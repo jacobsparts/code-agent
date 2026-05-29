@@ -45,13 +45,24 @@ def extract_method_source(impl: Callable, name: str) -> str:
     except SyntaxError as e:
         raise ValueError(f"Cannot parse source for '{name}': {e}")
     
-    # Find function definition
+    # Find function definition.  Prefer an exact name match, but tolerate
+    # injected tools whose registered tool name differs from the Python
+    # function name in the source returned by inspect.getsource().
     func_def = None
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             func_def = node
             break
-    
+
+    if func_def is None:
+        top_level_functions = [
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        if len(top_level_functions) == 1:
+            func_def = top_level_functions[0]
+            func_def.name = name
+
     if func_def is None:
         raise ValueError(f"Cannot find function '{name}' in extracted source")
     
