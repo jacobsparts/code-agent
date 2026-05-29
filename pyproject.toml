@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-agent"
+version = "0.1.0"
+description = "Python REPL-based coding assistant."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+]
+
+[project.scripts]
+code-agent = "code_agent.agent:main"
+repl-benchmark = "code_agent.repl_benchmark.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["code_agent*"]
+
+[tool.setuptools.package-data]
+code_agent = [
+  "skills/**/*.md",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

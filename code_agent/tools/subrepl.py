@@ -1,0 +1,650 @@
+"""
+SubREPL: Subprocess-based Python REPL with streaming output.
+
+A production-ready REPL environment that runs Python code in an isolated
+worker process with real-time output streaming and persistent state.
+
+Example:
+    repl = SubREPL()
+
+    # Simple execution
+    output = repl.execute("print('hello')")
+    # "hello\n"
+
+    # Long-running with polling
+    output = repl.execute("import time; time.sleep(30)", timeout=5.0)
+    # "partial output\n[still running]\n"
+    if output.endswith("[still running]\n"):
+        output = repl.interrupt()
+
+    # Hard timeout with auto-interrupt
+    output = repl.execute("while True: pass", timeout=5.0, hard_timeout=True)
+    # Automatically interrupted
+
+    # Clean up
+    repl.close()
+"""
+
+from __future__ import annotations
+
+import contextlib
+
+import ast
+import code
+import os
+import signal
+import sys
+import time
+from codeop import compile_command
+from multiprocessing import Queue
+from queue import Empty
+from typing import Any, Optional
+
+
+STILL_RUNNING = "[still running]\n"
+
+
+from code_agent.tools.transports import MultiprocessingTransport, StdioSubprocessTransport
+
+
+@contextlib.contextmanager
+def _noninteractive_stdin():
+    saved_fd = os.dup(0)
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(devnull_fd, 0)
+        yield
+    finally:
+        try:
+            os.dup2(saved_fd, 0)
+        finally:
+            os.close(saved_fd)
+            os.close(devnull_fd)
+
+
+
+def _redact_long_strings(source: str, max_len: int = 200, max_newlines: int = 3) -> str:
+    """Replace long string literals with redaction marker for echo display.
+
+    Only redacts plain string literals, not f-strings or variables.
+    Redacts if string exceeds max_len OR contains more than max_newlines.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source  # Can't parse, return as-is
+
+    # Find all long string constants with their repr (how they appear in source)
+    redactions = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and
+            isinstance(node.value, str) and
+            hasattr(node, 'end_lineno')):  # Ensure we have position info
+            value = node.value
+            if len(value) > max_len or value.count('\n') > max_newlines:
+                redactions.append(node)
+
+    if not redactions:
+        return source
+
+    # Use ast.get_source_segment to get exact source text (handles Unicode correctly)
+    # Then do string replacement
+    result = source
+    for node in redactions:
+        # Get the exact source text of this string literal
+        segment = ast.get_source_segment(source, node)
+        if segment:
+            # Replace first occurrence (we process all nodes, each gets replaced once)
+            result = result.replace(segment, '"[content omitted from echo]"', 1)
+
+    return result
+
+
+def _truncate_long_strings_for_echo(source: str, max_len: int = 120, max_newlines: int = 3) -> str:
+    """Replace long string literals with a truncated preview for stdout echo.
+
+    Only rewrites plain string literals, not f-strings or variables.
+    Multiline strings are collapsed to a single line for display.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    rewrites = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and
+            isinstance(node.value, str) and
+            hasattr(node, 'end_lineno')):
+            value = node.value
+            if len(value) > max_len or value.count('\n') > max_newlines:
+                rewrites.append(node)
+
+    if not rewrites:
+        return source
+
+    result = source
+    for node in rewrites:
+        segment = ast.get_source_segment(source, node)
+        if not segment:
+            continue
+        preview = node.value.replace('\n', ' ').replace('\r', ' ')
+        preview = ' '.join(preview.split())
+        if len(preview) > max_len:
+            preview = preview[:max_len - 3] + "..."
+        replacement = repr(preview)
+        result = result.replace(segment, replacement, 1)
+
+    return result
+
+
+def _with_still_running(output: str) -> str:
+    """Append STILL_RUNNING marker, ensuring proper newline."""
+    if output and not output.endswith('\n'):
+        output += '\n'
+    return output + STILL_RUNNING
+
+
+def _split_into_statements(source: str) -> list[str]:
+    """Split Python source into complete statements for REPL execution."""
+    # Keywords that continue a previous compound statement
+    CONTINUATION_KEYWORDS = ('else', 'elif', 'except', 'finally', 'case')
+
+    lines = source.split('\n')
+    statements = []
+    current = []
+
+    for line in lines:
+        is_indented = line.startswith((' ', '\t'))
+        stripped = line.strip()
+
+        # Check if this line is a continuation keyword (else:, elif x:, except:, etc)
+        is_continuation = any(
+            stripped == kw + ':' or stripped.startswith(kw + ' ') or stripped.startswith(kw + ':')
+            for kw in CONTINUATION_KEYWORDS
+        )
+
+        # When we see a non-indented, non-empty, non-continuation line
+        # and have accumulated code, check if accumulated code is complete
+        if not is_indented and stripped and not is_continuation and current:
+            current_src = '\n'.join(current)
+            try:
+                # Double newline signals end of any indented block
+                if compile_command(current_src + '\n\n') is not None:
+                    statements.append(current_src)
+                    current = []
+            except (SyntaxError, OverflowError, ValueError):
+                # Syntax error - save as-is, will error on exec
+                statements.append(current_src)
+                current = []
+
+        # Add line if it has content, or if we're accumulating a statement
+        # (preserves blank lines inside multiline strings and indented blocks)
+        if stripped or current:
+            current.append(line)
+
+    # Handle remaining code
+    if current:
+        statements.append('\n'.join(current))
+
+    return [s for s in statements if s.strip()]
+
+
+def _format_echo(stmt: str, redact_long_strings: bool = True) -> str:
+    """Format a statement with REPL-style echo prefix.
+
+    Args:
+        stmt: Python statement to format
+        redact_long_strings: If True, replace long string literals with
+            "[redacted by system]" to save tokens in the echo
+    """
+    if redact_long_strings:
+        stmt = _redact_long_strings(stmt)
+
+    lines = stmt.split('\n')
+    while len(lines) > 1 and not lines[-1].strip():
+        lines.pop()
+    result = [f">>> {lines[0]}"]
+    for line in lines[1:]:
+        result.append(f"... {line}")
+    return '\n'.join(result) + '\n'
+
+
+def _format_echo_stdout(stmt: str) -> str:
+    """Format a statement for user-facing stdout with truncated string previews."""
+    try:
+        tree = ast.parse(stmt)
+        if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+            expr = tree.body[0].value
+            if (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Name)
+                and expr.func.id == "preview"
+                and len(expr.args) >= 1
+                and isinstance(expr.args[0], ast.Call)
+                and isinstance(expr.args[0].func, ast.Name)
+                and expr.args[0].func.id == "bash"
+                and expr.args[0].args
+                and isinstance(expr.args[0].args[0], ast.Constant)
+                and isinstance(expr.args[0].args[0].value, str)
+                and "\n" not in expr.args[0].args[0].value
+            ):
+                return f"  $ {expr.args[0].args[0].value}\n"
+    except SyntaxError:
+        pass
+
+    stmt = _truncate_long_strings_for_echo(stmt)
+    lines = stmt.split('\n')
+    while len(lines) > 1 and not lines[-1].strip():
+        lines.pop()
+    result = [f">>> {lines[0]}"]
+    for line in lines[1:]:
+        result.append(f"... {line}")
+    return '\n'.join(result) + '\n'
+
+
+class _StreamingWriter:
+    """
+    Custom writer that sends output to a queue in real-time.
+    Replaces sys.stdout/stderr in the worker process.
+    """
+
+    def __init__(self, queue: Queue, original: Any) -> None:
+        self._queue = queue
+        self._original = original
+
+    def write(self, text: str) -> int:
+        if text:
+            self._queue.put(("output", text))
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+
+def _worker_main(cmd_queue: Queue, output_queue: Queue, cwd: str) -> None:
+    """
+    Worker process entry point.
+    """
+    os.chdir(cwd)
+    repl_locals: dict[str, Any] = {}
+
+    def sigint_handler(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGINT, sigint_handler)
+
+    while True:
+        try:
+            cmd = cmd_queue.get()
+
+            if cmd is None:
+                break
+
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            sys.stdout = _StreamingWriter(output_queue, old_stdout)
+            sys.stderr = _StreamingWriter(output_queue, old_stderr)
+
+            had_error = False
+            try:
+                try:
+                    with _noninteractive_stdin():
+                        # Parse and execute each node, displaying expression results
+                        tree = ast.parse(cmd, "<repl>", "exec")
+                        for node in tree.body:
+                            if isinstance(node, ast.Expr):
+                                # Expression statement - eval and display result
+                                code_obj = compile(ast.Expression(node.value), "<repl>", "eval")
+                                result = eval(code_obj, repl_locals)
+                                if result is not None:
+                                    print(repr(result))
+                            else:
+                                # Other statement - just exec
+                                mod = ast.Module(body=[node], type_ignores=[])
+                                code_obj = compile(mod, "<repl>", "exec")
+                                exec(code_obj, repl_locals)
+                except SyntaxError as e:
+                    had_error = True
+                    sys.stderr.write(f"  File \"<repl>\", line {e.lineno}\n")
+                    if e.text:
+                        sys.stderr.write(f"    {e.text}")
+                        if e.offset:
+                            sys.stderr.write(" " * (e.offset + 3) + "^\n")
+                    sys.stderr.write(f"SyntaxError: {e.msg}\n")
+            except KeyboardInterrupt:
+                had_error = True
+                sys.stderr.write("\nKeyboardInterrupt\n")
+            except Exception as e:
+                had_error = True
+                import traceback
+                # Filter traceback to only show frames from <repl>, not our internals
+                tb = e.__traceback__
+                # Skip frames until we reach <repl>
+                while tb is not None and tb.tb_frame.f_code.co_filename != "<repl>":
+                    tb = tb.tb_next
+                if tb is not None:
+                    sys.stderr.write("Traceback (most recent call last):\n")
+                    sys.stderr.write("".join(traceback.format_tb(tb)))
+                sys.stderr.write(f"{type(e).__name__}: {e}\n")
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+
+            output_queue.put(("done", had_error))
+
+        except KeyboardInterrupt:
+            output_queue.put(("output", "\nKeyboardInterrupt\n"))
+            output_queue.put(("done", True))
+
+
+class SubREPL:
+    """
+    Subprocess-based Python REPL with streaming output.
+
+    Executes Python code in an isolated worker process. State persists
+    across executions (variables, imports, function definitions).
+    Output streams in real-time rather than buffering until completion.
+
+    Sessions are created lazily on first execute() call.
+
+    Returns:
+        All methods return a string. If execution is still running,
+        the string ends with "[still running]\\n".
+    """
+
+    def __init__(self, echo: bool = True) -> None:
+        """Initialize SubREPL. Worker is not started until first execute().
+
+        Args:
+            echo: If True, prefix output with ">>> statement" echo (default True)
+        """
+        self._cmd_queue: Optional[Queue] = None
+        self._output_queue: Optional[Queue] = None
+        self._worker: Optional[Process] = None
+        self._transport: Optional[MultiprocessingTransport] = None
+
+        self._running: bool = False
+        self._echo: bool = echo
+
+    def __del__(self) -> None:
+        """Clean up worker process on garbage collection."""
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _ensure_session(self) -> None:
+        """Lazily create worker session if not exists."""
+        if self._transport is None or not self._transport.is_alive():
+            self._transport = MultiprocessingTransport(
+                target=_worker_main,
+                args=(os.getcwd(),),
+                queue_count=2,
+            )
+            self._transport.start()
+            self._cmd_queue, self._output_queue = self._transport.queues
+            self._worker = self._transport.worker
+            self._running = False
+
+    def _inject_code(self, code: str, timeout: float = 10.0) -> None:
+        """
+        Execute code silently (no echo, output discarded).
+        
+        This is the primitive for silent code injection. Subclasses may
+        override for different transports (queue, socket, etc.).
+        
+        Args:
+            code: Python code to execute
+            timeout: Max seconds to wait (default 10.0)
+        """
+        self._ensure_session()
+        old_echo = self._echo
+        self._echo = False
+        try:
+            self.execute(code, timeout=timeout)
+        finally:
+            self._echo = old_echo
+
+    def inject_startup(self, code_list: list[str], timeout: float = 10.0) -> None:
+        """
+        Inject startup code silently.
+        
+        Used to set up the REPL environment before agent interaction.
+        Each string in code_list is executed in order.
+        
+        Args:
+            code_list: List of Python code strings to execute
+            timeout: Max seconds per code block (default 10.0)
+        """
+        for code in code_list:
+            if code and code.strip():
+                self._inject_code(code, timeout=timeout)
+
+    def execute(
+        self,
+        code: str,
+        timeout: float = 10.0,
+        hard_timeout: bool = False
+    ) -> str:
+        """
+        Execute code and return output.
+
+        Args:
+            code: Python code to execute
+            timeout: Max seconds to wait for result (default 10.0)
+            hard_timeout: If True and timeout reached, interrupt execution
+
+        Returns:
+            Output string with each statement echoed as ">>> statement" (and
+            "... continuation" for multi-line statements).
+            Ends with "[still running]\\n" if final statement not complete.
+            If previous command still running, returns warning instead of executing.
+        """
+        # Split into complete statements for echo display
+        statements = _split_into_statements(code)
+        if not statements:
+            return ""
+
+        if self._echo:
+            prefix = ''.join(_format_echo(stmt) for stmt in statements)
+        else:
+            prefix = ""
+
+        if self._running:
+            pending = self.read(timeout=0).removesuffix(STILL_RUNNING)
+            return pending + prefix + "[Previous command still running. Use read(), interrupt(), or terminate() first.]\n"
+
+        self._ensure_session()
+        self._running = True
+        # Send all statements as one batch
+        self._cmd_queue.put('\n'.join(statements))
+
+        return prefix + self.read(timeout=timeout, hard_timeout=hard_timeout)
+
+    def read(
+        self,
+        timeout: float = 10.0,
+        hard_timeout: bool = False
+    ) -> str:
+        """
+        Read output from running execution.
+
+        Args:
+            timeout: Max seconds to wait (default 10.0)
+            hard_timeout: If True and timeout reached, interrupt execution
+
+        Returns:
+            Output string. Ends with "[still running]\\n" if not complete.
+        """
+        if not self._running:
+            return ""
+
+        if self._output_queue is None:
+            raise RuntimeError("No active session")
+
+        output_chunks: list[str] = []
+        deadline = time.time() + timeout
+
+        # Always drain available output first (non-blocking)
+        while True:
+            try:
+                msg_type, msg_data = self._output_queue.get_nowait()
+                if msg_type == "output":
+                    output_chunks.append(msg_data)
+                elif msg_type == "done":
+                    self._running = False
+                    return "".join(output_chunks)
+            except Empty:
+                break
+
+        # If timeout=0, return immediately with what we have
+        if timeout <= 0:
+            if hard_timeout:
+                return self._escalating_interrupt(output_chunks)
+            else:
+                return _with_still_running("".join(output_chunks))
+
+        # Wait for more output until deadline
+        while True:
+            remaining = deadline - time.time()
+
+            if remaining <= 0:
+                if hard_timeout:
+                    return self._escalating_interrupt(output_chunks)
+                else:
+                    return _with_still_running("".join(output_chunks))
+
+            try:
+                msg_type, msg_data = self._output_queue.get(timeout=min(remaining, 0.1))
+
+                if msg_type == "output":
+                    output_chunks.append(msg_data)
+                elif msg_type == "done":
+                    self._running = False
+                    return "".join(output_chunks)
+
+            except Empty:
+                continue
+
+    def _escalating_interrupt(self, output_chunks: list[str]) -> str:
+        """Interrupt with escalating signals: SIGINT (x3) -> SIGKILL."""
+        if not self._running or self._transport is None:
+            return ""
+        # Try SIGINT up to 3 times
+        for _ in range(3):
+            self._transport.interrupt()
+
+            result = self._drain_and_wait(output_chunks, timeout=1.0)
+            if result is not None:
+                return result
+
+        # Nuclear option: SIGKILL
+        self._transport.terminate()
+
+        self._running = False
+
+        output = "".join(output_chunks) + "\n[Process killed]\n"
+
+        self._transport = None
+        self._worker = None
+        self._cmd_queue = None
+        self._output_queue = None
+
+        return output
+
+    def _drain_and_wait(
+        self,
+        output_chunks: list[str],
+        timeout: float
+    ) -> Optional[str]:
+        """Drain output queue and wait for completion."""
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            try:
+                msg_type, msg_data = self._output_queue.get(timeout=0.05)
+
+                if msg_type == "output":
+                    output_chunks.append(msg_data)
+                elif msg_type == "done":
+                    self._running = False
+                    return "".join(output_chunks)
+            except Empty:
+                continue
+
+        return None
+
+    def interrupt(self) -> str:
+        """
+        Interrupt running execution with SIGINT (like Ctrl+C).
+
+        Returns:
+            Output string (always complete after interrupt).
+        """
+        if not self._running or self._transport is None:
+            return ""
+
+        self._transport.interrupt()
+        output_chunks: list[str] = []
+
+        while True:
+            try:
+                msg_type, msg_data = self._output_queue.get(timeout=0.1)
+
+                if msg_type == "output":
+                    output_chunks.append(msg_data)
+                elif msg_type == "done":
+                    self._running = False
+                    return "".join(output_chunks)
+            except Empty:
+                if not self._transport.is_alive():
+                    self._running = False
+                    return "".join(output_chunks) + "\n[Process died]\n"
+
+    def terminate(self) -> Optional[str]:
+        """
+        Kill the session immediately with SIGKILL.
+
+        Returns:
+            Output string, or None if no session active.
+        """
+        if self._transport is None:
+            return None
+        output_chunks: list[str] = []
+
+        if self._output_queue is not None:
+            while True:
+                try:
+                    msg_type, msg_data = self._output_queue.get_nowait()
+                    if msg_type == "output":
+                        output_chunks.append(msg_data)
+                except Empty:
+                    break
+
+        if self._transport.is_alive():
+            self._transport.terminate()
+
+        was_running = self._running
+        result = "".join(output_chunks) if was_running else None
+
+        self._transport = None
+        self._worker = None
+        self._cmd_queue = None
+        self._output_queue = None
+        self._running = False
+
+        return result
+
+    def close(self) -> None:
+        """Clean up the session."""
+        self.terminate()
+
+    def __enter__(self) -> SubREPL:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()

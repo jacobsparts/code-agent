@@ -1,0 +1,328 @@
+import os
+from dataclasses import dataclass, field
+from code_agent.dotenv import load_dotenv
+
+load_dotenv()
+
+class ModelNotFoundError(Exception):
+    """Raised when an unknown model is requested."""
+    pass
+
+@dataclass
+class ProviderConfig:
+    provider: str
+    host: str
+    path: str
+    port: int = 443
+    tpm: int = 60
+    concurrency: int = 5
+    timeout: int = 120
+    tools: bool = False
+    api_type: str = "completions"
+    token_transform: object = None    # callable(usage_dict) -> usage_dict
+    cost_transform: object = None     # callable(prompt, cached, completion, reasoning, in_cost, cached_cost, out_cost, rsn_cost) -> (in_cost, cached_cost, out_cost, rsn_cost)
+    response_transform: object = None # callable(resp_msg, tools) -> resp_msg
+    response_parser: object = None    # callable(response_json) -> (message, stop_reason, usage)
+
+@dataclass
+class ModelConfig:
+    model: str
+    provider: ProviderConfig
+    path: str = None
+    config: dict = field(default_factory=dict)
+    context_window: int = None
+    max_input_tokens: int = None
+    input_cost: float = None
+    output_cost: float = None
+    cached_cost: float = None
+    reasoning_cost: float = None
+    timeout: int = None
+    tools: bool = None
+
+    @property
+    def request_path(self):
+        return self.path or self.provider.path
+
+class EndpointRegistry:
+    def __init__(self):
+        self._models = {}
+        self._providers = {}
+        self._aliases = {}
+
+    def register_provider(self, name, **kwargs):
+        kwargs['provider'] = name
+        self._providers[name] = ProviderConfig(**kwargs)
+
+    def register_model(self, provider, alias, aliases=None, **kwargs):
+        if not (prov_obj := self._providers.get(provider)):
+            raise ValueError(f"unknown provider: {provider}")
+        kwargs.setdefault('model', alias)
+        full_name = f"{provider}/{alias}"
+        self._models[full_name] = ModelConfig(provider=prov_obj, **kwargs)
+        if aliases:
+            for a in (aliases if isinstance(aliases, list) else [aliases]):
+                self._aliases[a] = full_name
+
+    def resolve_model_name(self, name):
+        """Resolve an alias or short name to the full model name (provider/model).
+        Returns the input unchanged if not an alias."""
+        return self._aliases.get(name, name)
+
+    def get_model_config(self, name):
+        # Resolve alias if it exists
+        resolved_name = self._aliases.get(name, name)
+        
+        # Check if model exists
+        if resolved_name not in self._models:
+            # Provide helpful error message
+            available = list(self._models.keys()) + list(self._aliases.keys())
+            raise ModelNotFoundError(
+                f"Unknown model '{name}'. Available models and aliases:\n" +
+                "\n".join(f"  - {m}" for m in sorted(available))
+            )
+        
+        model_obj = self._models[resolved_name]
+        _model = dict(model_obj.__dict__)
+        _provider = _model.pop('provider').__dict__
+        keys = _model.keys() | _provider.keys()
+        model_config = { k: v if (v := _model.get(k)) is not None else _provider.get(k) for k in keys }
+        model_config['path'] = _provider['path']
+        model_config['request_path'] = model_obj.request_path
+        env_var = f"{model_config['provider'].upper()}_API_KEY"
+        if not (api_key := os.getenv(env_var)):
+            raise Exception(f"{env_var} is not set.")
+        return {**model_config, 'api_key': api_key}
+
+registry = EndpointRegistry()
+register_provider = registry.register_provider
+register_model = registry.register_model
+get_model_config = registry.get_model_config
+resolve_model_name = registry.resolve_model_name
+
+# --- OpenAI ---
+register_provider("openai",
+    host="api.openai.com",
+    path="/v1/chat/completions",
+    tpm=100,
+    concurrency=30,
+    timeout=300,
+    tools=True,
+    api_type="completions",
+)
+
+for conf, efforts in (
+    ({'model': 'gpt-4.1', 'input_cost': 2.0, 'cached_cost': 0.5, 'output_cost': 8.0}, (None,)),
+    ({'model': 'gpt-5-mini', 'input_cost': 0.25, 'cached_cost': 0.025, 'output_cost': 2.0}, ('high',)),
+    ({'model': 'gpt-5.1', 'input_cost': 1.25, 'cached_cost': 0.125, 'output_cost': 10.0}, ('none',)),
+    ({'model': 'gpt-5.2', 'input_cost': 1.75, 'cached_cost': 0.175, 'output_cost': 14.0}, ('none', 'medium', 'high')),
+    ({'model': 'gpt-5.4', 'input_cost': 2.5, 'cached_cost': 0.25, 'output_cost': 15.0}, ('none', 'medium', 'high')),
+    ({'model': 'gpt-5.4-mini', 'input_cost': 0.75, 'cached_cost': 0.075, 'output_cost': 4.5}, ('high',)),
+    ({'model': 'gpt-5.4-nano', 'input_cost': 0.2, 'cached_cost': 0.02, 'output_cost': 1.25}, ('high',)),
+    ({'model': 'gpt-5.5', 'input_cost': 5.0, 'cached_cost': 0.5, 'output_cost': 30.0}, ('none', 'medium', 'high')),
+):
+    for effort in efforts:
+        suffix = '' if (effort == 'none' or len(efforts) == 1) else f"-{effort}"
+        kwargs = {**conf, "config":{"reasoning_effort": effort}} if effort else conf
+        register_model("openai", f"{conf['model']}{suffix}", **kwargs)
+        if conf['model'] == 'gpt-5-mini':
+            kwargs['config']['service_tier'] = "flex"
+            kwargs['timeout'] = 1200
+            for k in ('input_cost','cached_cost','output_cost'):
+                kwargs[k] /= 2
+            register_model("openai", f"{conf['model']}{suffix}-flex", **kwargs)
+
+
+# --- Anthropic ---
+register_provider("anthropic",
+    host="api.anthropic.com",
+    path="/v1/messages",
+    tpm=100,
+    concurrency=30,
+    timeout=300,
+    tools=True,
+    api_type="messages"
+)
+register_model("anthropic","claude-haiku-4-5",
+    model="claude-haiku-4-5",
+    aliases="haiku",
+    input_cost=1.00,
+    cached_cost=0.1,
+    output_cost=5.0,
+)
+register_model("anthropic","claude-sonnet-4-6",
+    model="claude-sonnet-4-6",
+    aliases="sonnet",
+    input_cost=3.00,
+    cached_cost=0.3,
+    output_cost=15.0,
+)
+register_model("anthropic","claude-opus-4-6",
+    model="claude-opus-4-6",
+    aliases="opus",
+    input_cost=5.00,
+    cached_cost=0.5,
+    output_cost=25.0,
+)
+
+def gemini_token_transform(usage):
+    return {
+        'prompt_tokens': usage.get('promptTokenCount', 0),
+        'completion_tokens': usage.get('candidatesTokenCount', 0),
+        'completion_tokens_details': {
+            'reasoning_tokens': usage.get('thoughtsTokenCount', 0),
+        },
+        'prompt_tokens_details': {
+            'cached_tokens': usage.get('cachedContentTokenCount', 0),
+        },
+    }
+
+def gemini_cost_transform(prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens,
+                          input_cost, cached_cost, output_cost, reasoning_cost):
+    if prompt_tokens > 200000:
+        input_cost *= 2
+        output_cost *= 1.5
+        reasoning_cost *= 1.5
+    return input_cost, cached_cost, output_cost, reasoning_cost
+
+# --- Google ---
+register_provider("google",
+    host="generativelanguage.googleapis.com",
+    path="/v1beta",
+    tpm=5,
+    concurrency=3,
+    timeout=None,
+    tools=True,
+    api_type="gemini",
+    token_transform=gemini_token_transform,
+    cost_transform=gemini_cost_transform,
+)
+register_model("google","gemini-2.5-flash",
+    model="gemini-2.5-flash",
+    config={"thinkingBudget": 32768},
+    input_cost=0.3,
+    cached_cost=0.03,
+    output_cost=2.5,
+    reasoning_cost=2.5,
+)
+register_model("google","gemini-2.5-pro",
+    model="gemini-2.5-pro",
+    config={"thinkingBudget": 32768},
+    input_cost=1.25,
+    cached_cost=0.125,
+    output_cost=10.00,
+    reasoning_cost=10.00,
+)
+register_model("google","gemini-3-flash-preview",
+    model="gemini-3-flash-preview",
+    config={"thinkingLevel": "high"},
+    input_cost=0.5,
+    cached_cost=0.05,
+    output_cost=3.0,
+    reasoning_cost=3.0,
+)
+register_model("google","gemini-3.1-pro",
+    model="gemini-3.1-pro-preview",
+    config={"thinkingLevel": "high"},
+    input_cost=2.00,
+    cached_cost=0.2,
+    output_cost=12.00,
+    reasoning_cost=12.00,
+)
+
+# --- X.AI ---
+register_provider("xai",
+    host="api.x.ai",
+    path="/v1/chat/completions",
+    tpm=1000,
+    concurrency=50,
+    timeout=300,
+    tools=False,
+    api_type="completions",
+)
+register_model("xai","grok-4.3",
+    model="grok-4.3",
+    input_cost=1.25,
+    cached_cost=0.2,
+    output_cost=2.5,
+)
+
+# --- OpenRouter ---
+register_provider("openrouter",
+    host="openrouter.ai",
+    path="/api/v1/chat/completions",
+    timeout=300,
+    tools=None,
+    api_type="completions",
+)
+register_model("openrouter","kimi-k2.6",
+    model="moonshotai/kimi-k2.6",
+    config={
+        'provider': {'order': ['cloudflare'], 'allow_fallbacks': False},
+        'reasoning': {'enabled': True},
+        "temperature": 1.0,
+        "top_p": 1,
+        "top_k": 40,
+        "max_tokens": 1024*64,
+    },
+    input_cost=0.95,
+    cached_cost=0.16,
+    output_cost=4.0,
+    tools=False,
+)
+
+
+def cloudflare_response_parser(response_json):
+    result = response_json.get('result', response_json)
+    if 'choices' not in result:
+        raise Exception(f"choices missing from response: {response_json}")
+    choice = result['choices'][0]
+    return choice.get('message', {}), choice.get('finish_reason'), result.get('usage')
+
+register_provider("cloudflare",
+    host="api.cloudflare.com",
+    path=f"/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/ai/run",
+    timeout=900,
+    tools=False,
+    api_type="completions",
+    response_parser=cloudflare_response_parser,
+)
+register_model("cloudflare","kimi-k2.6",
+    model="@cf/moonshotai/kimi-k2.6",
+    path=f"/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/ai/run/@cf/moonshotai/kimi-k2.6",
+    context_window=262144,
+    config={
+        "temperature": 1.0,
+        "max_tokens": 16384,
+    },
+    input_cost=0.95,
+    cached_cost=0.16,
+    output_cost=4.0,
+    tools=False,
+)
+
+
+# --- User Configuration ---
+from code_agent.config import get_config_spec, get_user_config
+
+def load_user_config():
+    """Load user's custom model configurations from ~/.code-agent/config.py"""
+    # Get spec and module without executing
+    spec, user_config = get_config_spec()
+    
+    if spec is None and user_config is None:
+        # Config doesn't exist
+        return
+    
+    if spec is None:
+        # Already loaded by someone else
+        return
+    
+    # Inject registry functions before execution
+    user_config.register_provider = register_provider
+    user_config.register_model = register_model
+    user_config.registry = registry
+    
+    # Now execute with injected functions
+    get_user_config()
+
+load_user_config()
