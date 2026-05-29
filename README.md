@@ -151,6 +151,26 @@ Custom providers and models (local Ollama, corporate proxies, etc.) are register
 
 ---
 
+## Roadmap
+
+The subprocess transport is already abstracted. The default transport uses native
+multiprocessing with fork, which is fast and works well for local agents. There is also an
+alternate external-process transport that wraps a Python worker with a tiny `-e` stub and
+communicates entirely over stdin/stdout.
+
+That opens the door to sandboxed workers and remote Python workers over SSH, while keeping
+the same REPL-native agent model.
+
+---
+
+## Community
+
+Code Agent is my daily driver, but it is early and I am interested in feedback from people
+who try it seriously. Issues, bug reports, PRs, design notes, and weird session transcripts
+are all welcome.
+
+---
+
 ## License
 
 MIT
