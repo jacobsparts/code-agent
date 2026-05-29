@@ -87,7 +87,7 @@ Because sessions stay lean, you can configure a *smaller* context window than yo
 on partial context, which is a consistent source of errors. Code Agent uses an attachment
 system: `view(file)` pulls the full file into context with line numbers; `unview(file)`
 removes it. Only the most recent version of each file is ever in context—it updates
-automatically after edits. An ephemeral system prompt tracks the current attachment list
+automatically after edits. Ephemeral context injected into the latest user message tracks the current attachment list,
 so the model always knows what it has loaded, without that metadata entering conversation
 history and bloating the window.
 
