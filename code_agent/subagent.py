@@ -695,7 +695,7 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
             response.wait(timeout)
         except KeyboardInterrupt:
             response._set_error("Subagent task interrupted by KeyboardInterrupt.")
-            self._cleanup()
+            self._cleanup_after_interrupt()
             raise
         return response
 
@@ -727,6 +727,7 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
         if self._current_response:
             return self._current_response.wait(timeout)
         return None
+
     def kill(self) -> str:
         """Kill the subagent process."""
         if self._proc:
@@ -737,6 +738,43 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
             except ProcessLookupError:
                 return "Process already terminated"
         return "No process running"
+
+    def _force_stop(self) -> None:
+        """Force local cleanup without graceful shutdown."""
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+        if self._server:
+            try:
+                self._server.close()
+            except Exception:
+                pass
+            self._server = None
+
+        if self._proc:
+            try:
+                os.killpg(self._proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+        self._started = False
+
+    def _cleanup_after_interrupt(self) -> None:
+        """Clean up after foreground KeyboardInterrupt, tolerating repeated Ctrl+C."""
+        try:
+            self._cleanup()
+        except KeyboardInterrupt:
+            self._force_stop()
 
     def _cleanup(self) -> None:
         """Clean up subprocess and socket."""
