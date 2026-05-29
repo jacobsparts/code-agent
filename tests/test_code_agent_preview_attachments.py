@@ -425,3 +425,48 @@ def test_auto_preview_can_be_disabled(tmp_path):
 
     assert result == original
     assert "[PreviewRef:" not in result
+
+def test_line_patch_repeated_calls_use_start_of_turn_baseline(tmp_path):
+    path = tmp_path / "sample.txt"
+    path.write_text("a\nb\nc\nd\ne\n")
+    agent = make_persistent_agent(tmp_path)
+    agent.complete = False
+    repl = agent._get_tool_repl()
+    try:
+        output, pure_syntax_error, output_chunks, _ = agent._execute_with_tool_handling(
+            repl,
+            "\n".join([
+                f"line_patch({str(path)!r}, {chr(34)*3}delete 2:2{chr(34)*3})",
+                f"line_patch({str(path)!r}, {chr(34)*3}replace 4:4\\nD{chr(34)*3})",
+            ]),
+        )
+    finally:
+        repl.close()
+
+    assert pure_syntax_error is False
+    assert "Traceback" not in output
+    assert path.read_text() == "a\nc\nD\ne\n"
+    assert sum(1 for msg_type, _ in output_chunks if msg_type == "file_diff") == 2
+
+
+def test_line_patch_repeated_calls_reject_overlapping_original_ranges(tmp_path):
+    path = tmp_path / "sample.txt"
+    path.write_text("a\nb\nc\nd\n")
+    agent = make_persistent_agent(tmp_path)
+    agent.complete = False
+    repl = agent._get_tool_repl()
+    try:
+        output, pure_syntax_error, _, _ = agent._execute_with_tool_handling(
+            repl,
+            "\n".join([
+                f"line_patch({str(path)!r}, {chr(34)*3}replace 2:3\\nB\\nC{chr(34)*3})",
+                f"line_patch({str(path)!r}, {chr(34)*3}delete 3:3{chr(34)*3})",
+            ]),
+        )
+    finally:
+        repl.close()
+
+    assert pure_syntax_error is False
+    assert "overlaps earlier same-turn operation replace 2:3" in output
+    assert path.read_text() == "a\nB\nC\nd\n"
+

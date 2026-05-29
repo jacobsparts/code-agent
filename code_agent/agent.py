@@ -1335,6 +1335,11 @@ file writes (Path.write_text(), open(..., "w"), shell redirects, perl -pi,
 sed -i, etc.) to edit source code. If a direct write is truly required, explain
 why edit()/line_patch() cannot work and ask the user for permission first.
 
+For Python files (*.py), edit(...) and line_patch(...) reject invalid syntax:
+the full edited file is parsed, invalid edits are rolled back, and the error
+reports the location/reason. Skip separate syntax-only validation for Python
+edits; still run tests/linters/type checks when needed.
+
 edit(file_path, old_string, new_string, replace_all=False)
     Replace exact string matches.
     - old_string must match exactly (whitespace, indentation)
@@ -1342,11 +1347,12 @@ edit(file_path, old_string, new_string, replace_all=False)
 line_patch(file_path, patch)
     Edit an existing file by line number.
     - Prefer a full view(file_path) first; if absent, line_patch uses current on-disk contents
-    - Line numbers refer to the current viewed file contents, or current file contents if not viewed
+    - Within one assistant turn, repeated line_patch() calls for the same file use the
+      file content from the start of that turn as their line-number baseline
     - Operation headers must start at column 1 in the patch string
     - Body lines are literal file content; indent only if the file should contain that indentation
     - Multiple operations in one call are atomic
-    - You may call line_patch() repeatedly after one full view(file_path)
+    - Overlapping same-turn line_patch() operations for a file are rejected
     - For create/move/delete, use Python file APIs such as Path.write_text(), Path.rename(), or Path.unlink()
 
     line_patch("src/app.py", '''replace 10:12
@@ -1524,7 +1530,11 @@ If you don't know how to proceed:
     # REPL output hooks
     def on_repl_execute(self, code) -> None:
         """Called at start of each turn."""
-        pass  # No-op, display happens in on_repl_output
+        if hasattr(self, '_tool_repl'):
+            try:
+                self._tool_repl._inject_code('globals().pop("_line_patch_turn_baselines", None)')
+            except Exception:
+                pass
 
     def on_repl_chunk(self, chunk: str, msg_type: str = "echo") -> None:
         """Called for each output chunk. Display echo and progress immediately."""
@@ -2913,9 +2923,14 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         Prefer a full view(file_path) first. If no current view snapshot exists,
         line_patch uses the file's current on-disk contents as the line-number
         baseline and attaches the edited file for future context.
-        Multiple operations in one call are applied atomically.
 
-        You may call line_patch() repeatedly after one full view(file_path).
+        Within one assistant turn, repeated line_patch() calls for the same file
+        are interpreted against the file content as it existed at the start of
+        the turn. Each call is converted to a context patch and applied to the
+        current file, so line-count changes from earlier line_patch() calls do
+        not shift later line numbers.
+
+        Multiple operations in one call are applied atomically.
 
         Operations:
           replace START:END
@@ -2950,6 +2965,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         path = Path(file_path).expanduser()
         old_text = path.read_text()
         old_hash = hashlib.sha256(old_text.encode()).hexdigest()
+        resolved_path = str(path.resolve())
 
         snapshots = globals().setdefault("_line_patch_snapshots", {})
         snapshot = snapshots.get(file_path)
@@ -2957,7 +2973,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             all_lines = old_text.split('\n')
             snapshot = {
                 "path": file_path,
-                "resolved_path": str(path.resolve()),
+                "resolved_path": resolved_path,
                 "content": old_text,
                 "sha256": old_hash,
                 "line_count": len(all_lines),
@@ -2977,6 +2993,23 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 })
             else:
                 raise ValueError(f"{file_path} changed on disk since it was viewed. Call view({file_path!r}) again before line_patch().")
+
+        turn_baselines = globals().setdefault("_line_patch_turn_baselines", {})
+        baseline = turn_baselines.get(resolved_path)
+        if baseline is None:
+            baseline_text = old_text
+            baseline = {
+                "path": file_path,
+                "resolved_path": resolved_path,
+                "content": baseline_text,
+                "sha256": hashlib.sha256(baseline_text.encode()).hexdigest(),
+                "line_count": len(baseline_text.split('\n')),
+                "applied_ranges": [],
+                "applied_points": [],
+            }
+            turn_baselines[resolved_path] = baseline
+        else:
+            baseline_text = baseline["content"]
 
         header_re = re.compile(r'^(replace) (\d+):(\d+)$|^(delete) (\d+):(\d+)$|^(insert) (before|after) (\d+)$')
         raw_lines = patch.split('\n')
@@ -3032,8 +3065,8 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         if not ops:
             raise ValueError("line_patch has no operations.")
 
-        lines = old_text.split('\n')
-        line_count = len(lines)
+        baseline_lines = baseline_text.split('\n')
+        line_count = len(baseline_lines)
         range_ops = []
         insertion_points = set()
 
@@ -3043,7 +3076,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 start = op["start"]
                 end = op["end"]
                 if start < 1 or end < start or end > line_count:
-                    raise ValueError(f"Invalid range {start}:{end} for {file_path} with {line_count} lines.")
+                    raise ValueError(f"Invalid range {start}:{end} for {file_path} with {line_count} baseline lines.")
                 range_ops.append((start, end, op))
                 if kind == "delete" and any(line.strip() for line in op["body"]):
                     raise ValueError(f"{op['header']} does not accept a body.")
@@ -3057,7 +3090,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                     valid = 0 <= line <= line_count
                     point = ("after", line)
                 if not valid:
-                    raise ValueError(f"Invalid insert {where} {line} for {file_path} with {line_count} lines.")
+                    raise ValueError(f"Invalid insert {where} {line} for {file_path} with {line_count} baseline lines.")
                 if point in insertion_points:
                     raise ValueError(f"Duplicate line_patch insertion point: insert {where} {line}.")
                 insertion_points.add(point)
@@ -3080,6 +3113,33 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 if inside:
                     raise ValueError(f"Overlapping line_patch operations: {op['header']} conflicts with {range_op['header']}.")
 
+        for start, end, op in range_ops:
+            for prev_start, prev_end, prev_header, _prev_delta in baseline["applied_ranges"]:
+                if start <= prev_end and prev_start <= end:
+                    raise ValueError(f"line_patch operation {op['header']} overlaps earlier same-turn operation {prev_header}.")
+            for where, line, prev_header, _prev_delta in baseline["applied_points"]:
+                inside = (
+                    (where == "before" and start <= line <= end)
+                    or (where == "after" and start <= line < end)
+                )
+                if inside:
+                    raise ValueError(f"line_patch operation {op['header']} overlaps earlier same-turn operation {prev_header}.")
+        for op in ops:
+            if op["kind"] != "insert":
+                continue
+            line = op["line"]
+            where = op["where"]
+            for prev_start, prev_end, prev_header, _prev_delta in baseline["applied_ranges"]:
+                inside = (
+                    (where == "before" and prev_start <= line <= prev_end)
+                    or (where == "after" and prev_start <= line < prev_end)
+                )
+                if inside:
+                    raise ValueError(f"line_patch operation {op['header']} overlaps earlier same-turn operation {prev_header}.")
+            for prev_where, prev_line, prev_header, _prev_delta in baseline["applied_points"]:
+                if where == prev_where and line == prev_line:
+                    raise ValueError(f"line_patch operation {op['header']} duplicates earlier same-turn operation {prev_header}.")
+
         by_start = {start: op for start, end, op in range_ops}
         by_before = {}
         by_after = {}
@@ -3090,34 +3150,118 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 else:
                     by_after[op["line"]] = op
 
-        new_lines = []
+        desired_lines = []
         if 0 in by_after:
-            new_lines.extend(by_after[0]["body"])
+            desired_lines.extend(by_after[0]["body"])
 
         i = 1
         while i <= line_count:
             if i in by_before:
-                new_lines.extend(by_before[i]["body"])
+                desired_lines.extend(by_before[i]["body"])
             replace_op = by_start.get(i)
             if replace_op is not None:
                 if replace_op["kind"] == "replace":
-                    new_lines.extend(replace_op["body"])
+                    desired_lines.extend(replace_op["body"])
                 i = replace_op["end"] + 1
                 if i - 1 in by_after:
-                    new_lines.extend(by_after[i - 1]["body"])
+                    desired_lines.extend(by_after[i - 1]["body"])
                 continue
-            new_lines.append(lines[i - 1])
+            desired_lines.append(baseline_lines[i - 1])
             if i in by_after:
-                new_lines.extend(by_after[i]["body"])
+                desired_lines.extend(by_after[i]["body"])
             i += 1
 
         if line_count + 1 in by_before:
-            new_lines.extend(by_before[line_count + 1]["body"])
+            desired_lines.extend(by_before[line_count + 1]["body"])
+
+        desired_text = '\n'.join(desired_lines)
+        if desired_text == baseline_text:
+            raise ValueError("line_patch produced no changes.")
+
+        translated_range_ops = []
+        translated_insert_ops = []
+        for start, end, op in range_ops:
+            shift = 0
+            for prev_start, prev_end, _prev_header, prev_delta in baseline.get("applied_ranges", []):
+                if start > prev_end:
+                    shift += prev_delta
+            for prev_where, prev_line, _prev_header, prev_delta in baseline.get("applied_points", []):
+                if (
+                    (prev_where == "before" and start >= prev_line)
+                    or (prev_where == "after" and start > prev_line)
+                ):
+                    shift += prev_delta
+            translated_range_ops.append((start + shift, end + shift, op))
+
+        for op in ops:
+            if op["kind"] != "insert":
+                continue
+            line = op["line"]
+            shift = 0
+            for prev_start, prev_end, _prev_header, prev_delta in baseline.get("applied_ranges", []):
+                if line > prev_end:
+                    shift += prev_delta
+            for prev_where, prev_line, _prev_header, prev_delta in baseline.get("applied_points", []):
+                if (
+                    (prev_where == "before" and line >= prev_line)
+                    or (prev_where == "after" and line > prev_line)
+                ):
+                    shift += prev_delta
+            translated = dict(op)
+            translated["line"] = line + shift
+            translated_insert_ops.append(translated)
+
+        current_lines = old_text.split('\n')
+        current_line_count = len(current_lines)
+        for start, end, op in translated_range_ops:
+            if start < 1 or end < start or end > current_line_count:
+                raise ValueError(f"Translated line_patch range {op['header']} no longer fits {file_path}.")
+        for op in translated_insert_ops:
+            line = op["line"]
+            where = op["where"]
+            valid = 1 <= line <= current_line_count + 1 if where == "before" else 0 <= line <= current_line_count
+            if not valid:
+                raise ValueError(f"Translated line_patch insertion {op['header']} no longer fits {file_path}.")
+
+        translated_by_start = {start: op for start, end, op in translated_range_ops}
+        translated_ends = {start: end for start, end, op in translated_range_ops}
+        translated_by_before = {}
+        translated_by_after = {}
+        for op in translated_insert_ops:
+            if op["where"] == "before":
+                translated_by_before[op["line"]] = op
+            else:
+                translated_by_after[op["line"]] = op
+
+        new_lines = []
+        if 0 in translated_by_after:
+            new_lines.extend(translated_by_after[0]["body"])
+
+        i = 1
+        while i <= current_line_count:
+            if i in translated_by_before:
+                new_lines.extend(translated_by_before[i]["body"])
+            replace_op = translated_by_start.get(i)
+            if replace_op is not None:
+                if replace_op["kind"] == "replace":
+                    new_lines.extend(replace_op["body"])
+                i = translated_ends[i] + 1
+                if i - 1 in translated_by_after:
+                    new_lines.extend(translated_by_after[i - 1]["body"])
+                continue
+            new_lines.append(current_lines[i - 1])
+            if i in translated_by_after:
+                new_lines.extend(translated_by_after[i]["body"])
+            i += 1
+
+        if current_line_count + 1 in translated_by_before:
+            new_lines.extend(translated_by_before[current_line_count + 1]["body"])
 
         new_text = '\n'.join(new_lines)
         if new_text == old_text:
             raise ValueError("line_patch produced no changes.")
 
+        import difflib
         path.write_text(new_text)
         snapshot.update({
             "content": new_text,
@@ -3125,7 +3269,16 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             "line_count": len(new_text.split('\n')),
             "line_patch_stale": False,
         })
-        import difflib
+        baseline["applied_ranges"].extend(
+            (start, end, op["header"], len(op["body"]) - (end - start + 1) if op["kind"] == "replace" else -(end - start + 1))
+            for start, end, op in range_ops
+        )
+        baseline["applied_points"].extend(
+            (op["where"], op["line"], op["header"], len(op["body"]))
+            for op in ops
+            if op["kind"] == "insert"
+        )
+
         diff = ''.join(difflib.unified_diff(
             old_text.splitlines(keepends=True),
             new_text.splitlines(keepends=True),
