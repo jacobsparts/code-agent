@@ -7,6 +7,7 @@ Provides terminal input handling without requiring GNU readline >= 8.0.
 import sys
 import os
 import termios
+import unicodedata
 from typing import Optional, Callable, TYPE_CHECKING
 
 from .alt_input import AltInputMode
@@ -15,6 +16,14 @@ if TYPE_CHECKING:
     from .altmode import AltMode
 
 _PRINTABLE = set(range(32, 127))
+
+
+def _input_encoding() -> str:
+    return sys.stdin.encoding or "utf-8"
+
+
+def _is_insertable_text_char(ch: str) -> bool:
+    return ch == "\n" or (ch.isprintable() and unicodedata.category(ch)[0] != "C")
 
 
 class RawMode:
@@ -384,9 +393,10 @@ def prompt(
                             while paste_end not in paste_buf:
                                 paste_buf.extend(os.read(sys.stdin.fileno(), 4096))
                             end_pos = paste_buf.find(paste_end)
-                            for b in paste_buf[:end_pos]:
-                                if b == 10 or b in _PRINTABLE:
-                                    paste_content.append(chr(b))
+                            text = paste_buf[:end_pos].decode(_input_encoding(), errors='replace')
+                            for ch in text:
+                                if _is_insertable_text_char(ch):
+                                    paste_content.append(ch)
                             buf[cursor:cursor] = paste_content
                             cursor += len(paste_content)
                             redraw(buf, cursor)
@@ -567,8 +577,21 @@ def prompt(
                         return line
                 
                     # Printable character
+                    ch = None
+                    consumed = 1
                     if c in _PRINTABLE:
                         ch = chr(c)
+                    elif c >= 128:
+                        for width in range(1, min(4, len(k) - i) + 1):
+                            try:
+                                candidate = k[i:i + width].decode(_input_encoding())
+                            except UnicodeDecodeError:
+                                continue
+                            if candidate:
+                                ch = candidate
+                                consumed = width
+                                break
+                    if ch is not None and _is_insertable_text_char(ch):
                         buf.insert(cursor, ch)
                         cursor += 1
                         if (cursor == len(buf) and '\n' not in buf
@@ -594,7 +617,7 @@ def prompt(
                                 sys.stdout.write(ch)
                         else:
                             redraw(buf, cursor)
-                        i += 1
+                        i += consumed
                         continue
                 
                     i += 1
