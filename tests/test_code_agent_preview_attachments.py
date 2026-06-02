@@ -1,3 +1,4 @@
+import json
 import re
 
 from code_agent.agent import CodeAgent
@@ -470,3 +471,63 @@ def test_line_patch_repeated_calls_reject_overlapping_original_ranges(tmp_path):
     assert "overlaps earlier same-turn operation replace 2:3" in output
     assert path.read_text() == "a\nB\nC\nd\n"
 
+
+
+def test_auto_refresh_uses_last_same_turn_write_for_attached_file(tmp_path):
+    path = str(tmp_path / "same.txt")
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {path}]",
+        _attachments={path: "    1→old"},
+        _attachment_refs={path: path},
+    )
+
+    output = agent.build_output_for_llm([
+        ("file_written", json.dumps({"path": path, "content": "first\n"}) + "\n"),
+        ("file_written", json.dumps({"path": path, "content": "second\n"}) + "\n"),
+    ])
+
+
+    assert output == f">>> view({path!r})\n[Attachment: {path}]\n"
+    assert "second" in agent._read_attachments[path]
+    assert "first" not in agent._read_attachments[path]
+
+
+def test_auto_refresh_skips_when_file_explicitly_viewed_after_write(tmp_path):
+    path = str(tmp_path / "same.txt")
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {path}]",
+        _attachments={path: "    1→old"},
+        _attachment_refs={path: path},
+    )
+
+    output = agent.build_output_for_llm([
+        ("file_written", json.dumps({"path": path, "content": "written\n"}) + "\n"),
+        ("read_attach", path + "\n"),
+        ("read", "    1→viewed\n"),
+    ])
+
+
+    assert output == f"[Attachment: {path}]\n"
+    assert agent._read_attachments[path] == "    1→viewed"
+
+
+def test_auto_refresh_after_explicit_view_uses_later_write(tmp_path):
+    path = str(tmp_path / "same.txt")
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {path}]",
+        _attachments={path: "    1→old"},
+        _attachment_refs={path: path},
+    )
+
+    output = agent.build_output_for_llm([
+        ("read_attach", path + "\n"),
+        ("read", "    1→viewed\n"),
+        ("file_written", json.dumps({"path": path, "content": "written\n"}) + "\n"),
+    ])
+
+    assert output == f"[Attachment: {path}]\n>>> view({path!r})\n[Attachment: {path}]\n"
+    assert "written" in agent._read_attachments[path]
+    assert "viewed" not in agent._read_attachments[path]

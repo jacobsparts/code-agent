@@ -917,6 +917,7 @@ def _code_agent_send_rg_available():
         attach_path = None
         partial_read_path = None
         written_files = []
+        attachment_read_order = {}
         unviewed_files = set(getattr(self, '_pending_unviewed_files', set()))
         self._pending_unviewed_files = set()
 
@@ -925,7 +926,7 @@ def _code_agent_send_rg_available():
                 result.append(self._auto_preview_output("".join(statement)))
                 statement.clear()
 
-        for msg_type, chunk in output_chunks:
+        for chunk_order, (msg_type, chunk) in enumerate(output_chunks):
             if msg_type == "emit":
                 continue
             if msg_type == "file_unviewed":
@@ -959,6 +960,7 @@ def _code_agent_send_rg_available():
                     continue
                 self._invalidate_attachment(path)
                 self._read_attachments[path] = content
+                attachment_read_order[path] = chunk_order
                 result.append(f"[Attachment: {path}]\n")
                 continue
             if msg_type == "read" and partial_read_path:
@@ -970,9 +972,11 @@ def _code_agent_send_rg_available():
             if msg_type == "file_written":
                 text = chunk.strip()
                 try:
-                    written_files.append(json.loads(text))
+                    item = json.loads(text)
                 except Exception:
-                    written_files.append({"path": text, "content": None})
+                    item = {"path": text, "content": None}
+                item["_order"] = chunk_order
+                written_files.append(item)
                 continue
             if msg_type == "file_diff":
                 continue
@@ -983,17 +987,28 @@ def _code_agent_send_rg_available():
 
         flush_statement()
 
-        # Auto-refresh attached files from worker-supplied write content.
+        # Auto-refresh attached files from the last same-turn write.
+        latest_writes = {}
         for item in written_files:
             path = item.get("path")
             content = item.get("content")
             if not path or content is None:
                 continue
-            if path in self._read_attachments:
-                continue  # Agent already re-read this file
             attached_name = self._attached_file_name(path)
             if attached_name is None:
-                continue  # File wasn't attached
+                for name in self._read_attachments:
+                    if self._same_file(name, path):
+                        attached_name = name
+                        break
+            if attached_name is None:
+                continue
+            latest_writes[attached_name] = item
+
+        for attached_name, item in latest_writes.items():
+            read_order = attachment_read_order.get(attached_name)
+            if read_order is not None and read_order > item["_order"]:
+                continue
+            content = item["content"]
             lines = content.split('\n')
             formatted = '\n'.join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))
             self._invalidate_attachment(attached_name)
