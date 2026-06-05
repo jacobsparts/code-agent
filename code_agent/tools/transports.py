@@ -7,9 +7,12 @@ REPL application protocol.
 
 from __future__ import annotations
 
+import ast
 import os
+import contextlib
 import signal
 import sys
+import shlex
 from multiprocessing import Process, Queue
 from queue import Empty
 from typing import Any, Callable, Optional, Tuple
@@ -137,12 +140,17 @@ class StdioSubprocessTransport:
         queue_count: int = 2,
         maxsize: int = 1,
         executable: Optional[str] = None,
+        ready_timeout: float = 10.0,
+        echo_stderr: bool = False,
     ) -> None:
         self._target = target
         self._args = args
         self._queue_count = queue_count
         self._maxsize = maxsize
         self._executable = executable or sys.executable
+        self._ready_timeout = ready_timeout
+        self._echo_stderr = echo_stderr
+
         self.queues: Tuple[Any, ...] = ()
         self.worker: Any = None
         self._mux: Any = None
@@ -262,8 +270,8 @@ class _CapturedWriter:
         return self._original.fileno()
 
 
-_protocol_stdin = sys.stdin.buffer
-_protocol_stdout = sys.stdout.buffer
+_protocol_stdin = os.fdopen(os.dup(0), "rb", buffering=0)
+_protocol_stdout = os.fdopen(os.dup(1), "wb", buffering=0)
 _channel_names = _CHANNEL_NAMES[:__QUEUE_COUNT__]
 _mux = _StdioMux(_protocol_stdin, _protocol_stdout, _channel_names, __MAXSIZE__)
 
@@ -312,6 +320,8 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
             return False
 
         def should_bundle(value: Any) -> bool:
+            if inspect.isfunction(value):
+                value = inspect.unwrap(value)
             module = getattr(value, "__module__", "")
             return module == target.__module__ or module.startswith("code_agent.")
 
@@ -329,17 +339,21 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
             visiting.add(ident)
             try:
                 names = set()
+                source_value = value
                 if inspect.isfunction(value):
-                    names.update(value.__code__.co_names)
-                    namespace = value.__globals__
+                    source_value = inspect.unwrap(value)
+                    names.update(source_value.__code__.co_names)
+                    namespace = source_value.__globals__
                 else:
                     namespace = vars(__import__(value.__module__, fromlist=["*"]))
                     for member in vars(value).values():
                         if inspect.isfunction(member):
+                            member = inspect.unwrap(member)
                             names.update(member.__code__.co_names)
 
+                source_name = getattr(source_value, "__name__", value.__name__)
                 for name in sorted(names):
-                    if name not in namespace or name == value.__name__:
+                    if name not in namespace or name == source_name:
                         continue
                     dep = namespace[name]
                     if inspect.ismodule(dep):
@@ -349,7 +363,26 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
                     elif is_simple(dep) and not name.startswith("__"):
                         constants[name] = dep
 
-                source = textwrap.dedent(inspect.getsource(value)).strip()
+                source = textwrap.dedent(inspect.getsource(source_value)).strip()
+
+                try:
+                    tree = ast.parse(source)
+                except SyntaxError:
+                    tree = None
+                if tree is not None:
+                    for node in ast.walk(tree):
+                        if not isinstance(node, ast.Name):
+                            continue
+                        name = node.id
+                        if name not in namespace:
+                            continue
+                        dep = namespace[name]
+                        if inspect.ismodule(dep):
+                            modules[name] = dep
+                        elif (inspect.isfunction(dep) or inspect.isclass(dep)) and should_bundle(dep):
+                            include_object(dep)
+                        elif is_simple(dep) and not name.startswith("__"):
+                            constants[name] = dep
             except (OSError, TypeError) as exc:
                 raise RuntimeError(f"Cannot build portable stdio worker payload for {value!r}: {exc}") from exc
             finally:
@@ -452,6 +485,9 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
                     except queue.Full:
                         pass
 
+    def _popen_command(self) -> list[str]:
+        return [self._executable, "-u", "-c", self.LOADER]
+
     def start(self) -> None:
         import base64
         import pickle
@@ -470,7 +506,7 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
         )
 
         self.worker = subprocess.Popen(
-            [self._executable, "-u", "-c", self.LOADER],
+            self._popen_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -486,7 +522,7 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
         self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self._stderr_thread.start()
 
-        self._wait_for_ready(self.worker.stdout)
+        self._wait_for_ready(self.worker.stdout, timeout=self._ready_timeout)
 
         channel_names = self._CHANNEL_NAMES[:self._queue_count]
         self._mux = self._Mux(self.worker.stdout, self.worker.stdin, channel_names, self._maxsize)
@@ -500,6 +536,10 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
             if not chunk:
                 return
             self._stderr_chunks.append(chunk)
+            if self._echo_stderr:
+                with contextlib.suppress(Exception):
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
 
     def _wait_for_ready(self, stdout: Any, timeout: float = 10.0) -> None:
         import queue
@@ -574,3 +614,43 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
                 pass
         if self.is_alive():
             self.terminate()
+
+
+class SSHSubprocessTransport(StdioSubprocessTransport):
+    """Worker lifecycle plus queue endpoints backed by a remote Python over ssh."""
+
+    def __init__(
+        self,
+        target: Callable[..., None],
+        args: Tuple[Any, ...] = (),
+        queue_count: int = 2,
+        maxsize: int = 1,
+        executable: Optional[str] = None,
+        ssh_target: str = "",
+        remote_cwd: Optional[str] = None,
+        ssh_executable: str = "ssh",
+        ready_timeout: float = 120.0,
+        echo_stderr: bool = True,
+    ) -> None:
+        super().__init__(
+            target=target,
+            args=args,
+            queue_count=queue_count,
+            maxsize=maxsize,
+            executable=executable or "python3",
+            ready_timeout=ready_timeout,
+            echo_stderr=echo_stderr,
+        )
+        if not ssh_target:
+            raise ValueError("ssh_target is required")
+        self._ssh_target = ssh_target
+        self._remote_cwd = remote_cwd
+        self._ssh_executable = ssh_executable
+
+    def _popen_command(self) -> list[str]:
+        python_cmd = f"{shlex.quote(self._executable)} -u -c {shlex.quote(self.LOADER)}"
+        if self._remote_cwd:
+            python_cmd = f"cd {shlex.quote(self._remote_cwd)} && exec {python_cmd}"
+        else:
+            python_cmd = f"exec {python_cmd}"
+        return [self._ssh_executable, self._ssh_target, python_cmd]

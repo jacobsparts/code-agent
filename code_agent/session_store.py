@@ -36,6 +36,7 @@ class SessionStore:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
+                    host TEXT NOT NULL DEFAULT 'local',
                     cwd TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -44,6 +45,12 @@ class SessionStore:
                     last_user_text TEXT
                 )
             """)
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "host" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS session_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,26 +86,26 @@ class SessionStore:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_host_cwd ON sessions(host, cwd)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, seq)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_session_locks_expires_at ON session_locks(expires_at)")
             conn.commit()
 
-    def create_session(self, cwd: str, model: str | None = None) -> str:
+    def create_session(self, cwd: str, model: str | None = None, host: str = "local") -> str:
         session_id = str(uuid.uuid4())
         now = utc_now_iso()
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO sessions(session_id, cwd, created_at, updated_at, model)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions(session_id, host, cwd, created_at, updated_at, model)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, cwd, now, now, model),
+                (session_id, host, cwd, now, now, model),
             )
             conn.commit()
         return session_id
 
-    def fork_session(self, source_session_id: str, *, cwd: str | None = None, model: str | None = None) -> str:
+    def fork_session(self, source_session_id: str, *, cwd: str | None = None, model: str | None = None, host: str | None = None) -> str:
         new_session_id = str(uuid.uuid4())
         now = utc_now_iso()
         with self._connect() as conn:
@@ -111,11 +118,12 @@ class SessionStore:
 
             conn.execute(
                 """
-                INSERT INTO sessions(session_id, cwd, created_at, updated_at, model, title, last_user_text)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO sessions(session_id, host, cwd, created_at, updated_at, model, title, last_user_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_session_id,
+                    host if host is not None else source["host"],
                     cwd if cwd is not None else source["cwd"],
                     now,
                     now,
@@ -172,9 +180,10 @@ class SessionStore:
         *,
         cwd: str,
         model: str | None = None,
+        host: str = "local",
         preview_blobs_from: str | None = None,
     ) -> str:
-        session_id = self.create_session(cwd, model)
+        session_id = self.create_session(cwd, model, host)
         if preview_blobs_from:
             self.copy_preview_blobs(preview_blobs_from, session_id)
         seq = 1
@@ -333,12 +342,18 @@ class SessionStore:
             ).fetchone()
         return int(row["max_seq"]) + 1
 
-    def list_sessions(self, cwd: str | None = None, limit: int = 100) -> list[dict]:
+    def list_sessions(self, cwd: str | None = None, limit: int = 100, host: str | None = None) -> list[dict]:
         query = "SELECT * FROM sessions"
         args = []
+        clauses = []
+        if host is not None:
+            clauses.append("host = ?")
+            args.append(host)
         if cwd is not None:
-            query += " WHERE cwd = ?"
+            clauses.append("cwd = ?")
             args.append(cwd)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY updated_at DESC LIMIT ?"
         args.append(limit)
         with self._connect() as conn:

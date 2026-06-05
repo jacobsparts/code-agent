@@ -15,6 +15,7 @@ class SessionItem:
     last_user_text: str | None
     locked: bool = False
     lock_owner: str | None = None
+    host: str = "local"
 
 
 def _preview(text: str | None, max_chars: int = 70) -> str:
@@ -94,9 +95,9 @@ def _get_term_size():
         return 100, 30
 
 
-def _render(items, selected, scroll_offset, term_width, term_height, mode, current_cwd):
+def _render(items, selected, scroll_offset, term_width, term_height, mode, current_cwd, host):
     out = ['\x1b[?25l', '\x1b[2J', '\x1b[H']
-    title = f' /resume [{mode}] '
+    title = f' /resume [{host} / {mode}] '
     out.append(f'\x1b[7m{title:<{term_width}}\x1b[0m\n')
     subtitle = '  ↑/↓ navigate | Enter resume | f fork | Tab local/global | Esc cancel'
     out.append(f'\x1b[2m{_fit(subtitle, term_width):<{term_width}}\x1b[0m\n\n')
@@ -130,9 +131,9 @@ def _render(items, selected, scroll_offset, term_width, term_height, mode, curre
     return ''.join(out)
 
 
-def _render_empty(term_width, term_height, mode, current_cwd):
+def _render_empty(term_width, term_height, mode, current_cwd, host):
     out = ['\x1b[?25l', '\x1b[2J', '\x1b[H']
-    title = f' /resume [{mode}] '
+    title = f' /resume [{host} / {mode}] '
     out.append(f'\x1b[7m{title:<{term_width}}\x1b[0m\n')
     subtitle = '  Tab local/global | Esc cancel'
     out.append(f'\x1b[2m{_fit(subtitle, term_width):<{term_width}}\x1b[0m\n\n')
@@ -147,12 +148,12 @@ def _render_empty(term_width, term_height, mode, current_cwd):
     return ''.join(out)
 
 
-def select_session_ui(altmode, store, cwd: str) -> dict | str | None:
+def select_session_ui(altmode, store, cwd: str, host: str = "local") -> dict | str | None:
     from .prompt import RawMode
     mode = "local"
 
     def load_items():
-        rows = store.list_sessions(cwd=cwd if mode == "local" else None, limit=200)
+        rows = store.list_sessions(cwd=cwd if mode == "local" else None, limit=200, host=host)
         result = []
         for row in rows:
             lock = store.get_session_lock(row["session_id"]) if hasattr(store, "get_session_lock") else None
@@ -163,6 +164,7 @@ def select_session_ui(altmode, store, cwd: str) -> dict | str | None:
                 "created_at": row["created_at"],
                 "model": row.get("model"),
                 "last_user_text": row.get("last_user_text"),
+                "host": row.get("host") or "local",
                 "locked": lock is not None,
                 "lock_owner": lock.get("owner") if lock else None,
             }))
@@ -184,9 +186,9 @@ def select_session_ui(altmode, store, cwd: str) -> dict | str | None:
                         scroll_offset = selected
                     if selected >= scroll_offset + items_visible:
                         scroll_offset = selected - items_visible + 1
-                    sys.stdout.write(_render(items, selected, scroll_offset, term_width, term_height, mode, cwd))
+                    sys.stdout.write(_render(items, selected, scroll_offset, term_width, term_height, mode, cwd, host))
                 else:
-                    sys.stdout.write(_render_empty(term_width, term_height, mode, cwd))
+                    sys.stdout.write(_render_empty(term_width, term_height, mode, cwd, host))
                 sys.stdout.flush()
                 k = os.read(sys.stdin.fileno(), 4096)
                 if not k:

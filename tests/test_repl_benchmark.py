@@ -185,6 +185,75 @@ def test_repl_fd0_is_devnull_during_execution_and_restored_between_turns():
     assert second == "still works"
 
 
+def test_stdio_subprocess_transport_basic_subrepl():
+    from code_agent.tools.subrepl import _worker_main
+    from code_agent.tools.transports import StdioSubprocessTransport
+
+    transport = StdioSubprocessTransport(target=_worker_main, args=(os.getcwd(),), queue_count=2)
+    try:
+        transport.start()
+        cmd_queue, output_queue = transport.queues
+        cmd_queue.put("x = 40 + 2\nprint(x)\nx")
+
+        items = []
+        while True:
+            item = output_queue.get(timeout=5)
+            items.append(item)
+            if item[0] == "done":
+                break
+    finally:
+        transport.close()
+
+    assert items == [
+        ("output", "42"),
+        ("output", "\n"),
+        ("output", "42"),
+        ("output", "\n"),
+        ("done", False),
+    ]
+
+
+def test_stdio_subprocess_transport_tool_repl_emit_ack():
+    from queue import Empty
+
+    from code_agent.repl_agent import ToolREPL
+    from code_agent.tools.transports import StdioSubprocessTransport
+
+    repl = ToolREPL(echo=False, transport=StdioSubprocessTransport)
+    try:
+        repl.inject_builtins()
+        repl._running = True
+        repl._cmd_seq += 1
+        repl._cmd_queue.put((repl._cmd_seq, 'emit("hi", release=False)'))
+
+        acked = False
+        seen = []
+        while True:
+            try:
+                req = repl.poll_tool_request(timeout=0.05)
+            except Empty:
+                req = None
+            if req:
+                seen.append(("request", req))
+                repl.send_ack(req.get("request_id"))
+                acked = True
+
+            try:
+                msg = repl._output_queue.get(timeout=0.05)
+            except Empty:
+                continue
+            seen.append(("output", msg))
+            if msg[0] == "done":
+                break
+    finally:
+        repl.close()
+
+    assert acked is True
+    assert ("output", ("progress", "hi\n")) in seen
+    assert ("request", {"tool": "__emit__", "args": {"value": "hi", "release": False}, "request_id": 1}) in seen
+    assert seen[-1] == ("output", ("done", (1, False)))
+
+
 def test_default_checker_missing_release():
     task = BenchmarkTask(id="t", prompt="p", checker=default_checker)
     ctx = BenchmarkTaskContext(

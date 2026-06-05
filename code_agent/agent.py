@@ -69,6 +69,8 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
     """Code assistant with Python REPL execution."""
 
     model = _get_config_value("code_agent_model", "sonnet")
+    worker_host = "local"
+
 
     def _ensure_setup(self):
         super()._ensure_setup()
@@ -91,6 +93,9 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._configure_conversation(self._conversation)
 
         self.llm_client.on_retry = self.on_retry
+
+    def session_host(self) -> str:
+        return getattr(self, "worker_host", "local") or "local"
 
     def _lock_status_text(self, lock: dict | None) -> str:
         if not lock:
@@ -131,6 +136,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
                 session_id,
                 cwd=self.worker_cwd(),
                 model=getattr(self, "model", None),
+                host=self.session_host(),
             )
         except Exception as e:
             print(f"{DIM}Error forking session: {type(e).__name__}: {e}{RESET}")
@@ -189,7 +195,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
 
     def _ensure_live_session(self):
         if self._session_id is None:
-            self._session_id = self._session_store.create_session(self.worker_cwd(), getattr(self, 'model', None))
+            self._session_id = self._session_store.create_session(self.worker_cwd(), getattr(self, 'model', None), self.session_host())
             self._next_event_seq = 1
             if not self._acquire_session_lock(self._session_id):
                 raise RuntimeError("Could not acquire session lock.")
@@ -511,7 +517,9 @@ def _code_agent_send_rg_available():
         repl = self._tool_repl
         repl.inject_builtins()
         if not getattr(self, '_worker_attachment_helpers_injected', False):
-            repl._inject_code(self._worker_attachment_helpers)
+            import inspect
+            from code_agent.tools.subshell import ensure_python_on_path
+            repl._inject_code(inspect.getsource(ensure_python_on_path) + "\n" + self._worker_attachment_helpers)
             self._worker_attachment_helpers_injected = True
         return repl
 
@@ -551,7 +559,6 @@ def _code_agent_send_rg_available():
                     return chunks
         finally:
             repl._running = False
-
     def worker_cwd(self) -> str:
         chunks = self._run_worker_control_code(
             "_code_agent_send_worker_cwd()",
@@ -1948,6 +1955,10 @@ If you don't know how to proceed:
         if not session:
             print(f"{DIM}Session not found: {session_id}{RESET}")
             return False
+        session_host = session.get("host") or "local"
+        if session_host != self.session_host():
+            print(f"{DIM}Session {session_id} belongs to host {session_host}; current worker host is {self.session_host()}.{RESET}")
+            return False
         if not self._acquire_session_lock(session_id):
             return False
         old_session_id = getattr(self, "_session_id", None)
@@ -2090,7 +2101,7 @@ If you don't know how to proceed:
         if resume:
             if resume is True:
                 from code_agent.cli.sessions import select_session_ui
-                selection = select_session_ui(altmode, self._session_store, self.worker_cwd())
+                selection = select_session_ui(altmode, self._session_store, self.worker_cwd(), host=self.session_host())
                 session_id = self._resolve_session_selection(selection)
             else:
                 session_id = resume
@@ -2198,7 +2209,7 @@ If you don't know how to proceed:
                     parts = user_input.strip().split(None, 1)
                     if len(parts) == 1:
                         from code_agent.cli.sessions import select_session_ui
-                        selection = select_session_ui(altmode, self._session_store, self.worker_cwd())
+                        selection = select_session_ui(altmode, self._session_store, self.worker_cwd(), host=self.session_host())
                         session_id = self._resolve_session_selection(selection)
                         if session_id:
                             resumed = self.resume_session(session_id)
@@ -3498,8 +3509,6 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 output_info = f" output={len(self._output)}B" if self._output else ""
                 return f"[BashProcess pid={self.pid} status={status}{output_info} cmd={self.command!r}]"
 
-        # Ensure bare 'python' works in subprocesses
-        from code_agent.tools.subshell import ensure_python_on_path
         ensure_python_on_path()
 
         # Set up preexec_fn for Linux to kill child when parent dies
@@ -3560,6 +3569,21 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         return bp.output.strip()
 
 
+
+def _parse_worker_target(value: str) -> tuple[str, str | None]:
+    """Parse [user@]host[:path] worker target syntax."""
+    if not value:
+        raise ValueError("worker target cannot be empty")
+    if "/" in value.split(":", 1)[0]:
+        raise ValueError(f"Invalid worker target: {value}")
+    if ":" not in value:
+        return value, None
+    host, path = value.split(":", 1)
+    if not host or not path:
+        raise ValueError(f"Invalid worker target: {value}")
+    return host, path
+
+
 def main():
     """CLI entry point for code-agent."""
     import argparse
@@ -3595,6 +3619,12 @@ Examples:
         metavar="SESSION_ID",
         help="Resume a session. With no argument, opens the session picker."
     )
+    parser.add_argument(
+        "worker_target",
+        nargs="?",
+        help="Optional SSH worker target: [user@]host or [user@]host:path"
+    )
+
     args = parser.parse_args()
 
     try:
@@ -3604,10 +3634,32 @@ Examples:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
+    remote_transport = None
+    remote_host = "local"
+    if args.worker_target:
+        try:
+            ssh_target, remote_cwd = _parse_worker_target(args.worker_target)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+
+        from code_agent.tools.transports import SSHSubprocessTransport
+
+        class ConfiguredSSHTransport(SSHSubprocessTransport):
+            def __init__(self, *transport_args, **transport_kwargs):
+                transport_kwargs.setdefault("ssh_target", ssh_target)
+                transport_kwargs.setdefault("remote_cwd", remote_cwd)
+                super().__init__(*transport_args, **transport_kwargs)
+
+        remote_transport = ConfiguredSSHTransport
+        remote_host = ssh_target
+
     class ConfiguredAgent(CodeAgent):
         model = args.model
         max_turns = args.max_turns
-
+        worker_host = remote_host
+        if remote_transport is not None:
+            repl_transport = remote_transport
     try:
         with ConfiguredAgent() as agent:
             agent.cli_run(resume=args.resume)

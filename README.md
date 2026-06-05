@@ -5,10 +5,10 @@
 
 A Python REPL-native agent. The model's response is Python.
 
-Every assistant turn is source code
-executed in a persistent subprocess REPL, with full access to the filesystem, shell, and a
-set of built-in functions for reading files, editing code, searching, spawning processes, and
-managing context. The model decides when it's done by calling `emit(..., release=True)`.
+Every assistant turn is source code executed in a persistent subprocess REPL, 
+with full access to the filesystem, shell, and a set of built-in functions for 
+reading files, editing code, searching, spawning processes, and managing 
+context. The model decides when it's done by calling `emit(..., release=True)`.
 
 This is my daily driver, built and refined through real use.
 
@@ -20,11 +20,12 @@ $ code-agent
 ──────────────────────────────────
 Code Agent
 Python REPL-based coding assistant
-claude-sonnet-4-5
+gpt-5.5-medium
 ──────────────────────────────────
+Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit
+Commands: /repl, /rewind, /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens
 Loading AGENTS.md
 
-═ User ════════════════════════════
 > Summarize the error distribution in today's logs
 
 ─ Python ──────────────────────────
@@ -50,7 +51,7 @@ Worth checking pool settings.
 
 Session ended. Goodbye!
 Resume session: code-agent --resume f5867c0c-6963-405e-9c6a-c775cea6cb6a
-claude-sonnet-4-5: In=12847, Cached=41203, Rsn=1024, Out=843, Cost=$0.118
+gpt-5.5-medium: In=12847, Cached=41203, Rsn=1024, Out=843, Cost=$0.018
 ```
 
 ---
@@ -103,6 +104,7 @@ history and bloating the window.
 - **AST preprocessing** — output shaped for REPL execution; errors transparently corrected or retried silently
 - **Session persistence** — SQLite-backed sessions, fully replayable and resumable
 - **Subagents** — spawn isolated parallel Code Agent subprocesses for independent tasks
+- **Remote SSH workers** — run the REPL worker on any SSH-accessible host; LLM calls and session state remain local, only Python required remotely
 - **Session forking** — fork an active session to explore multiple paths in parallel; sessions are otherwise locked to one writer
 - **Rewind** — step back through conversation history and continue from any earlier point
 - **Auto-attached project context** — `CLAUDE.md` / `AGENTS.md` are loaded automatically at startup, with recursive `@file` reference resolution
@@ -151,15 +153,29 @@ Custom providers and models (local Ollama, corporate proxies, etc.) are register
 
 ---
 
-## Roadmap
+## Remote Workers
 
-The subprocess transport is already abstracted. The default transport uses native
-multiprocessing with fork, which is fast and works well for local agents. There is also an
-alternate external-process transport that wraps a Python worker with a tiny `-e` stub and
-communicates entirely over stdin/stdout.
+The REPL worker is a separate process from the agentic loop. By default it runs
+locally, but it can run on any host you can reach over SSH:
 
-That opens the door to sandboxed workers and remote Python workers over SSH, while keeping
-the same REPL-native agent model.
+```bash
+code-agent example.com
+code-agent root@example.com
+code-agent root@example.com:project-dir
+```
+
+The `:project-dir` suffix sets the worker's CWD before Python starts—relative
+to the remote login directory or absolute.
+
+**Everything that matters runs locally.** LLM API calls, authentication, session
+persistence, the agentic loop itself—none of that touches the remote host. The
+remote side runs a plain Python worker process over stdin/stdout, streamed through
+your SSH connection. The SSH transport wraps the local `ssh` client, so any
+existing configuration works automatically.
+
+**Zero remote setup.** The only remote dependency is Python. No agent software
+to install, no API keys to configure, no daemons to run. If you can `ssh` into
+it, you can run Code Agent on it—with full functionality.
 
 ---
 

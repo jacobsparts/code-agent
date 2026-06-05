@@ -111,3 +111,54 @@ def test_create_session_from_messages_appends_events_and_copies_preview_blobs(tm
     assert first_message["_attachment_refs"] == {"blob": "session://preview/abc"}
     assert "_attachments" not in first_message
     assert store.get_events(source)[0]["payload"]["message"]["_user_content"] == "source"
+
+
+def test_sessions_are_scoped_by_host(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    local = store.create_session("/repo", "model", host="local")
+    remote = store.create_session("/repo", "model", host="remote.example.test")
+
+    assert [row["session_id"] for row in store.list_sessions(cwd="/repo", host="local")] == [local]
+    assert [row["session_id"] for row in store.list_sessions(cwd="/repo", host="remote.example.test")] == [remote]
+    assert {row["session_id"] for row in store.list_sessions(cwd="/repo")} == {local, remote}
+
+
+def test_fork_session_can_override_host(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    source = store.create_session("/repo", "model-a", host="local")
+
+    forked = store.fork_session(source, cwd="/remote/repo", host="remote.example.test")
+
+    forked_session = store.get_session(forked)
+    assert forked_session["host"] == "remote.example.test"
+    assert forked_session["cwd"] == "/remote/repo"
+
+
+def test_existing_session_db_gets_local_host_column(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(str(db_path))
+    session_id = store.create_session("/repo", "model")
+    with store._connect() as conn:
+        conn.execute("ALTER TABLE sessions RENAME TO sessions_old")
+        conn.execute("""
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                model TEXT,
+                title TEXT,
+                last_user_text TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO sessions(session_id, cwd, created_at, updated_at, model, title, last_user_text)
+            SELECT session_id, cwd, created_at, updated_at, model, title, last_user_text
+            FROM sessions_old
+        """)
+        conn.execute("DROP TABLE sessions_old")
+        conn.commit()
+
+    migrated = SessionStore(str(db_path))
+
+    assert migrated.get_session(session_id)["host"] == "local"
