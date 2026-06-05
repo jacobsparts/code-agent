@@ -2466,7 +2466,7 @@ If you don't know how to proceed:
             session_id = getattr(self, "_session_id", None)
             if session_id:
                 self._release_session_lock(session_id)
-                self.console.print(f"[dim]Resume session: code-agent --resume {session_id}[/dim]")
+                self.console.print(f"[dim]Resume session: coda --resume {session_id}[/dim]")
 
 
 class CodeAgent(MCPMixin, CodeAgentBase):
@@ -3596,11 +3596,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  code-agent                          # Start with default settings
-  code-agent --model sonnet           # Use Claude
-  code-agent --max-turns 50           # Limit conversation turns
-  code-agent --resume                 # Open session picker on startup
-  code-agent --resume <session_id>    # Resume specific session directly
+  coda                                # Start with default settings
+  coda --model sonnet                 # Use Claude
+  coda --max-turns 50                 # Limit conversation turns
+  coda --resume                       # Open session picker on startup
+  coda --resume <session_id>          # Resume specific session directly
 """
     )
     parser.add_argument(

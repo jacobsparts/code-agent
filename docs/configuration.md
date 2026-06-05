@@ -111,7 +111,7 @@ variables, read from secrets managers, or do anything else you need.
 Once registered, select any model with:
 
 ```bash
-code-agent --model ollama/my-coder
+coda --model ollama/my-coder
 ```
 
 Or interactively at the prompt with `/model`.

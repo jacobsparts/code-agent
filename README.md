@@ -15,7 +15,7 @@ This is my daily driver, built and refined through real use.
 Here's what a session looks like:
 
 ```
-$ code-agent
+$ coda
 
 ──────────────────────────────────
 Code Agent
@@ -50,7 +50,7 @@ Worth checking pool settings.
 ...
 
 Session ended. Goodbye!
-Resume session: code-agent --resume f5867c0c-6963-405e-9c6a-c775cea6cb6a
+Resume session: coda --resume f5867c0c-6963-405e-9c6a-c775cea6cb6a
 gpt-5.5-medium: In=12847, Cached=41203, Rsn=1024, Out=843, Cost=$0.018
 ```
 
@@ -133,7 +133,7 @@ alternate-screen takeover.
 ```bash
 pip install git+https://github.com/jacobsparts/code-agent.git
 export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY, GOOGLE_API_KEY, etc.
-code-agent
+coda
 ```
 
 Or clone and install:
@@ -142,7 +142,7 @@ Or clone and install:
 git clone https://github.com/jacobsparts/code-agent.git
 cd code-agent
 pip install -e .
-code-agent
+coda
 ```
 
 Copy `.env.example` to `.env` to persist your API key and preferred model.
@@ -159,9 +159,9 @@ The REPL worker is a separate process from the agentic loop. By default it runs
 locally, but it can run on any host you can reach over SSH:
 
 ```bash
-code-agent example.com
-code-agent root@example.com
-code-agent root@example.com:project-dir
+coda example.com
+coda root@example.com
+coda root@example.com:project-dir
 ```
 
 The `:project-dir` suffix sets the worker's CWD before Python starts—relative

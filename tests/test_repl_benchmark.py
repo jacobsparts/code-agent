@@ -506,7 +506,7 @@ code_agent_model = "test-code-agent"
     assert result.returncode == 0
     assert "4" in text
     assert "Session ended. Goodbye!" in text
-    assert "Resume session: code-agent --resume " in text
+    assert "Resume session: coda --resume " in text
     assert Path(env["CODE_AGENT_SESSION_DB"]).exists()
     assert Path(env["CODE_AGENT_CLI_HISTORY_DB"]).exists()
 
