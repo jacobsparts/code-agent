@@ -70,6 +70,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
 
     model = _get_config_value("code_agent_model", "sonnet")
     worker_host = "local"
+    worker_target = None
 
 
     def _ensure_setup(self):
@@ -96,6 +97,11 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
 
     def session_host(self) -> str:
         return getattr(self, "worker_host", "local") or "local"
+
+    def resume_session_command(self, session_id: str) -> str:
+        worker_target = getattr(self, "worker_target", None)
+        target = f" {worker_target}" if worker_target else ""
+        return f"coda{target} --resume {session_id}"
 
     def _lock_status_text(self, lock: dict | None) -> str:
         if not lock:
@@ -2466,7 +2472,7 @@ If you don't know how to proceed:
             session_id = getattr(self, "_session_id", None)
             if session_id:
                 self._release_session_lock(session_id)
-                self.console.print(f"[dim]Resume session: coda --resume {session_id}[/dim]")
+                self.console.print(f"[dim]Resume session: {self.resume_session_command(session_id)}[/dim]")
 
 
 class CodeAgent(MCPMixin, CodeAgentBase):
@@ -3661,6 +3667,7 @@ Examples:
         model = args.model
         max_turns = args.max_turns
         worker_host = remote_host
+        worker_target = args.worker_target
         if remote_transport is not None:
             repl_transport = remote_transport
     try:

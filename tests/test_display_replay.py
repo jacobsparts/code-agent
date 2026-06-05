@@ -262,6 +262,23 @@ def test_code_agent_formats_empty_file_diff_history():
     assert agent._format_file_diff_events("src/missing.py") == "No file diffs recorded for src/missing.py."
 
 
+def test_code_agent_resume_session_command_uses_worker_target_when_present():
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.worker_target = "root@example.com:project-dir"
+
+    assert agent.resume_session_command("663389fc") == "coda root@example.com:project-dir --resume 663389fc"
+
+
+def test_code_agent_resume_session_command_without_worker_target_is_local():
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+
+    assert agent.resume_session_command("663389fc") == "coda --resume 663389fc"
+
+
 def test_code_agent_diff_history_tool_bridge():
     from code_agent.agent import CodeAgent
 
