@@ -31,11 +31,15 @@ def extract_method_source(impl: Callable, name: str) -> str:
     Raises:
         ValueError: If source extraction or transformation fails
     """
-    # Get source
-    try:
-        source = inspect.getsource(impl)
-    except (OSError, TypeError) as e:
-        raise ValueError(f"Cannot extract source for '{name}': {e}")
+    # Prefer the source captured when the tool was decorated.  Calling
+    # inspect.getsource() later can combine old function line metadata with a
+    # changed on-disk source file and inject the wrong function body.
+    source = getattr(impl, "_tool_source", None)
+    if source is None:
+        try:
+            source = inspect.getsource(impl)
+        except (OSError, TypeError) as e:
+            raise ValueError(f"Cannot extract source for '{name}': {e}")
     
     source = textwrap.dedent(source)
     
@@ -45,23 +49,22 @@ def extract_method_source(impl: Callable, name: str) -> str:
     except SyntaxError as e:
         raise ValueError(f"Cannot parse source for '{name}': {e}")
     
-    # Find function definition.  Prefer an exact name match, but tolerate
-    # injected tools whose registered tool name differs from the Python
-    # function name in the source returned by inspect.getsource().
+    # Find the top-level function definition.  Do not use ast.walk() here:
+    # injected tools may contain nested helper functions/classes, and extracting
+    # one of those would silently replace the tool with the wrong callable.
+    top_level_functions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
     func_def = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
+    for node in top_level_functions:
+        if node.name == name:
             func_def = node
             break
 
-    if func_def is None:
-        top_level_functions = [
-            node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        if len(top_level_functions) == 1:
-            func_def = top_level_functions[0]
-            func_def.name = name
+    if func_def is None and len(top_level_functions) == 1:
+        func_def = top_level_functions[0]
+        func_def.name = name
 
     if func_def is None:
         raise ValueError(f"Cannot find function '{name}' in extracted source")

@@ -2085,7 +2085,10 @@ If you don't know how to proceed:
             from code_agent.llm_registry import resolve_model_name
             full_model_name = resolve_model_name(self.model)
             model_name = full_model_name.split('/')[-1] if '/' in full_model_name else full_model_name
-            banner = f"{welcome}\n[dim]{model_name}[/dim]"
+            banner_lines = [welcome, f"[dim]{model_name}[/dim]"]
+            if self.session_host() != "local":
+                banner_lines.append(f"[dim]{self.session_host()}[/dim]")
+            banner = "\n".join(banner_lines)
             self.console.print(Panel.fit(banner, border_style="cyan"))
 
 

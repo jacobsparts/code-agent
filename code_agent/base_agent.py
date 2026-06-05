@@ -176,6 +176,11 @@ class BaseAgent(metaclass=AgentMeta):
                 raise ValueError(f"Missing docstring: {fn.__name__}")
             fn._tool_name = toolname = fn.__name__
             fn._tool_inject = inject
+            if inject:
+                try:
+                    fn._tool_source = inspect.getsource(fn)
+                except (OSError, TypeError):
+                    fn._tool_source = None
             fn._tool_spec = lambda self, fn=fn, toolname=toolname: _tool_spec_from_function(fn, toolname)
             return fn
 
