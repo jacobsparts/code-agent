@@ -50,17 +50,21 @@ class UsageTracker:
         if transform := model_config.get('token_transform'):
             usage = transform(usage)
         # Anthropic uses input_tokens/output_tokens; OpenAI uses prompt_tokens/completion_tokens
-        cached_tokens = self._coalesce_paths(usage, [
+        # OpenAI-style: cached tokens are included in prompt_tokens, so we need to subtract
+        openai_cached_tokens = self._coalesce_paths(usage, [
             'native_tokens_cached',
             ('prompt_tokens_details', 'cached_tokens'),
         ])
-        cached_tokens += usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+        # Anthropic-style: cache tokens are separate from input_tokens (already excluded)
+        anthropic_cached_tokens = usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+        cached_tokens = openai_cached_tokens + anthropic_cached_tokens
         prompt_tokens = self._coalesce_paths(usage, [
             'native_tokens_prompt',
             'prompt_tokens',
             'input_tokens',
         ])
-        prompt_tokens -= cached_tokens
+        # Only subtract OpenAI-style cached tokens (Anthropic's input_tokens already excludes cache)
+        prompt_tokens -= openai_cached_tokens
         if prompt_tokens < 0:
             logger.warning(f"⚠️ Negative prompt token count: {usage}")
             return {'prompt_tokens': 0, 'cached_tokens': 0, 'completion_tokens': 0, 'reasoning_tokens': 0, 'cost': 0.0}
