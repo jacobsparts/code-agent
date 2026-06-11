@@ -6,7 +6,9 @@ They are composed in preprocess() with a single compile gate at the end: if the
 transformed code compiles, accept it; otherwise return the original.
 """
 
+import ast
 import re
+
 
 
 def _compiles(code: str) -> bool:
@@ -313,6 +315,57 @@ def _fix_triple_quote_conflict(code: str) -> str:
     )
 
 
+_DIRECT_SUBPROCESS_ERROR = (
+    "Direct subprocess usage is not supported in this environment. "
+    "Use bash(command, timeout=..., bg=False) instead; it provides framework-managed "
+    "timeouts, output capture, and cancellation."
+)
+
+
+def _subprocess_rejection(code: str) -> str | None:
+    """Return replacement code that rejects direct subprocess usage, if present."""
+    try:
+        tree = ast.parse(code, "<repl>", "exec")
+    except SyntaxError:
+        return None
+
+    subprocess_names: set[str] = set()
+    subprocess_members: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess" or alias.name.startswith("subprocess."):
+                    subprocess_names.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            for alias in node.names:
+                if alias.name == "*":
+                    return f"raise RuntimeError({_DIRECT_SUBPROCESS_ERROR!r})"
+                subprocess_members.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in subprocess_names:
+                return f"raise RuntimeError({_DIRECT_SUBPROCESS_ERROR!r})"
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id in subprocess_members:
+                    return f"raise RuntimeError({_DIRECT_SUBPROCESS_ERROR!r})"
+                if func.id == "__import__" and node.args:
+                    first_arg = node.args[0]
+                    if isinstance(first_arg, ast.Constant) and first_arg.value == "subprocess":
+                        return f"raise RuntimeError({_DIRECT_SUBPROCESS_ERROR!r})"
+            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                if func.value.id in subprocess_names:
+                    return f"raise RuntimeError({_DIRECT_SUBPROCESS_ERROR!r})"
+
+    if subprocess_names or subprocess_members:
+        return f"raise RuntimeError({_DIRECT_SUBPROCESS_ERROR!r})"
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -323,8 +376,13 @@ def preprocess(code: str) -> str:
     Transforms are composed so that, e.g., fence stripping and JS-comment fixing
     work together even though neither alone produces compilable code.
     """
+    rejection = _subprocess_rejection(code)
+    if rejection is not None:
+        return rejection
+
     if _compiles(code):
         return code
+
 
     fixed = code
     fixed = _extract_provider_function_call_code(fixed)
@@ -337,6 +395,9 @@ def preprocess(code: str) -> str:
     fixed = _comment_out_non_python(fixed)
 
     if fixed != code and _compiles(fixed):
+        rejection = _subprocess_rejection(fixed)
+        if rejection is not None:
+            return rejection
         return fixed
 
     return code
