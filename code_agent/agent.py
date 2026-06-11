@@ -3570,12 +3570,19 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         output = bp.read()
         
         if bp.returncode is None:
-            # Timeout occurred
+            # Timeout occurred. Preserve a handle even if the caller wrote
+            # print(bash(...)) or otherwise failed to assign the return value.
+            globals()["bash_proc"] = bp
+            globals()[f"bash_proc_{bp.pid}"] = bp
+            print(
+                f"Timed-out BashProcess assigned to bash_proc "
+                f"(also bash_proc_{bp.pid})."
+            )
             if not getattr(bash, '_shown_bashprocess_help', False):
                 print(
-                    "BashProcess returned. Use proc.wait(timeout=...), "
-                    "proc.read(timeout=...), proc.output, proc.returncode, "
-                    "or proc.kill()."
+                    "BashProcess returned. Use bash_proc.wait(timeout=...), "
+                    "bash_proc.read(timeout=...), bash_proc.output, "
+                    "bash_proc.returncode, or bash_proc.kill()."
                 )
                 bash._shown_bashprocess_help = True
             return bp
