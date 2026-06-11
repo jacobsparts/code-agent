@@ -254,6 +254,75 @@ def test_stdio_subprocess_transport_tool_repl_emit_ack():
     assert seen[-1] == ("output", ("done", (1, False)))
 
 
+
+def test_tool_repl_worker_imports_from_current_directory(tmp_path, monkeypatch):
+    from queue import Empty
+
+    from code_agent.repl_agent import ToolREPL
+    from code_agent.tools.transports import StdioSubprocessTransport
+
+    (tmp_path / "worker_local_module.py").write_text("VALUE = 123\n")
+    monkeypatch.chdir(tmp_path)
+
+    repl = ToolREPL(echo=False, transport=StdioSubprocessTransport)
+    try:
+        repl.inject_builtins()
+        repl._running = True
+        repl._cmd_seq += 1
+        repl._cmd_queue.put((repl._cmd_seq, "import worker_local_module\nprint(worker_local_module.VALUE)"))
+
+        items = []
+        while True:
+            try:
+                msg = repl._output_queue.get(timeout=5)
+            except Empty:
+                raise AssertionError("Timed out waiting for ToolREPL output")
+            items.append(msg)
+            if msg[0] == "done":
+                break
+    finally:
+        repl.close()
+
+    assert ("output", "123\n") in items
+    assert items[-1] == ("done", (1, False))
+
+
+def test_tool_repl_does_not_pass_local_cwd_to_ssh_transport():
+    from queue import Queue
+
+    from code_agent.repl_agent import ToolREPL
+    from code_agent.tools.transports import SSHSubprocessTransport
+
+    class FakeSSHTransport(SSHSubprocessTransport):
+        def __init__(self, target, args=(), queue_count=2, maxsize=1):
+            self._target = target
+            self._args = args
+            self._queue_count = queue_count
+            self._maxsize = maxsize
+            self.queues = ()
+            self.worker = object()
+            self.started = False
+
+        def start(self):
+            self.started = True
+            self.queues = tuple(Queue(maxsize=self._maxsize) for _ in range(self._queue_count))
+
+        def is_alive(self):
+            return self.started
+
+        def terminate(self):
+            self.started = False
+
+        def close(self):
+            self.started = False
+
+    repl = ToolREPL(echo=False, transport=FakeSSHTransport)
+    try:
+        repl._ensure_session()
+        assert repl._transport._args == (None,)
+    finally:
+        repl.close()
+
 def test_default_checker_missing_release():
     task = BenchmarkTask(id="t", prompt="p", checker=default_checker)
     ctx = BenchmarkTaskContext(

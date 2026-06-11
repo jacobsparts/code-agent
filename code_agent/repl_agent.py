@@ -220,6 +220,7 @@ def _tool_worker_main(
     output_queue: Queue,
     tool_request_queue: Queue,
     tool_response_queue: Queue,
+    cwd: Optional[str] = None,
 ) -> None:
     """
     Worker process that can make tool calls back to main process.
@@ -227,6 +228,12 @@ def _tool_worker_main(
     Tool stubs in repl_locals use the request/response queues to
     execute tools in the main process where the actual implementations live.
     """
+    if cwd is not None:
+        os.chdir(cwd)
+    current_cwd = os.getcwd()
+    if current_cwd not in sys.path:
+        sys.path.insert(0, current_cwd)
+
     repl_locals: dict[str, Any] = {
         '_output_queue': output_queue,
         '_tool_request_queue': tool_request_queue,
@@ -333,8 +340,18 @@ class ToolREPL(SubREPL):
     def _ensure_session(self) -> None:
         """Override to use tool-aware worker and add tool queues."""
         if self._transport is None or not self._transport.is_alive():
+            cwd = None
+            try:
+                from code_agent.tools.transports import SSHSubprocessTransport
+                is_remote_transport = issubclass(self._transport_class, SSHSubprocessTransport)
+            except TypeError:
+                is_remote_transport = False
+            if not is_remote_transport:
+                cwd = os.getcwd()
+
             self._transport = self._transport_class(
                 target=_tool_worker_main,
+                args=(cwd,),
                 queue_count=4,
             )
             self._transport.start()
