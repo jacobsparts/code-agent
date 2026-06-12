@@ -1154,6 +1154,16 @@ Call help(function_name) for parameter descriptions.
                 self.on_repl_chunk(output, "error")
             return output, True, output_chunks, code
 
+        from code_agent.execution_policy import ExecutionPolicyError, check_execution_policy
+        try:
+            check_execution_policy(validation_code)
+        except ExecutionPolicyError as e:
+            output = f"{type(e).__name__}: {e}\n"
+            output_chunks = [("error", output)]
+            if hasattr(self, 'on_repl_chunk'):
+                self.on_repl_chunk(output, "error")
+            return output, False, output_chunks, code
+
         # Split into statements, then transform each individually
         # (Can't transform whole code first because AST strips comments,
         # which would cause misalignment between original and transformed statements)
