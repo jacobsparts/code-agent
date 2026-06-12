@@ -286,10 +286,13 @@ def prompt(
         _redraw(buf, cursor)
 
     with RawMode():
-        sys.stdout.write(prompt_str + initial_text)
-        sys.stdout.flush()
+        leading_newlines = prompt_str[:len(prompt_str) - len(display_prompt)]
+        if leading_newlines:
+            sys.stdout.write(leading_newlines)
+            sys.stdout.flush()
         buf = list(initial_text)
         cursor = len(buf)
+        redraw(buf, cursor)
         history_idx = len(history)
         saved_line = []
         pending_esc = False
