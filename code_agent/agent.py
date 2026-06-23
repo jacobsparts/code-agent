@@ -1381,34 +1381,29 @@ edit(file_path, old_string, new_string, replace_all=False)
     Replace exact string matches.
     - old_string must match exactly (whitespace, indentation)
     - Fails if not found or multiple matches (unless replace_all=True)
-line_patch(file_path, patch)
-    Edit an existing file by line number.
+line_patch(file_path, op, start, end_or_content=None, content=None)
+    Edit an existing file by line number with required line-content anchors.
     - Prefer a full view(file_path) first; if absent, line_patch uses current on-disk contents
-    - Within one assistant turn, repeated line_patch() calls for the same file use the
-      file content from the start of that turn as their line-number baseline
-    - Operation headers must start at column 1 in the patch string
-    - Body lines are literal file content; indent only if the file should contain that indentation
-    - Multiple operations in one call are atomic
-    - Overlapping same-turn line_patch() operations for a file are rejected
+    - Each call performs one operation
+    - Anchors use "@LINE expected line content"
+    - Anchor text must match the target line after leading/trailing whitespace is stripped
+    - Within one assistant turn, repeated line_patch() calls may use original line numbers;
+      line_patch tracks earlier same-turn line-count changes and translates later anchors
+    - Overlapping same-turn line_patch() operations are rejected
     - For create/move/delete, use Python file APIs such as Path.write_text(), Path.rename(), or Path.unlink()
 
-    line_patch("src/app.py", '''replace 10:12
-def name():
-    return "new"
-
-insert after 25
-print("done")
-
-delete 40:44''')
+    line_patch("src/app.py", "replace", "@10 def name():", "@11     return old", "def name():\\n    return \"new\"\\n")
+    line_patch("src/app.py", "insert_after", "@25 print(done)", "print('next')\n")
+    line_patch("src/app.py", "delete", "@40 old_start", "@44 old_end")
 
     Operations:
-      replace START:END
-      delete START:END
-      insert before LINE
-      insert after LINE
+      line_patch(path, "replace", start_anchor, end_anchor, new_content)
+      line_patch(path, "delete", start_anchor, end_anchor)
+      line_patch(path, "insert_before", anchor, new_content)
+      line_patch(path, "insert_after", anchor, new_content)
 
-    `insert after 0` prepends to the file.
-    `insert before LINE_COUNT + 1` appends to the file.
+    `insert_after` accepts @0 as a prepend anchor with empty expected content.
+    `insert_before` accepts @LINE_COUNT+1 as an append anchor with empty expected content.
 
 
 diff_history(file_path=None, limit=None)
@@ -1569,7 +1564,7 @@ If you don't know how to proceed:
         """Called at start of each turn."""
         if hasattr(self, '_tool_repl'):
             try:
-                self._tool_repl._inject_code('globals().pop("_line_patch_turn_baselines", None)')
+                self._tool_repl._inject_code('globals().pop("_line_patch_turn_state", None)')
             except Exception:
                 pass
 
@@ -2938,6 +2933,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                     "line_count": len(new_content.split('\n')),
                     "line_patch_stale": False,
                 })
+        globals().get("_line_patch_turn_state", {}).pop(resolved_path, None)
         import difflib
         diff = ''.join(difflib.unified_diff(
             content.splitlines(keepends=True),
@@ -2960,41 +2956,76 @@ class CodeAgent(MCPMixin, CodeAgentBase):
     @REPLAgent.tool(inject=True)
     def line_patch(self,
             file_path: str = "Path to an existing file",
-            patch: str = "Line patch operations"
+            op: str = "Operation: replace, delete, insert_before, or insert_after",
+            start: str = "Anchor in the form '@LINE expected line content'",
+            end_or_content: Optional[str] = "End anchor for replace/delete, or content for insert operations",
+            content: Optional[str] = "Replacement content for replace operations"
         ):
-        """Edit an existing file by line number.
+        """Edit an existing file by line number with line-content anchors.
 
         Prefer a full view(file_path) first. If no current view snapshot exists,
         line_patch uses the file's current on-disk contents as the line-number
         baseline and attaches the edited file for future context.
 
-        Within one assistant turn, repeated line_patch() calls for the same file
-        are interpreted against the file content as it existed at the start of
-        the turn. Each call is converted to a context patch and applied to the
-        current file, so line-count changes from earlier line_patch() calls do
-        not shift later line numbers.
+        Each call performs one operation. Line anchors use the form
+        "@LINE expected line content"; the expected content must match the target
+        line after leading/trailing whitespace is stripped.
 
-        Multiple operations in one call are applied atomically.
+        Within one assistant turn, repeated line_patch() calls for the same file
+        may continue to use line numbers from the file as it existed at the start
+        of the turn. The tool tracks earlier same-turn line-count changes and
+        translates later anchors to the current file before applying them.
 
         Operations:
-          replace START:END
-          delete START:END
-          insert before LINE
-          insert after LINE
+          line_patch(path, "replace", "@START first line", "@END last line", new_content)
+          line_patch(path, "delete", "@START first line", "@END last line")
+          line_patch(path, "insert_before", "@LINE anchor line", new_content)
+          line_patch(path, "insert_after", "@LINE anchor line", new_content)
 
-        Operation headers must start at column 1 in the patch string. Body lines
-        are literal file content and continue until the next operation header; do
-        not indent body lines unless the file should contain that indentation.
-
-        Use Python file APIs such as Path.write_text(), Path.rename(), or
-        Path.unlink() for create, move, and delete.
+        `insert_after` accepts @0 as a prepend anchor. `insert_before` accepts
+        @LINE_COUNT+1 as an append anchor; the expected line content must be
+        empty for that virtual EOF anchor.
         """
+        import ast
         import hashlib
         import json as _json
+        import os
         import re
 
         if isinstance(file_path, str) and file_path.startswith("session://"):
             raise ValueError("line_patch cannot edit session:// preview URIs.")
+
+        valid_ops = {"replace", "delete", "insert_before", "insert_after"}
+        if op not in valid_ops:
+            raise ValueError(f"Unsupported line_patch operation {op!r}. Expected one of: {', '.join(sorted(valid_ops))}.")
+
+        def _parse_anchor(anchor, label):
+            if not isinstance(anchor, str):
+                raise TypeError(f"{label} anchor must be a string like '@12 expected content'.")
+            match = re.match(r"^@(\d+)(?:\s(.*))?$", anchor)
+            if not match:
+                raise ValueError(f"{label} anchor must be in the form '@LINE expected line content'.")
+            return int(match.group(1)), match.group(2) or ""
+
+        def _line_matches(actual, expected):
+            return actual.strip() == expected.strip()
+
+        def _anchor_mismatch(path_text, original_line, current_line, expected, actual):
+            return (
+                f"Anchor mismatch in {path_text}\n"
+                f"Expected original @{original_line}: {expected}\n"
+                f"Translated current @{current_line}: {actual}"
+            )
+
+        def _content_lines(text):
+            if text is None:
+                return []
+            if not isinstance(text, str):
+                raise TypeError("line_patch content must be a string.")
+            lines = text.split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
+            return lines
 
         global _request_id
         _request_id += 1
@@ -3014,13 +3045,12 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         snapshots = globals().setdefault("_line_patch_snapshots", {})
         snapshot = snapshots.get(file_path)
         if snapshot is None:
-            all_lines = old_text.split('\n')
             snapshot = {
                 "path": file_path,
                 "resolved_path": resolved_path,
                 "content": old_text,
                 "sha256": old_hash,
-                "line_count": len(all_lines),
+                "line_count": len(old_text.split("\n")),
                 "line_patch_stale": False,
             }
             snapshots[file_path] = snapshot
@@ -3032,312 +3062,217 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 snapshot.update({
                     "content": old_text,
                     "sha256": old_hash,
-                    "line_count": len(old_text.split('\n')),
+                    "line_count": len(old_text.split("\n")),
                     "line_patch_stale": False,
                 })
             else:
                 raise ValueError(f"{file_path} changed on disk since it was viewed. Call view({file_path!r}) again before line_patch().")
 
-        turn_baselines = globals().setdefault("_line_patch_turn_baselines", {})
-        baseline = turn_baselines.get(resolved_path)
-        if baseline is None:
+        turn_states = globals().setdefault("_line_patch_turn_state", {})
+        state = turn_states.get(resolved_path)
+        if state is None:
             baseline_text = old_text
-            baseline = {
+            state = {
                 "path": file_path,
                 "resolved_path": resolved_path,
                 "content": baseline_text,
                 "sha256": hashlib.sha256(baseline_text.encode()).hexdigest(),
-                "line_count": len(baseline_text.split('\n')),
-                "applied_ranges": [],
-                "applied_points": [],
+                "line_count": len(baseline_text.split("\n")),
+                "edits": [],
             }
-            turn_baselines[resolved_path] = baseline
+            turn_states[resolved_path] = state
         else:
-            baseline_text = baseline["content"]
+            baseline_text = state["content"]
 
-        header_re = re.compile(r'^(replace) (\d+):(\d+)$|^(delete) (\d+):(\d+)$|^(insert) (before|after) (\d+)$')
-        raw_lines = patch.split('\n')
-        ops = []
-        current = None
-
-        def finish_current():
-            if current is not None:
-                ops.append(current)
-
-        for raw in raw_lines:
-            match = header_re.match(raw)
-            if match:
-                finish_current()
-                if match.group(1):
-                    current = {
-                        "kind": "replace",
-                        "start": int(match.group(2)),
-                        "end": int(match.group(3)),
-                        "body": [],
-                        "header": raw,
-                    }
-                elif match.group(4):
-                    current = {
-                        "kind": "delete",
-                        "start": int(match.group(5)),
-                        "end": int(match.group(6)),
-                        "body": [],
-                        "header": raw,
-                    }
-                else:
-                    current = {
-                        "kind": "insert",
-                        "where": match.group(8),
-                        "line": int(match.group(9)),
-                        "body": [],
-                        "header": raw,
-                    }
-                continue
-            if current is None:
-                if raw.strip():
-                    raise ValueError(f"Expected line_patch operation header, got: {raw!r}")
-                continue
-            current["body"].append(raw)
-        finish_current()
-
-        if raw_lines and raw_lines[-1] == "":
-            for op in reversed(ops):
-                if op.get("body") and op["body"][-1] == "":
-                    op["body"].pop()
-                    break
-
-        if not ops:
-            raise ValueError("line_patch has no operations.")
-
-        baseline_lines = baseline_text.split('\n')
-        line_count = len(baseline_lines)
-        range_ops = []
-        insertion_points = set()
-
-        for op in ops:
-            kind = op["kind"]
-            if kind in {"replace", "delete"}:
-                start = op["start"]
-                end = op["end"]
-                if start < 1 or end < start or end > line_count:
-                    raise ValueError(f"Invalid range {start}:{end} for {file_path} with {line_count} baseline lines.")
-                range_ops.append((start, end, op))
-                if kind == "delete" and any(line.strip() for line in op["body"]):
-                    raise ValueError(f"{op['header']} does not accept a body.")
-            else:
-                line = op["line"]
-                where = op["where"]
-                if where == "before":
-                    valid = 1 <= line <= line_count + 1
-                    point = ("before", line)
-                else:
-                    valid = 0 <= line <= line_count
-                    point = ("after", line)
-                if not valid:
-                    raise ValueError(f"Invalid insert {where} {line} for {file_path} with {line_count} baseline lines.")
-                if point in insertion_points:
-                    raise ValueError(f"Duplicate line_patch insertion point: insert {where} {line}.")
-                insertion_points.add(point)
-                if not op["body"]:
-                    raise ValueError(f"insert {where} {line} has no body.")
-
-        for i, (start_a, end_a, op_a) in enumerate(range_ops):
-            for start_b, end_b, op_b in range_ops[i + 1:]:
-                if start_a <= end_b and start_b <= end_a:
-                    raise ValueError(f"Overlapping line_patch operations: {op_a['header']} conflicts with {op_b['header']}.")
-        for op in ops:
-            if op["kind"] != "insert":
-                continue
-            line = op["line"]
-            for start, end, range_op in range_ops:
-                inside = (
-                    (op["where"] == "before" and start <= line <= end)
-                    or (op["where"] == "after" and start <= line < end)
-                )
-                if inside:
-                    raise ValueError(f"Overlapping line_patch operations: {op['header']} conflicts with {range_op['header']}.")
-
-        for start, end, op in range_ops:
-            for prev_start, prev_end, prev_header, _prev_delta in baseline["applied_ranges"]:
-                if start <= prev_end and prev_start <= end:
-                    raise ValueError(f"line_patch operation {op['header']} overlaps earlier same-turn operation {prev_header}.")
-            for where, line, prev_header, _prev_delta in baseline["applied_points"]:
-                inside = (
-                    (where == "before" and start <= line <= end)
-                    or (where == "after" and start <= line < end)
-                )
-                if inside:
-                    raise ValueError(f"line_patch operation {op['header']} overlaps earlier same-turn operation {prev_header}.")
-        for op in ops:
-            if op["kind"] != "insert":
-                continue
-            line = op["line"]
-            where = op["where"]
-            for prev_start, prev_end, prev_header, _prev_delta in baseline["applied_ranges"]:
-                inside = (
-                    (where == "before" and prev_start <= line <= prev_end)
-                    or (where == "after" and prev_start <= line < prev_end)
-                )
-                if inside:
-                    raise ValueError(f"line_patch operation {op['header']} overlaps earlier same-turn operation {prev_header}.")
-            for prev_where, prev_line, prev_header, _prev_delta in baseline["applied_points"]:
-                if where == prev_where and line == prev_line:
-                    raise ValueError(f"line_patch operation {op['header']} duplicates earlier same-turn operation {prev_header}.")
-
-        by_start = {start: op for start, end, op in range_ops}
-        by_before = {}
-        by_after = {}
-        for op in ops:
-            if op["kind"] == "insert":
-                if op["where"] == "before":
-                    by_before[op["line"]] = op
-                else:
-                    by_after[op["line"]] = op
-
-        desired_lines = []
-        if 0 in by_after:
-            desired_lines.extend(by_after[0]["body"])
-
-        i = 1
-        while i <= line_count:
-            if i in by_before:
-                desired_lines.extend(by_before[i]["body"])
-            replace_op = by_start.get(i)
-            if replace_op is not None:
-                if replace_op["kind"] == "replace":
-                    desired_lines.extend(replace_op["body"])
-                i = replace_op["end"] + 1
-                if i - 1 in by_after:
-                    desired_lines.extend(by_after[i - 1]["body"])
-                continue
-            desired_lines.append(baseline_lines[i - 1])
-            if i in by_after:
-                desired_lines.extend(by_after[i]["body"])
-            i += 1
-
-        if line_count + 1 in by_before:
-            desired_lines.extend(by_before[line_count + 1]["body"])
-
-        desired_text = '\n'.join(desired_lines)
-        if desired_text == baseline_text:
-            raise ValueError("line_patch produced no changes.")
-
-        translated_range_ops = []
-        translated_insert_ops = []
-        for start, end, op in range_ops:
-            shift = 0
-            for prev_start, prev_end, _prev_header, prev_delta in baseline.get("applied_ranges", []):
-                if start > prev_end:
-                    shift += prev_delta
-            for prev_where, prev_line, _prev_header, prev_delta in baseline.get("applied_points", []):
-                if (
-                    (prev_where == "before" and start >= prev_line)
-                    or (prev_where == "after" and start > prev_line)
-                ):
-                    shift += prev_delta
-            translated_range_ops.append((start + shift, end + shift, op))
-
-        for op in ops:
-            if op["kind"] != "insert":
-                continue
-            line = op["line"]
-            shift = 0
-            for prev_start, prev_end, _prev_header, prev_delta in baseline.get("applied_ranges", []):
-                if line > prev_end:
-                    shift += prev_delta
-            for prev_where, prev_line, _prev_header, prev_delta in baseline.get("applied_points", []):
-                if (
-                    (prev_where == "before" and line >= prev_line)
-                    or (prev_where == "after" and line > prev_line)
-                ):
-                    shift += prev_delta
-            translated = dict(op)
-            translated["line"] = line + shift
-            translated_insert_ops.append(translated)
-
-        current_lines = old_text.split('\n')
+        baseline_lines = baseline_text.split("\n")
+        current_lines = old_text.split("\n")
+        baseline_line_count = len(baseline_lines)
         current_line_count = len(current_lines)
-        for start, end, op in translated_range_ops:
-            if start < 1 or end < start or end > current_line_count:
-                raise ValueError(f"Translated line_patch range {op['header']} no longer fits {file_path}.")
-        for op in translated_insert_ops:
-            line = op["line"]
-            where = op["where"]
-            valid = 1 <= line <= current_line_count + 1 if where == "before" else 0 <= line <= current_line_count
+
+        def _baseline_line(line):
+            if line == 0:
+                return ""
+            if line == baseline_line_count + 1:
+                return ""
+            return baseline_lines[line - 1]
+
+        def _current_line(line):
+            if line == 0:
+                return ""
+            if line == current_line_count + 1:
+                return ""
+            return current_lines[line - 1]
+
+        def _check_baseline_anchor(original_line, expected, label, allow_prepend=False, allow_append=False):
+            valid = 1 <= original_line <= baseline_line_count
+            if allow_prepend and original_line == 0:
+                valid = True
+            if allow_append and original_line == baseline_line_count + 1:
+                valid = True
             if not valid:
-                raise ValueError(f"Translated line_patch insertion {op['header']} no longer fits {file_path}.")
+                raise ValueError(f"{label} anchor @{original_line} is outside {file_path} with {baseline_line_count} baseline lines.")
+            actual = _baseline_line(original_line)
+            if not _line_matches(actual, expected):
+                raise ValueError(
+                    f"Anchor mismatch in {file_path}\n"
+                    f"Expected baseline @{original_line}: {expected}\n"
+                    f"Actual baseline   @{original_line}: {actual}"
+                )
 
-        translated_by_start = {start: op for start, end, op in translated_range_ops}
-        translated_ends = {start: end for start, end, op in translated_range_ops}
-        translated_by_before = {}
-        translated_by_after = {}
-        for op in translated_insert_ops:
-            if op["where"] == "before":
-                translated_by_before[op["line"]] = op
+        def _insert_affects_existing(edit, original_line):
+            if edit["kind"] != "insert":
+                return False
+            if edit["where"] == "before":
+                return original_line >= edit["line"]
+            return original_line > edit["line"]
+
+        def _map_existing_line(original_line):
+            mapped = original_line
+            for edit in state["edits"]:
+                if edit["kind"] == "range":
+                    if edit["start"] <= original_line <= edit["end"]:
+                        raise ValueError(f"Original line @{original_line} was already modified by earlier same-turn line_patch operation {edit['header']}.")
+                    if original_line > edit["end"]:
+                        mapped += edit["delta"]
+                elif _insert_affects_existing(edit, original_line):
+                    mapped += edit["delta"]
+            return mapped
+
+        def _map_insert_point(where, original_line):
+            mapped = original_line
+            for edit in state["edits"]:
+                if edit["kind"] == "range":
+                    if edit["start"] <= original_line <= edit["end"]:
+                        raise ValueError(f"Insert anchor @{original_line} was already modified by earlier same-turn line_patch operation {edit['header']}.")
+                    if original_line > edit["end"]:
+                        mapped += edit["delta"]
+                elif edit["kind"] == "insert":
+                    if edit["where"] == "before":
+                        if original_line >= edit["line"]:
+                            mapped += edit["delta"]
+                    elif edit["where"] == "after":
+                        if original_line > edit["line"] or (where == "after" and original_line == edit["line"]):
+                            mapped += edit["delta"]
+            return mapped
+
+        def _reject_range_overlap(start_line, end_line, header):
+            for edit in state["edits"]:
+                if edit["kind"] == "range":
+                    if start_line <= edit["end"] and edit["start"] <= end_line:
+                        raise ValueError(f"line_patch operation {header} overlaps earlier same-turn operation {edit['header']}.")
+                elif edit["kind"] == "insert":
+                    inside = (
+                        (edit["where"] == "before" and start_line <= edit["line"] <= end_line)
+                        or (edit["where"] == "after" and start_line <= edit["line"] < end_line)
+                    )
+                    if inside:
+                        raise ValueError(f"line_patch operation {header} overlaps earlier same-turn operation {edit['header']}.")
+
+        if op in {"replace", "delete"}:
+            start_line, start_expected = _parse_anchor(start, "start")
+            end_line, end_expected = _parse_anchor(end_or_content, "end")
+            if start_line < 1 or end_line < start_line or end_line > baseline_line_count:
+                raise ValueError(f"Invalid range {start_line}:{end_line} for {file_path} with {baseline_line_count} baseline lines.")
+            _check_baseline_anchor(start_line, start_expected, "start")
+            _check_baseline_anchor(end_line, end_expected, "end")
+            header = f"{op} @{start_line}..@{end_line}"
+            _reject_range_overlap(start_line, end_line, header)
+            current_start = _map_existing_line(start_line)
+            current_end = _map_existing_line(end_line)
+            if current_start < 1 or current_end < current_start or current_end > current_line_count:
+                raise ValueError(f"Translated range @{start_line}:@{end_line} no longer fits {file_path}.")
+            actual_start = _current_line(current_start)
+            actual_end = _current_line(current_end)
+            if not _line_matches(actual_start, start_expected):
+                raise ValueError(_anchor_mismatch(file_path, start_line, current_start, start_expected, actual_start))
+            if not _line_matches(actual_end, end_expected):
+                raise ValueError(_anchor_mismatch(file_path, end_line, current_end, end_expected, actual_end))
+            replacement = _content_lines(content if op == "replace" else "")
+            if op == "delete" and content is not None:
+                raise ValueError("delete does not accept replacement content.")
+            new_lines = current_lines[:current_start - 1] + replacement + current_lines[current_end:]
+            delta = len(replacement) - (end_line - start_line + 1)
+            edit_record = {
+                "kind": "range",
+                "start": start_line,
+                "end": end_line,
+                "delta": delta,
+                "header": header,
+            }
+        else:
+            anchor_line, expected = _parse_anchor(start, "insert")
+            insert_content = end_or_content if content is None else content
+            body = _content_lines(insert_content)
+            if not body:
+                raise ValueError(f"{op} requires non-empty content.")
+            where = "before" if op == "insert_before" else "after"
+            _check_baseline_anchor(
+                anchor_line,
+                expected,
+                "insert",
+                allow_prepend=(where == "after"),
+                allow_append=(where == "before"),
+            )
+            header = f"{op} @{anchor_line}"
+            current_anchor = _map_insert_point(where, anchor_line)
+            valid = 1 <= current_anchor <= current_line_count + 1 if where == "before" else 0 <= current_anchor <= current_line_count
+            if not valid:
+                raise ValueError(f"Translated insert anchor @{anchor_line} no longer fits {file_path}.")
+            if anchor_line in (0, baseline_line_count + 1):
+                validation_line = current_anchor
             else:
-                translated_by_after[op["line"]] = op
+                validation_line = _map_existing_line(anchor_line)
+            actual = _current_line(validation_line)
+            if not _line_matches(actual, expected):
+                raise ValueError(_anchor_mismatch(file_path, anchor_line, validation_line, expected, actual))
+            if where == "before":
+                new_lines = current_lines[:current_anchor - 1] + body + current_lines[current_anchor - 1:]
+            else:
+                new_lines = current_lines[:current_anchor] + body + current_lines[current_anchor:]
+            edit_record = {
+                "kind": "insert",
+                "where": where,
+                "line": anchor_line,
+                "delta": len(body),
+                "header": header,
+            }
 
-        new_lines = []
-        if 0 in translated_by_after:
-            new_lines.extend(translated_by_after[0]["body"])
-
-        i = 1
-        while i <= current_line_count:
-            if i in translated_by_before:
-                new_lines.extend(translated_by_before[i]["body"])
-            replace_op = translated_by_start.get(i)
-            if replace_op is not None:
-                if replace_op["kind"] == "replace":
-                    new_lines.extend(replace_op["body"])
-                i = translated_ends[i] + 1
-                if i - 1 in translated_by_after:
-                    new_lines.extend(translated_by_after[i - 1]["body"])
-                continue
-            new_lines.append(current_lines[i - 1])
-            if i in translated_by_after:
-                new_lines.extend(translated_by_after[i]["body"])
-            i += 1
-
-        if current_line_count + 1 in translated_by_before:
-            new_lines.extend(translated_by_before[current_line_count + 1]["body"])
-
-        new_text = '\n'.join(new_lines)
+        new_text = "\n".join(new_lines)
         if new_text == old_text:
             raise ValueError("line_patch produced no changes.")
+
+        if path.suffix == ".py":
+            try:
+                ast.parse(new_text, filename=str(path))
+            except SyntaxError as exc:
+                location = f"{exc.lineno}:{exc.offset}" if exc.lineno is not None else "unknown"
+                raise SyntaxError(f"line_patch would make invalid Python syntax at {location}: {exc.msg}") from exc
 
         import difflib
         path.write_text(new_text)
         snapshot.update({
             "content": new_text,
             "sha256": hashlib.sha256(new_text.encode()).hexdigest(),
-            "line_count": len(new_text.split('\n')),
+            "line_count": len(new_text.split("\n")),
             "line_patch_stale": False,
         })
-        baseline["applied_ranges"].extend(
-            (start, end, op["header"], len(op["body"]) - (end - start + 1) if op["kind"] == "replace" else -(end - start + 1))
-            for start, end, op in range_ops
-        )
-        baseline["applied_points"].extend(
-            (op["where"], op["line"], op["header"], len(op["body"]))
-            for op in ops
-            if op["kind"] == "insert"
-        )
+        state["edits"].append(edit_record)
 
-        diff = ''.join(difflib.unified_diff(
+        diff = "".join(difflib.unified_diff(
             old_text.splitlines(keepends=True),
             new_text.splitlines(keepends=True),
             fromfile=file_path,
             tofile=file_path,
         ))
         if diff:
-            _send_output("file_diff", diff.rstrip('\n') + "\n")
+            _send_output("file_diff", diff.rstrip("\n") + "\n")
         _send_output("file_written", _json.dumps({
             "path": file_path,
             "content": new_text,
         }) + "\n")
         if not was_attached:
-            lines = new_text.split('\n')
-            formatted = '\n'.join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))
+            lines = new_text.split("\n")
+            formatted = "\n".join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))
             _send_output("read_attach", file_path + "\n")
             _send_output("read", formatted + "\n")
         return "Line patch applied."

@@ -427,7 +427,7 @@ def test_auto_preview_can_be_disabled(tmp_path):
     assert result == original
     assert "[PreviewRef:" not in result
 
-def test_line_patch_repeated_calls_use_start_of_turn_baseline(tmp_path):
+def test_line_patch_repeated_calls_adjust_line_changes_between_calls(tmp_path):
     path = tmp_path / "sample.txt"
     path.write_text("a\nb\nc\nd\ne\n")
     agent = make_persistent_agent(tmp_path)
@@ -437,8 +437,8 @@ def test_line_patch_repeated_calls_use_start_of_turn_baseline(tmp_path):
         output, pure_syntax_error, output_chunks, _ = agent._execute_with_tool_handling(
             repl,
             "\n".join([
-                f"line_patch({str(path)!r}, {chr(34)*3}delete 2:2{chr(34)*3})",
-                f"line_patch({str(path)!r}, {chr(34)*3}replace 4:4\\nD{chr(34)*3})",
+                f"line_patch({str(path)!r}, 'delete', '@2 b', '@2 b')",
+                f"line_patch({str(path)!r}, 'replace', '@4 d', '@4 d', 'D\\n')",
             ]),
         )
     finally:
@@ -460,15 +460,15 @@ def test_line_patch_repeated_calls_reject_overlapping_original_ranges(tmp_path):
         output, pure_syntax_error, _, _ = agent._execute_with_tool_handling(
             repl,
             "\n".join([
-                f"line_patch({str(path)!r}, {chr(34)*3}replace 2:3\\nB\\nC{chr(34)*3})",
-                f"line_patch({str(path)!r}, {chr(34)*3}delete 3:3{chr(34)*3})",
+                f"line_patch({str(path)!r}, 'replace', '@2 b', '@3 c', 'B\\nC\\n')",
+                f"line_patch({str(path)!r}, 'delete', '@3 c', '@3 c')",
             ]),
         )
     finally:
         repl.close()
 
     assert pure_syntax_error is False
-    assert "overlaps earlier same-turn operation replace 2:3" in output
+    assert "overlaps earlier same-turn operation replace @2..@3" in output
     assert path.read_text() == "a\nB\nC\nd\n"
 
 
