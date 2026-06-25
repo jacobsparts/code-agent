@@ -49,6 +49,21 @@ class EndpointRegistry:
         self._providers = {}
         self._aliases = {}
 
+    def list_models(self):
+        aliases_by_model = {}
+        for alias, full_name in self._aliases.items():
+            aliases_by_model.setdefault(full_name, []).append(alias)
+        return [
+            {
+                "full_name": full_name,
+                "provider": model.provider.provider,
+                "alias": full_name.split("/", 1)[1],
+                "model": model.model,
+                "aliases": sorted(aliases_by_model.get(full_name, [])),
+            }
+            for full_name, model in sorted(self._models.items())
+        ]
+
     def register_provider(self, name, **kwargs):
         kwargs['provider'] = name
         self._providers[name] = ProviderConfig(**kwargs)
@@ -98,6 +113,7 @@ register_provider = registry.register_provider
 register_model = registry.register_model
 get_model_config = registry.get_model_config
 resolve_model_name = registry.resolve_model_name
+list_models = registry.list_models
 
 # --- OpenAI ---
 register_provider("openai",

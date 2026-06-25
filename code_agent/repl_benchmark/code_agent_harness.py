@@ -46,7 +46,7 @@ def parse_events(text: str) -> list[dict]:
 def _prompt_idle(output: bytearray, inputs_done: bool) -> bool:
     if not inputs_done:
         return False
-    decoded = strip_ansi(output.decode(errors="replace"))
+    decoded = strip_ansi(output.decode(errors="replace")).replace("\r", "")
     stripped = decoded.rstrip()
     if not stripped.endswith(">"):
         return False

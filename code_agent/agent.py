@@ -2315,31 +2315,33 @@ If you don't know how to proceed:
                     self._display_input_block(user_input, include_header=False)
                     parts = user_input.strip().split(None, 1)
                     if len(parts) == 1:
-                        # No argument - show current model
-                        from code_agent.llm_registry import resolve_model_name
-                        full_name = resolve_model_name(self.model)
-                        if full_name != self.model:
-                            self._display_text(f"{DIM}Current model: {self.model} → {full_name}{RESET}", kind="status")
-                        else:
-                            self._display_text(f"{DIM}Current model: {self.model}{RESET}", kind="status")
+                        from code_agent.llm_registry import list_models, resolve_model_name
+                        from code_agent.cli.models import select_model_ui
+                        selected_model = select_model_ui(altmode, list_models(), resolve_model_name(self.model))
+                        if selected_model is None:
+                            continue
+                        new_model = selected_model
                     else:
-                        # Set new model
                         new_model = parts[1].strip()
-                        old_model = self.model
-                        try:
-                            # Validate the model exists by trying to get its config
-                            from code_agent.llm_registry import get_model_config
-                            get_model_config(new_model)
-                            self.model = new_model
-                            # Clear cached client so new model takes effect
-                            if hasattr(self, '_llm_client'):
-                                delattr(self, '_llm_client')
-                            # Update conversation's client reference (preserves message history)
-                            if hasattr(self, '_conversation'):
-                                self._conversation.llm_client = self.llm_client
-                            self._display_text(f"{DIM}Model changed: {old_model} → {new_model}{RESET}", kind="status")
-                        except ModelNotFoundError as e:
-                            self._display_text(f"{DIM}{str(e)}{RESET}", kind="status")
+
+                    old_model = self.model
+                    try:
+                        # Validate the model exists by trying to get its config
+                        from code_agent.llm_registry import get_model_config
+                        get_model_config(new_model)
+                        if new_model == old_model:
+                            self._display_text(f"{DIM}Current model: {old_model}{RESET}", kind="status")
+                            continue
+                        self.model = new_model
+                        # Clear cached client so new model takes effect
+                        if hasattr(self, '_llm_client'):
+                            delattr(self, '_llm_client')
+                        # Update conversation's client reference (preserves message history)
+                        if hasattr(self, '_conversation'):
+                            self._conversation.llm_client = self.llm_client
+                        self._display_text(f"{DIM}Model changed: {old_model} → {new_model}{RESET}", kind="status")
+                    except ModelNotFoundError as e:
+                        self._display_text(f"{DIM}{str(e)}{RESET}", kind="status")
                     continue
 
                 if user_input.strip() == "/tokens":
@@ -2994,6 +2996,29 @@ class CodeAgent(MCPMixin, CodeAgentBase):
 
         if isinstance(file_path, str) and file_path.startswith("session://"):
             raise ValueError("line_patch cannot edit session:// preview URIs.")
+
+        if isinstance(op, str):
+            legacy = re.match(r"^(replace|delete|insert_before|insert_after)\s+(\d+)(?::(\d+))?\n(.*)\Z", op, re.DOTALL)
+            if legacy:
+                legacy_op = legacy.group(1)
+                legacy_start = int(legacy.group(2))
+                legacy_end = int(legacy.group(3) or legacy.group(2))
+                legacy_content = legacy.group(4)
+                legacy_lines = Path(file_path).expanduser().read_text().split("\n")
+
+                def _legacy_anchor(line):
+                    if 1 <= line <= len(legacy_lines):
+                        return f"@{line} {legacy_lines[line - 1]}"
+                    return f"@{line}"
+
+                op = legacy_op
+                start = _legacy_anchor(legacy_start)
+                if legacy_op in {"replace", "delete"}:
+                    end_or_content = _legacy_anchor(legacy_end)
+                    content = legacy_content if legacy_op == "replace" else None
+                else:
+                    end_or_content = legacy_content
+                    content = None
 
         valid_ops = {"replace", "delete", "insert_before", "insert_after"}
         if op not in valid_ops:
