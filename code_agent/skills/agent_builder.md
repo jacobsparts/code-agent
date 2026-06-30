@@ -40,32 +40,32 @@ Select the appropriate model automatically from this set when building agents:
 
 | Model | Use |
 |---|---|
-| `google/gemini-3-flash-preview` | Default for simple tasks. Fast, cheap, good general-purpose model, especially data retrieval tasks. |
-| `sonnet` | Everyday reasoning model. More intelligent than `google/gemini-3-flash-preview`, slower, and more opinionated. |
-| `opus` | High-intelligence model for non-deterministic goal-oriented workflows, data analysis, and communication-heavy tasks. Prefers many turns. |
-| `gpt-5.5-medium` | High-intelligence model, concise and direct. Best REPL performance and a good orchestrator. |
+| `opencode/mimo-v2.5-pro` | Default for simple tasks. Fast, cheap, good general-purpose model, especially data retrieval tasks. No vision support. |
+| `opencode/minimax-m3` | Everyday reasoning model. More intelligent than `opencode/mimo-v2.5-pro`. Vision support. |
+| `fireworks/glm-5.2` | High-intelligence model for non-deterministic goal-oriented workflows, data analysis, and communication-heavy tasks. No vision support. |
+| `gpt-5.5-medium` | High-intelligence model, concise and direct. Best REPL performance and a good orchestrator. Vision support. |
 
 Default choices:
-- Simple retrieval, extraction, formatting, routing: `google/gemini-3-flash-preview`.
-- Normal business reasoning or mixed judgment: `sonnet`.
-- Complex data analysis or open-ended goal pursuit: ask before using `opus`.
-- REPL-heavy agents or orchestration-heavy workflows: ask before using `gpt-5.5-medium`.
+- Simple retrieval, extraction, formatting, routing: `opencode/mimo-v2.5-pro`.
+- Normal business reasoning or mixed judgment: `opencode/minimax-m3`.
+- Complex data analysis or open-ended goal pursuit: `fireworks/glm-5.2`.
+- REPL-heavy agents or orchestration-heavy workflows: `gpt-5.5-medium`.
 
 Approval rule:
 - For interactive, user-driven agents, choose the best fit from the table.
-- For unattended automation, scheduled jobs, or side-effecting production workflows, use only `google/gemini-3-flash-preview` or `sonnet` unless the user explicitly approves `opus` or `gpt-5.5-medium`.
+- For unattended automation, scheduled jobs, or side-effecting production workflows, use only `opencode/mimo-v2.5-pro` or `opencode/minimax-m3` unless the user explicitly approves `fireworks/glm-5.2` or `gpt-5.5-medium`.
 - If requirements do not clearly justify one of the four models, ask the user.
 
 ```python
 class Agent(BaseAgent):
-    model = "google/gemini-3-flash-preview"
+    model = "opencode/mimo-v2.5-pro"
 ```
 
 For deployable projects:
 - Put model selection in a config helper if several agents share tiers.
 - Allow command-line or environment overrides for evaluation.
 - Keep model choice at class level unless runtime switching is a requirement.
-- Require explicit approval before configuring unattended automation to use `opus` or `gpt-5.5-medium`.
+- Require explicit approval before configuring unattended automation to use `fireworks/glm-5.2` or `gpt-5.5-medium`.
 
 ```python
 class Agent(BaseAgent):
@@ -79,7 +79,7 @@ class Agent(BaseAgent):
 from agentlib import BaseAgent
 
 class HashAgent(BaseAgent):
-    model = "google/gemini-3-flash-preview"
+    model = "opencode/mimo-v2.5-pro"
     system = "You are a hashing assistant. Use sha256 to answer."
 
     @BaseAgent.tool
@@ -100,7 +100,7 @@ print(agent.run("hash hello world"))
 from agentlib import BaseAgent
 
 class ReportAgent(BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = """You write concise reports from provided records.
 Call submit_report when done."""
 
@@ -132,7 +132,7 @@ from typing import Literal
 from agentlib import BaseAgent
 
 class DecisionAgent(BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = "Choose an action, then call decide."
 
     @BaseAgent.tool
@@ -171,7 +171,7 @@ class ReviewDecision(BaseModel):
     confidence: str = Field(..., description="high, medium, or low")
 
 class Reviewer(BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = "Review the item, then call submit_decision."
 
     @BaseAgent.tool(model=ReviewDecision)
@@ -191,7 +191,7 @@ from pydantic import Field, create_model
 from agentlib import BaseAgent
 
 class Picker(BaseAgent):
-    model = "google/gemini-3-flash-preview"
+    model = "opencode/mimo-v2.5-pro"
     system = "Pick one option and call choose."
 
     def __init__(self, options):
@@ -242,7 +242,7 @@ A `REPLAgent` makes the LLM write Python directly. The assistant response is exe
 from agentlib import REPLAgent
 
 class AnalysisAgent(REPLAgent):
-    model = "google/gemini-3-flash-preview"
+    model = "opencode/mimo-v2.5-pro"
     system = """You are a data analyst.
 Write Python only. Use emit(answer, release=True) for the final answer."""
 
@@ -297,7 +297,7 @@ Use `repl_startup` to preload imports, constants, clients, or data.
 
 ```python
 class ResearchREPL(REPLAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = """You answer questions about the preloaded `data` object.
 Use emit(answer, release=True)."""
 
@@ -331,7 +331,7 @@ This is often the best balance: structured outer agent, REPL only for hard analy
 from agentlib import BaseAgent, REPLAgent
 
 class ResearchREPL(REPLAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = """Answer specific data questions using Python.
 If the answer is already in summaries, say so. Use emit(answer, release=True)."""
 
@@ -346,7 +346,7 @@ If the answer is already in summaries, say so. Use emit(answer, release=True).""
         ]
 
 class PricingAgent(BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = """Make the pricing decision from the summaries.
 Use research only for specific questions not answered by the summaries."""
 
@@ -393,7 +393,7 @@ from agentlib import PythonToolResponseMixin
 from agentlib.cli import CLIAgent
 
 class FinanceAgent(PythonToolResponseMixin, CLIAgent):
-    model = "google/gemini-3-flash-preview"
+    model = "opencode/mimo-v2.5-pro"
     system = """You answer questions about simplefin.sqlite3.
 
 Call sql_query(query) in Python to query the database.
@@ -432,7 +432,7 @@ Use when:
 from agentlib.cli import CLIAgent
 
 class Assistant(CLIAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = "You are helpful. Call submit_response for final answers."
     welcome_message = "[bold]Assistant[/bold]"
     cli_prompt = "assistant> "
@@ -463,7 +463,7 @@ Use attachments for large named context that may be updated or invalidated.
 from agentlib import AttachmentMixin, BaseAgent
 
 class DocAgent(AttachmentMixin, BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = "Answer using attached documents."
 
     @BaseAgent.tool
@@ -538,7 +538,7 @@ Production lessons:
 from agentlib import BaseAgent
 
 class WorkflowAgent(BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
 
     @BaseAgent.tool
     def think(self, notes: str = "Working notes"):
@@ -572,7 +572,7 @@ Use a script to select work, call an agent per item, then apply side effects.
 
 ```python
 class ItemReviewer(BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = open("review.prompt").read()
 
     def __init__(self, manager):
@@ -717,7 +717,7 @@ For BaseAgent file editors, use `FilePatchMixin`.
 from agentlib import BaseAgent, FilePatchMixin
 
 class Editor(FilePatchMixin, BaseAgent):
-    model = "sonnet"
+    model = "opencode/minimax-m3"
     system = "Edit files using apply_patch, then call done."
     patch_preview = None
 

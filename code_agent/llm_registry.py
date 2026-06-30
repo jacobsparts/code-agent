@@ -244,6 +244,14 @@ register_model("google","gemini-3.1-pro",
     output_cost=12.00,
     reasoning_cost=12.00,
 )
+register_model("google","gemini-3.5-flash",
+    model="gemini-3.5-flash",
+    config={"thinkingLevel": "high"},
+    input_cost=1.5,
+    cached_cost=0.15,
+    output_cost=9.00,
+    reasoning_cost=9.00,
+)
 
 # --- X.AI ---
 register_provider("xai",
