@@ -349,25 +349,24 @@ def _render_table(rows: list[list[str]], width: int) -> list[str]:
     if table_width > max_table_width:
         available = max_table_width - (3 * col_count + 1)
         if available > col_count:
-            min_width = 3
+            min_widths = [min(12, w) for w in col_widths]
             # Start with natural widths, then shrink the widest columns until the
-            # table fits. This preserves narrow numeric columns better than
-            # forcing every column toward the same average width.
-            col_widths = [max(min_width, w) for w in col_widths]
+            # table fits or every column has reached its minimum. This preserves
+            # readable columns better than forcing very thin wrapping.
             while sum(col_widths) > available:
-                shrinkable = [c for c, w in enumerate(col_widths) if w > min_width]
+                shrinkable = [c for c, w in enumerate(col_widths) if w > min_widths[c]]
                 if not shrinkable:
                     break
                 widest = max(shrinkable, key=lambda c: col_widths[c])
                 col_widths[widest] -= 1
 
-    def truncate(cell: str, col_width: int) -> str:
+    def wrap_cell(cell: str, col_width: int) -> list[str]:
         plain = strip_ansi(cell)
+        if col_width <= 0:
+            return [plain]
         if len(plain) <= col_width:
-            return cell
-        if col_width <= 1:
-            return '…'
-        return plain[:col_width - 1] + '…'
+            return [cell]
+        return [plain[i:i + col_width] for i in range(0, len(plain), col_width)]
 
     rendered = []
     border = TABLE_COLOR + '┌' + '┬'.join('─' * (w + 2) for w in col_widths) + '┐' + RESET
@@ -376,14 +375,20 @@ def _render_table(rows: list[list[str]], width: int) -> list[str]:
     rendered.append(border)
 
     for row_index, row in enumerate(normalized):
-        cells = []
+        wrapped_cells = []
         for col, cell in enumerate(row):
             colored = _colorize_inline(cell)
             if row_index == 0:
                 colored = BOLD + colored + RESET
-            colored = truncate(colored, col_widths[col])
-            cells.append(' ' + _pad_ansi(colored, col_widths[col]) + ' ')
-        rendered.append(TABLE_COLOR + '│' + RESET + (TABLE_COLOR + '│' + RESET).join(cells) + TABLE_COLOR + '│' + RESET)
+            wrapped_cells.append(wrap_cell(colored, col_widths[col]))
+
+        row_height = max(len(cell_lines) for cell_lines in wrapped_cells)
+        for line_index in range(row_height):
+            cells = []
+            for col, cell_lines in enumerate(wrapped_cells):
+                cell_line = cell_lines[line_index] if line_index < len(cell_lines) else ''
+                cells.append(' ' + _pad_ansi(cell_line, col_widths[col]) + ' ')
+            rendered.append(TABLE_COLOR + '│' + RESET + (TABLE_COLOR + '│' + RESET).join(cells) + TABLE_COLOR + '│' + RESET)
         if row_index == 0:
             rendered.append(header_sep)
 
