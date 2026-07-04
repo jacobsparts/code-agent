@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.11
 """Code assistant with Python REPL execution and REPL-proxied tools.
 
 Combines REPLAgent with CLIMixin to create an interactive coding assistant
@@ -3572,6 +3572,7 @@ def _parse_worker_target(value: str) -> tuple[str, str | None]:
 def main():
     """CLI entry point for code-agent."""
     import argparse
+    import logging
 
     parser = argparse.ArgumentParser(
         description="Code Agent - Python REPL-based coding assistant",
@@ -3604,6 +3605,12 @@ Examples:
         metavar="SESSION_ID",
         help="Resume a session. With no argument, opens the session picker."
     )
+
+    parser.add_argument(
+        "--debug",
+        metavar="LOG_FILE",
+        help="Write LLM request bodies and provider responses to LOG_FILE.",
+    )
     parser.add_argument(
         "worker_target",
         nargs="?",
@@ -3611,6 +3618,17 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.debug:
+        log_path = Path(args.debug).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger = logging.getLogger("code_agent")
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        logger.propagate = False
 
     try:
         from code_agent.llm_registry import get_model_config
