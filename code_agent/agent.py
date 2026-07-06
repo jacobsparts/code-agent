@@ -1184,6 +1184,8 @@ def _code_agent_send_rg_available():
     welcome_message = "[bold]Code Agent[/bold]\nPython REPL-based coding assistant"
     thinking_message = "Working..."
     interactive = True  # Enables multi-turn autonomous workflow
+    repl_display = True
+    response_formatting = True
     max_turns = _get_config_value("code_agent_max_turns", 100)
     system = """>>> help(assistant)
 
@@ -1569,6 +1571,10 @@ If you don't know how to proceed:
                 pass
 
     def on_repl_chunk(self, chunk: str, msg_type: str = "echo") -> None:
+        if not self.repl_display:
+            if msg_type == "file_diff":
+                self._record_file_diff_event(chunk)
+            return
         """Called for each output chunk. Display echo and progress immediately."""
         # Suppress display during direct user REPL mode
         if getattr(self, '_in_user_repl', False):
@@ -1804,6 +1810,10 @@ If you don't know how to proceed:
         return '\n'.join(truncated_lines)
 
     def on_statement_output(self, statement_chunks: list) -> None:
+        if not self.repl_display:
+            if getattr(self, '_suppress_next_edit_result', False):
+                self._suppress_next_edit_result = False
+            return
         """Display per-statement summary after each statement completes."""
         # Suppress display during direct user REPL mode
         if getattr(self, '_in_user_repl', False):
@@ -1831,6 +1841,12 @@ If you don't know how to proceed:
             self._suppress_next_edit_result = False
 
     def on_repl_output(self, output_chunks: list) -> None:
+        if not self.repl_display:
+            self._turn_number = getattr(self, '_turn_number', 1) + 1
+            self._edit_echo_buffer = []
+            self._in_edit_echo = False
+            self._turn_output_started = False
+            return
         """Called at end of turn. Updates thinking message for next turn."""
         # Show thinking for next turn
         self._turn_number = getattr(self, '_turn_number', 1) + 1
@@ -1841,6 +1857,8 @@ If you don't know how to proceed:
         print(f"{DIM}{thinking} (turn {self._turn_number}){RESET}", end="", flush=True)
 
     def on_retry(self, kind: str, retry_num: int) -> None:
+        if not self.repl_display:
+            return
         if kind == "syntax":
             status = f"Syntax Retry #{retry_num}... (turn {getattr(self, '_turn_number', 1)})"
         elif kind == "max_tokens":
@@ -2425,8 +2443,9 @@ If you don't know how to proceed:
                 self._header_pending = False
                 self._in_emit_echo = False
                 self._reset_display_capture()
-                print()  # Blank line after user input
-                print(f"{DIM}{thinking} (turn 1){RESET}", end="", flush=True)
+                if self.repl_display:
+                    print()  # Blank line after user input
+                    print(f"{DIM}{thinking} (turn 1){RESET}", end="", flush=True)
 
                 try:
                     response = self.run_loop(max_turns=max_turns)
@@ -2445,17 +2464,19 @@ If you don't know how to proceed:
 
                 self._coalesce_context()
 
-                self.console.clear_line()  # Clear thinking message
+                if self.repl_display:
+                    self.console.clear_line()  # Clear thinking message
 
                 # The next section header delineates the end of Python output.
 
                 # Display response
                 response_str = str(response) if response is not None else ""
-                formatted = self.format_response(response_str)
+                formatted = self.format_response(response_str) if self.response_formatting else response_str
                 if formatted:
                     user_header_pending = True
-                    output_header = self._section_header("Output", "═", TEXT)
-                    print(output_header)
+                    if self.response_formatting:
+                        output_header = self._section_header("Output", "═", TEXT)
+                        print(output_header)
                     print(formatted)
         finally:
             altmode.uninstall()
@@ -3605,6 +3626,16 @@ Examples:
         metavar="SESSION_ID",
         help="Resume a session. With no argument, opens the session picker."
     )
+    parser.add_argument(
+        "--no-repl-display",
+        action="store_true",
+        help="Suppress intermediary REPL display output while the agent is working.",
+    )
+    parser.add_argument(
+        "--no-response-formatting",
+        action="store_true",
+        help="Print final emit(release=True) values as plain text without markdown rendering.",
+    )
 
     parser.add_argument(
         "--debug",
@@ -3662,6 +3693,8 @@ Examples:
         max_turns = args.max_turns
         worker_host = remote_host
         worker_target = args.worker_target
+        repl_display = not args.no_repl_display
+        response_formatting = not args.no_response_formatting
         if remote_transport is not None:
             repl_transport = remote_transport
     try:
