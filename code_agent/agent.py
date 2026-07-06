@@ -2147,6 +2147,14 @@ If you don't know how to proceed:
                 for filename in files:
                     self.attach_file_ref(filename, filename)
 
+        if startup_attachments := getattr(self, "startup_attachments", None):
+            for filename in startup_attachments:
+                try:
+                    size_kb = self.attach_file_ref(filename, filename) / 1000
+                    self._display_text(f"{DIM}Attached {filename} ({size_kb:.1f}KB){RESET}", kind="status", create_session=False)
+                except Exception as e:
+                    self._display_text(f"{DIM}Error attaching {filename}: {e}{RESET}", kind="status", create_session=False)
+
         synth = not resumed_on_start
 
         try:
@@ -3605,6 +3613,7 @@ Examples:
   coda --max-turns 50                 # Limit conversation turns
   coda --resume                       # Open session picker on startup
   coda --resume <session_id>          # Resume specific session directly
+  coda --attach AGENTS.md             # Attach a file on startup
 """
     )
     parser.add_argument(
@@ -3641,6 +3650,13 @@ Examples:
         "--debug",
         metavar="LOG_FILE",
         help="Write LLM request bodies and provider responses to LOG_FILE.",
+    )
+    parser.add_argument(
+        "--attach",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="Attach a file on startup. May be passed multiple times.",
     )
     parser.add_argument(
         "worker_target",
@@ -3693,6 +3709,7 @@ Examples:
         max_turns = args.max_turns
         worker_host = remote_host
         worker_target = args.worker_target
+        startup_attachments = args.attach
         repl_display = not args.no_repl_display
         response_formatting = not args.no_response_formatting
         if remote_transport is not None:
