@@ -343,6 +343,44 @@ def test_code_agent_resume_session_command_without_worker_target_is_local():
     assert agent.resume_session_command("663389fc") == "coda --resume 663389fc"
 
 
+
+def test_code_agent_formats_skills_list():
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.list_skills = lambda: [
+        {
+            "name": "debugging",
+            "source": "built-in",
+            "attached": False,
+            "description": "Debug failures",
+        },
+        {
+            "name": "testing",
+            "source": "user",
+            "attached": True,
+            "description": "",
+        },
+    ]
+
+    assert agent.format_skills_list() == (
+        "Available skills:\n"
+        "- debugging [built-in] — Debug failures\n"
+        "- testing [user] (attached)\n"
+        "\n"
+        "Load a skill with: /skills <name>"
+    )
+
+
+def test_code_agent_formats_empty_skills_list():
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.list_skills = lambda: []
+
+    assert agent.format_skills_list() == "No skills available."
+
+
 def test_code_agent_diff_history_tool_bridge():
     from code_agent.agent import CodeAgent
 

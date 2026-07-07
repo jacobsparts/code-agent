@@ -797,6 +797,19 @@ def _code_agent_send_rg_available():
         self.attach_memory_ref(self._skill_attachment_name(skill), Path(skill["path"]).read_text())
         return True, f"Attached skill: {skill['name']} [{skill['source']}]"
 
+    def format_skills_list(self) -> str:
+        items = self.list_skills()
+        if not items:
+            return "No skills available."
+        lines = ["Available skills:"]
+        for item in items:
+            suffix = " (attached)" if item["attached"] else ""
+            description = f" — {item['description']}" if item["description"] else ""
+            lines.append(f"- {item['name']} [{item['source']}]{suffix}{description}")
+        lines.append("")
+        lines.append("Load a skill with: /skills <name>")
+        return "\n".join(lines)
+
     def apply_skill_selection(self, selected_skills: list[dict]) -> list[str]:
         current = {item["attachment_name"]: item for item in self.list_skills() if item["attached"]}
         desired = {item["attachment_name"]: item for item in selected_skills if item["attached"]}
@@ -1186,6 +1199,7 @@ def _code_agent_send_rg_available():
     interactive = True  # Enables multi-turn autonomous workflow
     repl_display = True
     response_formatting = True
+    agent_mode = False
     max_turns = _get_config_value("code_agent_max_turns", 100)
     system = """>>> help(assistant)
 
@@ -2348,16 +2362,19 @@ Return only the replacement user prompt text.
                     self._display_input_block(user_input, include_header=False)
                     parts = user_input.strip().split(None, 1)
                     if len(parts) == 1:
-                        from code_agent.cli.skills import select_skills_ui
-                        skill_items = self.list_skills()
-                        result = select_skills_ui(altmode, skill_items)
-                        if result is not None:
-                            changes = self.apply_skill_selection(result)
-                            if changes:
-                                for line in changes:
-                                    self._display_text(f"{DIM}{line}{RESET}", kind="status")
-                            else:
-                                self._display_text(f"{DIM}No skill changes{RESET}", kind="status")
+                        if self.agent_mode:
+                            self._display_text(self.format_skills_list(), kind="status")
+                        else:
+                            from code_agent.cli.skills import select_skills_ui
+                            skill_items = self.list_skills()
+                            result = select_skills_ui(altmode, skill_items)
+                            if result is not None:
+                                changes = self.apply_skill_selection(result)
+                                if changes:
+                                    for line in changes:
+                                        self._display_text(f"{DIM}{line}{RESET}", kind="status")
+                                else:
+                                    self._display_text(f"{DIM}No skill changes{RESET}", kind="status")
                     else:
                         ok, msg = self.attach_skill(parts[1].strip())
                         self._display_text(f"{DIM}{msg}{RESET}", kind="status")
@@ -3715,6 +3732,11 @@ Examples:
         action="store_true",
         help="Print final emit(release=True) values as plain text without markdown rendering.",
     )
+    parser.add_argument(
+        "--agent-mode",
+        action="store_true",
+        help="Use agent-oriented output: suppress REPL display, print plain final responses, and list skills without the interactive picker.",
+    )
 
     parser.add_argument(
         "--debug",
@@ -3780,8 +3802,9 @@ Examples:
         worker_host = remote_host
         worker_target = args.worker_target
         startup_attachments = args.attach
-        repl_display = not args.no_repl_display
-        response_formatting = not args.no_response_formatting
+        agent_mode = args.agent_mode
+        repl_display = not (args.no_repl_display or args.agent_mode)
+        response_formatting = not (args.no_response_formatting or args.agent_mode)
         if remote_transport is not None:
             repl_transport = remote_transport
     try:
