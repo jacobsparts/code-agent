@@ -159,6 +159,9 @@ def replay_session_into_agent(agent, session_id: str, store):
         elif event_type == "rewind":
             target_seq = payload["target_seq"]
             messages = copy.deepcopy(snapshots.get(target_seq, snapshots[0]))
+        elif event_type == "exec":
+            messages = copy.deepcopy(snapshots[0])
+            agent._expanded_preview_refs.clear()
         snapshot(seq)
 
     final_missing = []
@@ -312,6 +315,9 @@ def replay_display_text(session_id: str, store, format_response=None) -> str:
         elif event_type == "rewind":
             target_seq = payload["target_seq"]
             chunks, released_to_user, _ = copy.deepcopy(snapshots.get(target_seq, snapshots[0]))
+            just_rewound = True
+        elif event_type == "exec":
+            chunks, released_to_user, _ = copy.deepcopy(snapshots[0])
             just_rewound = True
         snapshot(seq)
 

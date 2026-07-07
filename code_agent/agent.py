@@ -2037,6 +2037,49 @@ If you don't know how to proceed:
         print(f"{DIM}Session resumed: {session_id}{RESET}")
         return True
 
+    def _generate_exec_prompt(self, extra_instructions: str = "") -> str:
+        instruction = """Write a continuation prompt for a fresh Code Agent session.
+
+The prompt will replace the first user message after rewinding this session to the beginning.
+Include all context needed to continue from a new session:
+- current task or pending question
+- relevant project/files/functions inspected
+- decisions and constraints
+- changes already made, if any
+- commands/tests run and results
+- unresolved issues and next steps
+- attachments, previews, or files that should be reattached or viewed again
+- any connection parameters, credential names, environment details, or operational constraints that are necessary and safe to include
+
+Also include kickoff instructions for the next agent. If no task is pending, instruct it to ask the user what to do next.
+
+Return only the replacement user prompt text.
+"""
+        if extra_instructions:
+            instruction += f"\nAdditional user instructions for the continuation prompt:\n{extra_instructions}\n"
+
+        old_ephemeral = self.ephemeral
+        try:
+            self.ephemeral = ""
+            msg = self.llm_client.text_call(
+                self.conversation._messages() + [{"role": "user", "content": instruction}]
+            )
+        finally:
+            self.ephemeral = old_ephemeral
+        return (msg.get("content") or "").strip()
+
+    def _restore_auto_context_attachments(self):
+        names = list(getattr(self, "_auto_context_attachment_names", set()))
+        self._explicit_attachment_refs = {}
+        self._pending_explicit_attachment_refs = {}
+        self._pending_attachments = {}
+        self._expanded_preview_refs.clear()
+        for name in names:
+            try:
+                self.attach_file_ref(name, name)
+            except Exception as e:
+                self._display_text(f"{DIM}Error reattaching {name}: {e}{RESET}", kind="status")
+
     def _quiet_replay_session(self):
         """Re-replay the persisted session into this agent without UI noise."""
         if not self._session_id:
@@ -2129,7 +2172,7 @@ If you don't know how to proceed:
         thinking = getattr(self, 'thinking_message', 'Thinking...')
 
         self.console.print("[dim]Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit[/dim]")
-        startup_commands = "Commands: /repl, /rewind, /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens"
+        startup_commands = "Commands: /repl, /rewind, /exec [instructions], /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens"
         startup_help = f"[dim]{startup_commands}[/dim]"
         self.console.print(startup_help)
 
@@ -2245,6 +2288,28 @@ If you don't know how to proceed:
                     elif rewind_shortcut:
                         sys.stdout.write("\x1b[1A\r\x1b[K")
                         sys.stdout.flush()
+                    continue
+
+                if user_input.strip() == "/exec" or user_input.strip().startswith("/exec "):
+                    self._display_input_block(user_input, include_header=False)
+                    extra_instructions = user_input.strip()[5:].strip()
+                    try:
+                        continuation_prompt = self._generate_exec_prompt(extra_instructions)
+                    except Exception as e:
+                        self._display_text(f"{DIM}Error generating continuation prompt: {type(e).__name__}: {e}{RESET}", kind="status")
+                        continue
+                    if not continuation_prompt:
+                        self._display_text(f"{DIM}No continuation prompt generated.{RESET}", kind="status")
+                        continue
+                    self._append_session_event("exec", {})
+                    self._quiet_replay_session()
+                    self._restore_auto_context_attachments()
+                    self._replay_display_output()
+                    self._display_text(f"{DIM}Session reset. Edit the continuation prompt, then press Enter.{RESET}", kind="status")
+                    preload_input = continuation_prompt
+                    synth = False
+                    user_header_pending = False
+                    self._last_was_repl_output = False
                     continue
 
                 if user_input.strip().startswith("/resume"):

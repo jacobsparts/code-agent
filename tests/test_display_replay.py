@@ -29,6 +29,56 @@ def test_replay_display_text_respects_rewind():
     assert out == "> first\n\n═ Output ═════════════════════════\none\n> third\n\n"
 
 
+
+def test_replay_display_text_respects_exec():
+    store = DummyStore([
+        {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> first\n\n"}},
+        {"seq": 2, "event_type": "message_added", "payload": {"message": {
+            "role": "assistant",
+            "content": 'emit("one", release=True)',
+        }}},
+        {"seq": 3, "event_type": "exec", "payload": {}},
+        {"seq": 4, "event_type": "display", "payload": {"kind": "status", "text": "Session reset.\n"}},
+        {"seq": 5, "event_type": "display", "payload": {"kind": "input", "text": "> continuation\n\n"}},
+    ])
+
+    out = replay_display_text("sid", store)
+    assert out == "Session reset.\n> continuation\n\n"
+
+
+def test_replay_session_into_agent_exec_resets_messages_and_preview_refs():
+    from code_agent.conversation import Conversation
+    from code_agent.session_replay import replay_session_into_agent
+
+    class Client:
+        pass
+
+    class Agent:
+        def __init__(self):
+            self.conversation = Conversation(Client(), "system")
+            self._expanded_preview_refs = {}
+
+        def _configure_conversation(self, conversation):
+            conversation.expanded_preview_refs = self._expanded_preview_refs
+
+    store = DummyStore([
+        {"seq": 1, "event_type": "message_added", "payload": {"message": {"role": "user", "content": "first"}}},
+        {"seq": 2, "event_type": "preview_expanded", "payload": {"uri": "session://preview/old", "numbered": False}},
+        {"seq": 3, "event_type": "message_added", "payload": {"message": {"role": "assistant", "content": "old"}}},
+        {"seq": 4, "event_type": "exec", "payload": {}},
+        {"seq": 5, "event_type": "message_added", "payload": {"message": {"role": "user", "content": "continuation"}}},
+    ])
+    store.get_session = lambda session_id: {"cwd": "."}
+
+    agent = Agent()
+    replay_session_into_agent(agent, "sid", store)
+
+    assert agent.conversation.messages == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "continuation", "_event_seq": 5},
+    ]
+    assert agent._expanded_preview_refs == {}
+
 def test_replay_display_text_ignores_non_display_events():
     store = DummyStore([
         {"seq": 1, "event_type": "message_added", "payload": {"message": {"role": "user"}}},
