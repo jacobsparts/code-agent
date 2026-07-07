@@ -23,7 +23,7 @@ Python REPL-based coding assistant
 gpt-5.5-medium
 ──────────────────────────────────
 Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit
-Commands: /repl, /rewind, /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens
+Commands: /repl, /rewind, /exec [instructions], /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens
 Loading AGENTS.md
 
 > Summarize the error distribution in today's logs
@@ -125,6 +125,9 @@ alternate-screen takeover.
   inspect state, inject values, then hand back control
 - **`/rewind`**, **`/fork`**, **`/resume`**, **`/subagents`**, **`/skills`**, **`/model`**,
   **`/tokens`** — standard slash commands
+- **`/exec [instructions]`** — generate an editable continuation prompt, reset the active session
+  to the beginning under the same session ID, clear non-auto context, and preload the prompt so
+  you can start a fresh branch with preserved task context
 
 ---
 
