@@ -262,6 +262,20 @@ def test_code_agent_formats_empty_file_diff_history():
     assert agent._format_file_diff_events("src/missing.py") == "No file diffs recorded for src/missing.py."
 
 
+
+def test_code_agent_no_repl_display_still_prints_progress_emit(capsys):
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.repl_display = False
+    agent._display_capture = []
+
+    agent.on_repl_chunk("working\n", "progress")
+
+    assert capsys.readouterr().out == "\x1b[92mworking\x1b[0m\n"
+    assert agent._display_capture == ["working\n"]
+
+
 def test_code_agent_resume_session_command_uses_worker_target_when_present():
     from code_agent.agent import CodeAgentBase
 

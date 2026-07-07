@@ -1574,6 +1574,11 @@ If you don't know how to proceed:
         if not self.repl_display:
             if msg_type == "file_diff":
                 self._record_file_diff_event(chunk)
+            elif msg_type == "progress":
+                text = chunk.rstrip('\n')
+                for line in text.split('\n'):
+                    print(f"\x1b[92m{line}\x1b[0m", flush=True)
+                    self._capture_display_line(line)
             return
         """Called for each output chunk. Display echo and progress immediately."""
         # Suppress display during direct user REPL mode
