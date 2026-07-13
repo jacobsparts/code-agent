@@ -2185,8 +2185,18 @@ Return only the replacement user prompt text.
         prompt_str = getattr(self, 'cli_prompt', '> ')
         thinking = getattr(self, 'thinking_message', 'Thinking...')
 
-        self.console.print("[dim]Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit[/dim]")
-        startup_commands = "Commands: /repl, /rewind, /exec [instructions], /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens"
+        key_help = "Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Ctrl+C = interrupt | Ctrl+D = quit"
+        if not self.agent_mode:
+            key_help = "Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit"
+        self.console.print(f"[dim]{key_help}[/dim]")
+        commands = ["/repl"]
+        if not self.agent_mode:
+            commands.append("/rewind")
+        commands.extend(["/exec [instructions]", "/resume [session_id]"])
+        if not self.agent_mode:
+            commands.append("/fork [session_id]")
+        commands.extend(["/skills [name]", "/subagents [model]", "/attach <file>", "/detach <file>", "/attachments", "/model [name]", "/tokens"])
+        startup_commands = f"Commands: {', '.join(commands)}"
         startup_help = f"[dim]{startup_commands}[/dim]"
         self.console.print(startup_help)
 
@@ -2238,6 +2248,8 @@ Return only the replacement user prompt text.
                     return "/rewind"
 
                 def accepted_user_prefix(line: str) -> str | None:
+                    if self.agent_mode or not self.response_formatting:
+                        return None
                     if not user_header_pending:
                         return None
                     stripped = line.strip()
@@ -2250,7 +2262,7 @@ Return only the replacement user prompt text.
                         prompt_str,
                         initial_text=preload_input,
                         on_ctrl_o=open_transcript,
-                        on_esc_esc=trigger_rewind,
+                        on_esc_esc=None if self.agent_mode else trigger_rewind,
                         accepted_prefix=accepted_user_prefix,
                     )
                 except KeyboardInterrupt:
@@ -2278,7 +2290,7 @@ Return only the replacement user prompt text.
                         print(f"\n{DIM}Error: {type(e).__name__}: {e}{RESET}", file=sys.stderr)
                     continue
 
-                if user_input.strip() == "/rewind":
+                if user_input.strip() == "/rewind" and not self.agent_mode:
                     if not rewind_shortcut:
                         self._display_input_block(user_input, include_header=False)
                     from code_agent.cli.rewind import rewind_ui
@@ -2343,7 +2355,7 @@ Return only the replacement user prompt text.
                         synth = False
                     continue
 
-                if user_input.strip().startswith("/fork"):
+                if user_input.strip().startswith("/fork") and not self.agent_mode:
                     self._display_input_block(user_input, include_header=False)
                     parts = user_input.strip().split(None, 1)
                     source_id = parts[1].strip() if len(parts) > 1 else getattr(self, "_session_id", None)
@@ -2541,6 +2553,8 @@ Return only the replacement user prompt text.
                 if self.repl_display:
                     print()  # Blank line after user input
                     print(f"{DIM}{thinking} (turn 1){RESET}", end="", flush=True)
+                elif self.agent_mode:
+                    print()  # Keep agent-mode output from overwriting the submitted prompt line
 
                 try:
                     response = self.run_loop(max_turns=max_turns)
@@ -2568,7 +2582,7 @@ Return only the replacement user prompt text.
                 response_str = str(response) if response is not None else ""
                 formatted = self.format_response(response_str) if self.response_formatting else response_str
                 if formatted:
-                    user_header_pending = True
+                    user_header_pending = bool(self.response_formatting) and not self.agent_mode
                     if self.response_formatting:
                         output_header = self._section_header("Output", "═", TEXT)
                         print(output_header)
