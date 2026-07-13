@@ -135,6 +135,8 @@ for conf, efforts in (
     ({'model': 'gpt-5.4-mini', 'input_cost': 0.75, 'cached_cost': 0.075, 'output_cost': 4.5}, ('high',)),
     ({'model': 'gpt-5.4-nano', 'input_cost': 0.2, 'cached_cost': 0.02, 'output_cost': 1.25}, ('high',)),
     ({'model': 'gpt-5.5', 'input_cost': 5.0, 'cached_cost': 0.5, 'output_cost': 30.0}, ('none', 'medium', 'high')),
+    ({'model': 'gpt-5.6-luna', 'input_cost': 1.0, 'cached_cost': 0.1, 'output_cost': 6.0}, ('high','xhigh','max')),
+    ({'model': 'gpt-5.6-sol', 'input_cost': 5.0, 'cached_cost': 0.5, 'output_cost': 30.0}, ('medium', 'high', 'xhigh', 'max')),
 ):
     for effort in efforts:
         suffix = '' if (effort == 'none' or len(efforts) == 1) else f"-{effort}"
@@ -271,7 +273,7 @@ register_model("xai","grok-4.3",
     context_window=1_000_000
 )
 register_model("xai","grok-4.5",
-    model="grok-4.3",
+    model="grok-4.5",
     input_cost=2.0,
     cached_cost=0.5,
     output_cost=6.0,
