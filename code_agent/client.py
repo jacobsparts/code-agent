@@ -15,6 +15,7 @@ from .utils import throttle, UsageTracker
 from .llm_registry import get_model_config
 from .conversation import Conversation
 from .streaming import wrap_chat_completions_streaming_response
+from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, normalize_openai_repl_response, project_openai_repl_messages
 
 # Define TCP keepalive constants for cross-platform compatibility
 try:
@@ -71,6 +72,7 @@ class LLMClient:
         self.timeout = self.model_config.get('timeout', 300)
         self.concurrency_lock = threading.BoundedSemaphore(self.model_config.get('concurrency',10))
         self.native = self.model_config.get('tools') if native is None else native
+        self.tool_mode = self.model_config.get('tool_mode')
         self.on_retry = None
         self._current_input_bytes = None
 
@@ -164,7 +166,9 @@ class LLMClient:
                 "messages": messages,
                 **extra_config,
             }
-            if tools:
+            if self.tool_mode == "repl_execute":
+                req["tools"] = [REPL_EXECUTE_TOOL]
+            elif tools:
                 raise TypeError("Provider-side tool calls are not supported by Code Agent")
             if self.model_config['port'] == 443:
                 conn = http.client.HTTPSConnection(self.model_config['host'], timeout=self.timeout)
@@ -216,6 +220,8 @@ class LLMClient:
                 response_json = json.loads(response_data)
                 parser = self.model_config.get('response_parser') or _parse_completions_response
                 message, stop_reason, usage = parser(response_json)
+                if self.tool_mode == "repl_execute":
+                    message = normalize_openai_repl_response(message)
                 if usage:
                     self.usage_tracker.log(self.model_name, usage)
                     self._update_input_tokens_per_byte(self._current_input_bytes, usage)
@@ -478,12 +484,16 @@ class LLMClient:
         return [{k: v for k, v in msg.items() if k != 'tool_calls'} for msg in messages]
 
     def _call(self, messages, tools=None):
-        if not self.native:
-            messages = [ self.prepare_message(msg) for msg in messages ]
+        if self.tool_mode == "repl_execute":
+            messages = project_openai_repl_messages(messages)
+        else:
+            if not self.native:
+                messages = [self.prepare_message(msg) for msg in messages]
+            messages = self._strip_tool_metadata(messages)
         # Strip internal metadata keys (underscore-prefixed) before sending to API
         messages = [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages]
-        messages = self._strip_tool_metadata(messages)
-        self._validate_context_budget(self._input_bytes(messages, tools))
+        size_tools = [REPL_EXECUTE_TOOL] if self.tool_mode == "repl_execute" else tools
+        self._validate_context_budget(self._input_bytes(messages, size_tools))
         if self.model_config['api_type'] == "completions":
             return self._call_completions(messages, tools)
         elif self.model_config['api_type'] == "messages":
@@ -504,7 +514,7 @@ class LLMClient:
         try:
             with self.concurrency_lock:
                 return self._call(messages)
-        except ContextOverflowError:
+        except (ContextOverflowError, ReplExecuteResponseError):
             raise
         except Exception as e:
             err = (str(e) if len(str(e)) < 1000 else str(e)[:1000]+'...').replace("\n"," ")

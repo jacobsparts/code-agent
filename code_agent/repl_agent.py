@@ -42,6 +42,7 @@ def _emit_event(event_type: str, **payload) -> None:
 
 from code_agent.base_agent import BaseAgent, _CompleteException
 from code_agent.client import BadRequestError, ContextOverflowError
+from code_agent.repl_tool_adapter import ReplExecuteResponseError, repl_protocol_prompt, repl_retry_hint
 
 
 class _InterruptedError(KeyboardInterrupt):
@@ -872,10 +873,20 @@ class REPLMixin:
         tools_str = "\n".join(tool_list) if tool_list else "(no tools defined)"
 
         emit_line = "\nemit(value, release=False) - Emit output. release=True yields control." if self.advertise_emit else ""
-
-        return f"""You are in a Python REPL. Your response body is executed directly as Python source code.
-
-Respond with raw Python only.
+        tool_mode = getattr(self.llm_client, "tool_mode", None)
+        native_protocol = repl_protocol_prompt(tool_mode)
+        protocol_intro = (
+            "You are operating Code Agent through a provider-native execution tool."
+            if native_protocol
+            else "You are in a Python REPL. Your response body is executed directly as Python source code."
+        )
+        if native_protocol:
+            response_rules = """Use the repl_execute tool for Python execution.
+- Put raw Python source in its code argument
+- Do not wrap Python in markdown fences
+- Do not invent or call any other native tool"""
+        else:
+            response_rules = """Respond with raw Python only.
 - Do not wrap your code in markdown fences
 - Do not wrap it in <function_calls>, XML, JSON, or any tool-call protocol
 - Do not add prose before or after the code
@@ -884,7 +895,13 @@ Respond with raw Python only.
 Important:
 - There is no separate tool-calling layer for your response
 - The text of your response itself is what gets executed
-- If you need to communicate text, do it from Python using print(...) or an appropriate provided Python function
+- If you need to communicate text, do it from Python using print(...) or an appropriate provided Python function"""
+
+        return f"""{protocol_intro}
+
+{response_rules}
+
+{native_protocol}
 
 {base_prompt}
 
@@ -939,9 +956,27 @@ Call help(function_name) for parameter descriptions.
             output = ""
             output_chunks = []
             try:
+                native_retry = 0
                 for syntax_retry in range(max_syntax_retries):
                     try:
-                        resp = self._llm_text_call_with_context_recovery(messages)
+                        try:
+                            resp = self._llm_text_call_with_context_recovery(messages)
+                        except ReplExecuteResponseError as exc:
+                            native_retry += 1
+                            if native_retry >= max_syntax_retries:
+                                raise
+                            logger.debug("Invalid repl_execute response, retry #%s: %s", native_retry, exc)
+                            if hasattr(self, 'on_retry'):
+                                self.on_retry("native_repl", native_retry)
+                            _emit_event("native_repl_retry", attempt=native_retry)
+                            messages = self.conversation._messages() + [{
+                                "role": "user",
+                                "content": repl_retry_hint(
+                                    getattr(self.llm_client, "tool_mode", None),
+                                    exc,
+                                ),
+                            }]
+                            continue
                     except KeyboardInterrupt:
                         # User interrupted LLM call - subprocess may also have received SIGINT
                         # Wait briefly for subprocess to handle signal, then drain
@@ -976,7 +1011,11 @@ Call help(function_name) for parameter descriptions.
                     if hasattr(self, 'on_retry'):
                         self.on_retry("syntax", syntax_retry + 1)
                     _emit_event("syntax_retry", attempt=syntax_retry + 1)
-                    hint = (
+                    native_hint = repl_retry_hint(
+                        getattr(self.llm_client, "tool_mode", None),
+                        output,
+                    )
+                    hint = native_hint or (
                         "Your previous response was rejected because the response body itself must be valid Python source code.\n\n"
                         "Write raw Python only.\n"
                         "- Do not wrap it in <function_calls>, XML, JSON, markdown fences, or any tool-call protocol\n"
