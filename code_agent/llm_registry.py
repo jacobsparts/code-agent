@@ -38,6 +38,7 @@ class ModelConfig:
     reasoning_cost: float = None
     timeout: int = None
     tools: bool = None
+    tool_mode: str = None
 
     @property
     def request_path(self):
@@ -274,6 +275,7 @@ register_model("xai","grok-4.3",
 )
 register_model("xai","grok-4.5",
     model="grok-4.5",
+    tool_mode="repl_execute",
     input_cost=2.0,
     cached_cost=0.5,
     output_cost=6.0,
