@@ -2051,6 +2051,30 @@ If you don't know how to proceed:
         print(f"{DIM}Session resumed: {session_id}{RESET}")
         return True
 
+    @staticmethod
+    def _exec_prompt_text(content: str) -> str:
+        text = (content or "").strip()
+        try:
+            import ast
+            tree = ast.parse(text)
+        except SyntaxError:
+            return text
+        if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr):
+            return text
+        call = tree.body[0].value
+        if (
+            not isinstance(call, ast.Call)
+            or not isinstance(call.func, ast.Name)
+            or call.func.id != "emit"
+            or not call.args
+        ):
+            return text
+        try:
+            value = ast.literal_eval(call.args[0])
+        except Exception:
+            return text
+        return str(value).strip()
+
     def _generate_exec_prompt(self, extra_instructions: str = "") -> str:
         instruction = """Write a continuation prompt for a fresh Code Agent session.
 
@@ -2080,7 +2104,7 @@ Return only the replacement user prompt text.
             )
         finally:
             self.ephemeral = old_ephemeral
-        return (msg.get("content") or "").strip()
+        return self._exec_prompt_text(msg.get("content") or "")
 
     def _restore_auto_context_attachments(self):
         names = list(getattr(self, "_auto_context_attachment_names", set()))

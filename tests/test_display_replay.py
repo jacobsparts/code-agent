@@ -30,6 +30,24 @@ def test_replay_display_text_respects_rewind():
 
 
 
+def test_exec_prompt_text_unwraps_emit():
+    from code_agent.agent import CodeAgentBase
+
+    generated = 'emit("Continue investigating src/app.py.\\nRun pytest.", release=True)'
+
+    assert CodeAgentBase._exec_prompt_text(generated) == (
+        "Continue investigating src/app.py.\nRun pytest."
+    )
+
+
+def test_exec_prompt_text_keeps_plain_prompt():
+    from code_agent.agent import CodeAgentBase
+
+    generated = "Continue investigating src/app.py.\nRun pytest."
+
+    assert CodeAgentBase._exec_prompt_text(generated) == generated
+
+
 def test_replay_display_text_respects_exec():
     store = DummyStore([
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> first\n\n"}},
