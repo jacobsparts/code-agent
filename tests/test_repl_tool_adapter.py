@@ -96,6 +96,37 @@ def test_projection_splits_appended_human_input():
     assert result[2] == {"role": "user", "content": "next task"}
 
 
+def test_projection_strips_echoed_preceding_human_input_from_tool_result():
+    messages = [
+        {
+            "role": "user",
+            "content": "What's today's date?\n",
+            "_user_content": "What's today's date?",
+            "_render_segments": [
+                {"type": "input", "content": "What's today's date?"},
+            ],
+        },
+        {"role": "assistant", "content": "print('2026-07-13')"},
+        {
+            "role": "user",
+            "content": "What's today's date?\n>>> print('2026-07-13')\n2026-07-13\n",
+            "_stdout": "What's today's date?\n>>> print('2026-07-13')\n2026-07-13\n",
+            "_render_segments": [{
+                "type": "stdout",
+                "content": "What's today's date?\n>>> print('2026-07-13')\n2026-07-13\n",
+            }],
+        },
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert result[2] == {
+        "role": "tool",
+        "tool_call_id": "repl_000001",
+        "content": ">>> print('2026-07-13')\n2026-07-13\n",
+    }
+
+
 def test_schema_is_exactly_one_function():
     assert REPL_EXECUTE_TOOL["function"]["name"] == "repl_execute"
     assert REPL_EXECUTE_TOOL["function"]["parameters"]["additionalProperties"] is False

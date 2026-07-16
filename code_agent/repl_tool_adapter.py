@@ -84,7 +84,18 @@ def _public_message(message):
     return {k: v for k, v in message.items() if not k.startswith("_") and k != "tool_calls"}
 
 
-def _split_repl_output_and_input(message):
+def _strip_leading_input_echo(output, human_input):
+    if not output or not human_input:
+        return output
+    echo = human_input.rstrip("\r\n")
+    for newline in ("\r\n", "\n", "\r"):
+        prefix = echo + newline
+        if output.startswith(prefix):
+            return output[len(prefix):]
+    return output
+
+
+def _split_repl_output_and_input(message, preceding_human_input=None):
     segments = message.get("_render_segments") or []
     if segments:
         stdout = "".join(
@@ -98,7 +109,7 @@ def _split_repl_output_and_input(message):
             if segment.get("type") == "input" and segment.get("content")
         ]
         if stdout or inputs:
-            return stdout, inputs
+            return _strip_leading_input_echo(stdout, preceding_human_input), inputs
 
     human = message.get("_user_content")
     if human is not None:
@@ -106,14 +117,16 @@ def _split_repl_output_and_input(message):
         suffix = human + "\n"
         if stdout.endswith(suffix):
             stdout = stdout[:-len(suffix)].rstrip("\n") + ("\n" if stdout[:-len(suffix)] else "")
-        return stdout, [human]
-    return message.get("_stdout", message.get("content", "")), []
+        return _strip_leading_input_echo(stdout, preceding_human_input), [human]
+    stdout = message.get("_stdout", message.get("content", ""))
+    return _strip_leading_input_echo(stdout, preceding_human_input), []
 
 
 def project_openai_repl_messages(messages):
     projected = []
     call_number = 0
     index = 0
+    pending_human_input = None
 
     while index < len(messages):
         message = messages[index]
@@ -121,6 +134,8 @@ def project_openai_repl_messages(messages):
 
         if role != "assistant":
             projected.append(_public_message(message))
+            if role == "user":
+                pending_human_input = message.get("_user_content", message.get("content"))
             index += 1
             continue
 
@@ -143,10 +158,14 @@ def project_openai_repl_messages(messages):
         output = ""
         human_inputs = []
         if index + 1 < len(messages) and messages[index + 1].get("role") == "user":
-            output, human_inputs = _split_repl_output_and_input(messages[index + 1])
+            output, human_inputs = _split_repl_output_and_input(
+                messages[index + 1],
+                pending_human_input,
+            )
             index += 1
         projected.append({"role": "tool", "tool_call_id": call_id, "content": output})
         projected.extend({"role": "user", "content": value} for value in human_inputs)
+        pending_human_input = human_inputs[-1] if human_inputs else None
         index += 1
 
     return projected

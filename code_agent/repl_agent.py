@@ -881,10 +881,7 @@ class REPLMixin:
             else "You are in a Python REPL. Your response body is executed directly as Python source code."
         )
         if native_protocol:
-            response_rules = """Use the repl_execute tool for Python execution.
-- Put raw Python source in its code argument
-- Do not wrap Python in markdown fences
-- Do not invent or call any other native tool"""
+            response_rules = native_protocol
         else:
             response_rules = """Respond with raw Python only.
 - Do not wrap your code in markdown fences
@@ -900,8 +897,6 @@ Important:
         return f"""{protocol_intro}
 
 {response_rules}
-
-{native_protocol}
 
 {base_prompt}
 

@@ -24,7 +24,7 @@ def _render(items, selected, scroll_offset, term_width, term_height):
     out = ['\x1b[?25l', '\x1b[2J', '\x1b[H']
     title = ' /skills '
     out.append(f'\x1b[7m{title:<{term_width}}\x1b[0m\n')
-    subtitle = '  ↑/↓ navigate | Space toggle attach | Enter apply | Esc cancel'
+    subtitle = '  ↑/↓ navigate | PgUp/PgDn page | Space toggle attach | Enter apply | Esc cancel'
     out.append(f'\x1b[2m{_fit(subtitle, term_width):<{term_width}}\x1b[0m\n\n')
     header_lines = 3
     footer_lines = 2
@@ -100,5 +100,14 @@ def select_skills_ui(altmode, skills: list[dict]) -> list[dict] | None:
                         selected = max(0, selected - 1)
                     elif k[2] == 66:
                         selected = min(len(items) - 1, selected + 1)
+                    elif k.startswith(b'\x1b[5~'):
+                        new_offset = max(0, scroll_offset - items_visible)
+                        selected -= scroll_offset - new_offset
+                        scroll_offset = new_offset
+                    elif k.startswith(b'\x1b[6~'):
+                        max_offset = max(0, len(items) - items_visible)
+                        new_offset = min(max_offset, scroll_offset + items_visible)
+                        selected += new_offset - scroll_offset
+                        scroll_offset = new_offset
     finally:
         session.exit()
