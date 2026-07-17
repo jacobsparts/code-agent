@@ -2171,6 +2171,10 @@ Return only the replacement user prompt text.
             ('user', user_emit_output),
         ):
             self.conversation.messages.append({"role": role, "content": content, "_synthetic": True})
+        self.conversation.messages[-1]["_stdout"] = user_emit_output
+        self.conversation.messages[-1]["_render_segments"] = [
+            {"type": "stdout", "content": user_emit_output}
+        ]
         self._last_was_repl_output = True
 
     def cli_run(self, max_turns: int | None = None, resume: str | bool = False):

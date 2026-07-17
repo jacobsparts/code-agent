@@ -96,6 +96,35 @@ def test_projection_splits_appended_human_input():
     assert result[2] == {"role": "user", "content": "next task"}
 
 
+def test_projection_preserves_synthetic_release_output_before_first_real_input():
+    final_output = (
+        '>>> emit("Today is Friday, July 17, 2026.", release=True)\n'
+        'Today is Friday, July 17, 2026.\n'
+    )
+    messages = [
+        {"role": "assistant", "content": 'emit("Today is Friday, July 17, 2026.", release=True)'},
+        {
+            "role": "user",
+            "content": final_output + "hi\n",
+            "_stdout": final_output + "hi\n",
+            "_user_content": "hi",
+            "_render_segments": [
+                {"type": "stdout", "content": final_output},
+                {"type": "input", "content": "hi"},
+            ],
+        },
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert result[1] == {
+        "role": "tool",
+        "tool_call_id": "repl_000001",
+        "content": final_output,
+    }
+    assert result[2] == {"role": "user", "content": "hi"}
+
+
 def test_projection_strips_echoed_preceding_human_input_from_tool_result():
     messages = [
         {
