@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 from code_agent.execution_policy import ExecutionPolicyError, check_execution_policy
@@ -38,3 +40,13 @@ def test_preprocess_does_not_replace_subprocess_source():
 
 def test_execution_policy_allows_subprocess_in_text_only():
     check_execution_policy('emit("subprocess is not supported; use bash()", release=True)')
+
+
+def test_preprocess_invalid_escape_does_not_warn():
+    code = 'value = """\\s"""'
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert preprocess(code) == code
+
+    assert caught == []

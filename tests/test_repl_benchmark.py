@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import threading
+import warnings
 from pathlib import Path
 from textwrap import dedent
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -253,6 +254,31 @@ def test_stdio_subprocess_transport_tool_repl_emit_ack():
     assert ("request", {"tool": "__emit__", "args": {"value": "hi", "release": False}, "request_id": 1}) in seen
     assert seen[-1] == ("output", ("done", (1, False)))
 
+
+def test_tool_repl_validation_silences_parent_warning_and_captures_execution_warning(monkeypatch):
+    from code_agent.repl_agent import REPLMixin, ToolREPL
+    from code_agent.tools.transports import StdioSubprocessTransport
+
+    code = 'value = """\\s"""'
+    monkeypatch.setenv("PYTHONWARNINGS", "always")
+    repl = ToolREPL(echo=False, transport=StdioSubprocessTransport)
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            output, pure_syntax_error, output_chunks, corrected_code = (
+                REPLMixin()._execute_with_tool_handling(repl, code)
+            )
+    finally:
+        repl.close()
+
+    assert [
+        warning for warning in caught
+        if isinstance(warning.message, (SyntaxWarning, DeprecationWarning))
+    ] == []
+    assert pure_syntax_error is False
+    assert corrected_code == code
+    assert output.count("invalid escape sequence") == 1
+    assert sum(chunk.count("invalid escape sequence") for _, chunk in output_chunks) == 1
 
 
 def test_tool_repl_worker_imports_from_current_directory(tmp_path, monkeypatch):

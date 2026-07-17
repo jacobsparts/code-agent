@@ -8,13 +8,22 @@ transformed code compiles, accept it; otherwise return the original.
 
 import ast
 import re
+import warnings
 
+
+
+def _compile_silently(code: str, filename: str = '<repl>', mode: str = 'exec'):
+    """Compile code without leaking warnings from internal validation."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        warnings.simplefilter('ignore', DeprecationWarning)
+        return compile(code, filename, mode)
 
 
 def _compiles(code: str) -> bool:
     """Return True if code compiles as Python."""
     try:
-        compile(code, '<repl>', 'exec')
+        _compile_silently(code)
         return True
     except SyntaxError:
         return False
@@ -239,7 +248,7 @@ def _comment_out_non_python(code: str) -> str:
 
     for _ in range(len(lines)):            # bounded iteration
         try:
-            compile('\n'.join(lines), '<repl>', 'exec')
+            _compile_silently('\n'.join(lines))
             break
         except SyntaxError as e:
             if not e.lineno:

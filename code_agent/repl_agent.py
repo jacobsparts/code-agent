@@ -12,6 +12,7 @@ The provider does not receive JSON tool schemas for these functions.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 
 import json
@@ -19,12 +20,36 @@ import logging
 import os
 import signal
 import sys
+import warnings
 from multiprocessing import Queue
 
 from queue import Empty
 from typing import Any, Callable, Optional, Union
 
 logger = logging.getLogger('code_agent')
+
+
+@contextlib.contextmanager
+def _silence_compile_warnings():
+    """Suppress warnings emitted by parent-side parsing and validation."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        warnings.simplefilter('ignore', DeprecationWarning)
+        yield
+
+
+def _compile_silently(code: str, filename: str = '<repl>', mode: str = 'exec'):
+    """Compile code without leaking warnings from internal validation."""
+    with _silence_compile_warnings():
+        return compile(code, filename, mode)
+
+
+def _parse_silently(code: str, filename: str = '<unknown>') -> ast.AST:
+    """Parse code without leaking warnings from internal transformation."""
+    with _silence_compile_warnings():
+        return ast.parse(code, filename=filename)
+
+
 _EVENT_PREFIX = "[[CODE_AGENT_EVENT:"
 _EVENT_SUFFIX = "]]"
 
@@ -1119,13 +1144,14 @@ Call help(function_name) for parameter descriptions.
         import ast
 
         try:
-            tree = ast.parse(code)
+            tree = _parse_silently(code)
         except SyntaxError:
             return code  # Let the REPL handle syntax errors
 
         class PrintTransformer(ast.NodeTransformer):
             def __init__(self):
                 self.in_function = False
+                self.changed = False
 
             def visit_FunctionDef(self, node):
                 # Don't transform inside function bodies
@@ -1152,10 +1178,13 @@ Call help(function_name) for parameter descriptions.
                 if not self.in_function:
                     if isinstance(node.func, ast.Name) and node.func.id == 'print':
                         node.func.id = '_print'
+                        self.changed = True
                 return node
 
         transformer = PrintTransformer()
         new_tree = transformer.visit(tree)
+        if not transformer.changed:
+            return code
         ast.fix_missing_locations(new_tree)
         return ast.unparse(new_tree)
 
@@ -1180,7 +1209,7 @@ Call help(function_name) for parameter descriptions.
         code = self.preprocess_code(code)
         validation_code = self._transform_toplevel_print(code)
         try:
-            compile(validation_code, '<repl>', 'exec')
+            _compile_silently(validation_code)
         except SyntaxError as e:
             output = self._format_syntax_error(e)
             output_chunks = [("error", output)]
@@ -1190,7 +1219,8 @@ Call help(function_name) for parameter descriptions.
 
         from code_agent.execution_policy import ExecutionPolicyError, check_execution_policy
         try:
-            check_execution_policy(validation_code)
+            with _silence_compile_warnings():
+                check_execution_policy(validation_code)
         except ExecutionPolicyError as e:
             output = f"{type(e).__name__}: {e}\n"
             output_chunks = [("error", output)]
@@ -1201,7 +1231,8 @@ Call help(function_name) for parameter descriptions.
         # Split into statements, then transform each individually
         # (Can't transform whole code first because AST strips comments,
         # which would cause misalignment between original and transformed statements)
-        original_statements = _split_into_statements(code)
+        with _silence_compile_warnings():
+            original_statements = _split_into_statements(code)
         if not original_statements:
             return "", False, [], code
 
@@ -1224,10 +1255,13 @@ Call help(function_name) for parameter descriptions.
 
             # Pre-validate syntax before echoing (use transformed for validation)
             try:
-                compile(exec_stmt, '<repl>', 'exec')
+                _compile_silently(exec_stmt)
             except SyntaxError as e:
                 # Echo the original statement, show error, stop processing
-                stream(_format_echo(original_stmt), "echo", _format_echo_stdout(original_stmt))
+                with _silence_compile_warnings():
+                    echo = _format_echo(original_stmt)
+                    display_echo = _format_echo_stdout(original_stmt)
+                stream(echo, "echo", display_echo)
                 stream(self._format_syntax_error(e), "error")
                 if hasattr(self, 'on_statement_output'):
                     self.on_statement_output(statement_chunks)
@@ -1235,7 +1269,10 @@ Call help(function_name) for parameter descriptions.
 
             # Valid syntax - echo original, execute transformed
             any_executed = True
-            stream(_format_echo(original_stmt), "echo", _format_echo_stdout(original_stmt))
+            with _silence_compile_warnings():
+                echo = _format_echo(original_stmt)
+                display_echo = _format_echo_stdout(original_stmt)
+            stream(echo, "echo", display_echo)
             repl._running = True
             repl._cmd_seq += 1
             current_seq = repl._cmd_seq
