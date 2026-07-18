@@ -392,6 +392,39 @@ def test_code_agent_no_repl_display_still_prints_progress_emit(capsys):
     assert agent._display_capture == ["working\n"]
 
 
+
+def test_code_agent_observe_displays_full_text_in_bright_yellow(capsys):
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent._display_capture = []
+
+    text = "First observation.\n" + ("x" * 500)
+    agent.on_tool_call("observe", {"content": text})
+
+    assert capsys.readouterr().out == (
+        "\x1b[93mFirst observation.\x1b[0m\n"
+        f"\x1b[93m{'x' * 500}\x1b[0m\n"
+    )
+    assert agent._display_capture == ["First observation.\n", f"{'x' * 500}\n"]
+    assert agent._suppress_next_observe_result is True
+
+
+def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.repl_display = True
+    agent._display_capture = []
+    agent._suppress_next_observe_result = True
+
+    agent.on_repl_chunk("'[Continuing...]'\n", "output")
+
+    assert capsys.readouterr().out == ""
+    assert agent._display_capture == []
+    assert agent._suppress_next_observe_result is False
+
+
 def test_code_agent_resume_session_command_uses_worker_target_when_present():
     from code_agent.agent import CodeAgentBase
 

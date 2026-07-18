@@ -1611,6 +1611,16 @@ If you don't know how to proceed:
         return output
 
     # REPL output hooks
+    def on_tool_call(self, name: str, args: dict) -> None:
+        super().on_tool_call(name, args)
+        if name != "observe":
+            return
+        text = str(args.get("content", ""))
+        for line in text.split("\n"):
+            print(f"\x1b[93m{line}\x1b[0m", flush=True)
+            self._capture_display_line(line)
+        self._suppress_next_observe_result = True
+
     def on_repl_execute(self, code) -> None:
         """Called at start of each turn."""
         if hasattr(self, '_tool_repl'):
@@ -1662,8 +1672,9 @@ If you don't know how to proceed:
                         self._in_print_echo = False
                     self._flush_edit_echo_buffer()
 
-                    # New statement - check if it's emit(), print(), edit(), or line_patch()
+                    # New statement - check if it's emit(), observe(), print(), edit(), or line_patch()
                     self._in_emit_echo = line.startswith('>>> emit(')
+                    self._in_observe_echo = line.startswith('>>> observe(')
                     if line.startswith('>>> print('):
                         self._in_print_echo = True
                         self._print_echo_buffer = [line]
@@ -1697,8 +1708,11 @@ If you don't know how to proceed:
                     self._edit_echo_buffer.append(line)
                     continue
 
-                # Skip emit() echo
-                if not getattr(self, '_in_emit_echo', False):
+                # Skip emit()/observe() echoes
+                if not (
+                    getattr(self, '_in_emit_echo', False)
+                    or getattr(self, '_in_observe_echo', False)
+                ):
                     self._show_python_header_if_pending()
                     print(line, flush=True)
                     self._capture_display_line(line)
@@ -1711,6 +1725,11 @@ If you don't know how to proceed:
         elif msg_type == "emit":
             return
         elif msg_type in ("output", "print"):
+            if msg_type == "output" and getattr(self, '_suppress_next_observe_result', False):
+                if chunk.strip() == "'[Continuing...]'":
+                    self._suppress_next_observe_result = False
+                    return
+                self._suppress_next_observe_result = False
             if msg_type == "output" and getattr(self, '_edit_echo_buffer', []) and chunk.lstrip().startswith("Traceback"):
                 self._flush_edit_echo_buffer()
             if msg_type == "output" and getattr(self, '_suppress_next_edit_result', False):
@@ -2612,6 +2631,8 @@ Return only the replacement user prompt text.
                 self._turn_output_started = False
                 self._header_pending = False
                 self._in_emit_echo = False
+                self._in_observe_echo = False
+                self._suppress_next_observe_result = False
                 self._reset_display_capture()
                 if self.repl_display:
                     print()  # Blank line after user input
