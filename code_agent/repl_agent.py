@@ -663,6 +663,8 @@ def {name}({sig}):
         return x
 
     _args = {args}
+    if "{name}" == "observe":
+        _args["content"] = str(_args["content"])
     _safe_args = {{k: _serialize(v) for k, v in _args.items()}}
 
     _tool_request_queue.put(_json.dumps({{"tool": "{name}", "args": _safe_args}}))
@@ -978,6 +980,8 @@ Call help(function_name) for parameter descriptions.
             try:
                 native_retry = 0
                 for syntax_retry in range(max_syntax_retries):
+                    if hasattr(self, '_start_assistant_execution_attempt'):
+                        self._start_assistant_execution_attempt()
                     try:
                         try:
                             resp = self._llm_text_call_with_context_recovery(messages)

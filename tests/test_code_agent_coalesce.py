@@ -2,6 +2,7 @@ import importlib.util
 import re
 
 from code_agent.code_agent_coalesce import coalesce_repl_messages
+from code_agent.code_agent_coalesce import render_preview_ref
 
 
 def interaction(i, work_size=2500):
@@ -21,6 +22,114 @@ def five_interactions():
     for i in range(5):
         messages.extend(interaction(i))
     return messages
+
+
+def test_render_preview_ref_uses_observations_instead_of_excerpt():
+    content = "head\n" + ("x" * 2500) + "\ntail"
+
+    uri, rendered = render_preview_ref(content, ["First result.", "Second result."])
+
+    assert f"[PreviewRef: {uri}]" in rendered
+    assert "Observations:\n- First result.\n- Second result." in rendered
+    assert "(3 lines, 2510 chars)" in rendered
+    assert "x" * 500 not in rendered
+    assert "head" not in rendered
+    assert "tail" not in rendered
+
+
+def test_render_preview_ref_formats_multiline_observations():
+    _, rendered = render_preview_ref(
+        "canonical",
+        ["The attempt exposed two invariants.\n\nVirtual boundaries matter.\nFiltering broke them."],
+    )
+
+    assert (
+        "Observations:\n"
+        "- The attempt exposed two invariants.\n"
+        "\n"
+        "  Virtual boundaries matter.\n"
+        "  Filtering broke them.\n"
+        "(1 lines, 9 chars)"
+    ) in rendered
+
+
+def test_render_preview_ref_without_observations_is_unchanged():
+    content = "head\nbody\ntail"
+
+    assert render_preview_ref(content) == render_preview_ref(content, [])
+    assert "Observations:" not in render_preview_ref(content)[1]
+
+
+def test_preview_key_depends_only_on_canonical_content():
+    content = "same canonical content"
+
+    plain_uri, _ = render_preview_ref(content)
+    observed_uri, _ = render_preview_ref(content, ["Different collapsed rendering."])
+
+    assert observed_uri == plain_uri
+
+
+def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
+    saved = {}
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Task", "_user_content": "Task"},
+        {
+            "role": "assistant",
+            "content": "observe(value)\n" + ("x" * 2500),
+            "_observations": ["First.", 123, "", "Second."],
+        },
+        {"role": "user", "content": ">>> observe(value)\n'[Continuing...]'\n" + ("y" * 2500)},
+        {"role": "assistant", "content": "emit('Done', release=True)"},
+    ]
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_chars=1,
+        min_savings_chars=1,
+        save_preview_blob=saved.setdefault,
+    )
+
+    coalesced = next(msg for msg in projected if msg.get("_coalesced"))
+    assert "Observations:\n- First.\n- Second." in coalesced["content"]
+    assert "x" * 500 not in coalesced["content"]
+    canonical = next(iter(saved.values()))
+    assert canonical.startswith("observe(value)")
+    assert ">>> observe(value)\n'[Continuing...]'" in canonical
+    assert "Observations:" not in canonical
+
+
+def test_pinned_and_normal_sections_keep_their_own_observations():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Task", "_user_content": "Task"},
+        {"role": "assistant", "content": "print('normal')\n" + ("x" * 2500), "_observations": ["Normal only."]},
+        {"role": "user", "content": ">>> print('normal')\nnormal\n" + ("y" * 2500)},
+        {
+            "role": "assistant",
+            "content": "print('pinned')",
+            "_pinned_coalesce": {"label": "Pinned previous turn"},
+            "_observations": ["Pinned only."],
+        },
+        {"role": "user", "content": ">>> print('pinned')\npinned\n"},
+        {"role": "assistant", "content": "emit('Done', release=True)"},
+    ]
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_chars=1,
+        min_savings_chars=1,
+    )
+    coalesced = next(msg for msg in projected if msg.get("_coalesced"))
+    blocks = re.findall(r"\[PreviewRef: .*?\[/PreviewRef\]", coalesced["content"], re.DOTALL)
+
+    assert len(blocks) == 2
+    assert "Normal only." in blocks[0] and "Pinned only." not in blocks[0]
+    assert "Pinned only." in blocks[1] and "Normal only." not in blocks[1]
 
 
 def test_keeps_last_three_interactions_uncoalesced():

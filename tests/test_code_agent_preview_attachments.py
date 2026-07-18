@@ -33,6 +33,109 @@ def make_agent():
     return agent
 
 
+def test_observe_records_runtime_text_and_commits_metadata():
+    agent = make_agent()
+    agent._start_assistant_execution_attempt()
+
+    assert agent.observe(42) == "[Continuing...]"
+    assert agent.observe("  first\nsecond  ") == "[Continuing...]"
+
+    message = {"role": "assistant", "content": "observe(value)"}
+    agent._on_assistant_message_committed(message)
+
+    assert message["_observations"] == ["42", "  first\nsecond  "]
+    assert agent._pending_observations == []
+
+
+def test_observe_rejects_empty_content():
+    agent = make_agent()
+    agent._start_assistant_execution_attempt()
+
+    try:
+        agent.observe("  \n ")
+    except ValueError as exc:
+        assert str(exc) == "Observation content must not be empty."
+    else:
+        raise AssertionError("Expected whitespace-only observation to fail")
+    assert agent._pending_observations == []
+
+
+def test_observe_does_not_pin_or_release():
+    agent = make_agent()
+    assistant = {"role": "assistant", "content": "print('previous')"}
+    agent.conversation.messages.append(assistant)
+    agent.complete = False
+    agent._start_assistant_execution_attempt()
+
+    assert agent.observe("Result learned.") == "[Continuing...]"
+
+    assert "_pinned_coalesce" not in assistant
+    assert agent.complete is False
+
+
+def test_observe_appears_in_generated_tool_help():
+    agent = make_agent()
+    prompt = agent._build_system_prompt()
+
+    assert "observe(content: str) - Record a reflective observation about previous work." in prompt
+
+
+def test_observe_relay_captures_runtime_expression_and_arbitrary_value():
+    agent = make_agent()
+    agent.complete = False
+    agent._start_assistant_execution_attempt()
+    repl = agent._get_tool_repl()
+    try:
+        output, pure_syntax_error, _, _ = agent._execute_with_tool_handling(
+            repl,
+            "class RuntimeValue:\n"
+            "    def __str__(self):\n"
+            "        return 'runtime text'\n"
+            "value = RuntimeValue()\n"
+            "observe(value)",
+        )
+    finally:
+        repl.close()
+
+    assert pure_syntax_error is False
+    assert "Traceback" not in output
+    assert "'[Continuing...]'" in output
+    assert agent._pending_observations == ["runtime text"]
+
+
+def test_observations_before_runtime_error_remain_on_committed_message():
+    agent = make_agent()
+    agent.complete = False
+    agent._start_assistant_execution_attempt()
+    repl = agent._get_tool_repl()
+    try:
+        output, pure_syntax_error, _, _ = agent._execute_with_tool_handling(
+            repl,
+            "observe('kept')\nraise RuntimeError('later failure')",
+        )
+    finally:
+        repl.close()
+
+    message = {"role": "assistant", "content": "observe('kept')\nraise RuntimeError('later failure')"}
+    agent._on_assistant_message_committed(message)
+
+    assert pure_syntax_error is False
+    assert "RuntimeError: later failure" in output
+    assert message["_observations"] == ["kept"]
+
+
+def test_new_execution_attempt_discards_uncommitted_observations():
+    agent = make_agent()
+    agent._start_assistant_execution_attempt()
+    agent.observe("abandoned")
+
+    agent._start_assistant_execution_attempt()
+    message = {"role": "assistant", "content": "print('replacement')"}
+    agent._on_assistant_message_committed(message)
+
+    assert "_observations" not in message
+
+
 def test_pin_marks_previous_assistant_turn():
     agent = make_agent()
     assistant = {"role": "assistant", "content": "print('important')"}
@@ -108,6 +211,33 @@ def test_pin_persists_metadata_event_for_existing_persisted_message(tmp_path):
     assert replayed_assistant["_pinned_coalesce"] == {"label": "Pinned previous turn"}
 
 
+def test_observations_survive_message_persistence_and_replay(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+
+    agent = make_persistent_agent(tmp_path)
+    message = {
+        "role": "assistant",
+        "content": "observe(value)",
+        "_observations": ["  persisted\nreflection  "],
+    }
+    agent._persist_message(message)
+
+    class ReplayAgent:
+        def __init__(self):
+            self.conversation = Conversation(DummyClient(), "system")
+            self._expanded_preview_refs = {}
+
+        def _configure_conversation(self, conversation):
+            pass
+
+    replayed = ReplayAgent()
+    replay_session_into_agent(replayed, agent._session_id, agent._session_store)
+
+    assert replayed.conversation.messages[-1]["_observations"] == ["  persisted\nreflection  "]
+    events = agent._session_store.get_events(agent._session_id)
+    assert [event["event_type"] for event in events] == ["message_added"]
+
+
 def test_preview_uri_attachments_are_listed_by_default():
     agent = make_agent()
     agent.conversation.usermsg(
@@ -159,9 +289,11 @@ def test_system_prompt_mentions_pin_and_context_pressure():
     prompt = agent._build_system_prompt()
 
     assert "REPL output may become a preview after three user interactions" in prompt
-    assert "If the most\nrecent completed turn should remain in context long-term, call pin()" in prompt
-    assert "pin() is\nonly for the previous turn" in prompt
-    assert "cannot pin the current turn or other historical\nturns" in prompt
+    assert ">>> reflection()" in prompt
+    assert "After each substantive turn, call observe()" in prompt
+    assert "think() is a scratchpad for the current turn" in prompt
+    assert "pin() preserves the exact previous turn's code and output" in prompt
+    assert "cannot pin the current\nturn or other historical turns" in prompt
     assert "Context window is near capacity" in prompt
 
 

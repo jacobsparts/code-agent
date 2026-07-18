@@ -85,6 +85,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._pending_session_events = []
             self._display_capture = []
             self._pending_unviewed_files = set()
+            self._pending_observations = []
             self._auto_context_attachment_names = set()
             self._expanded_preview_refs = {}
             self._rg_available = None
@@ -405,7 +406,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         for key, value in message.items():
             if key in {'images', 'audio'}:
                 msg[key] = encode_media(value)
-            elif key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary'}:
+            elif key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary', '_observations'}:
                 msg[key] = copy.deepcopy(value)
 
         refs = message.get('_attachment_refs')
@@ -932,7 +933,14 @@ def _code_agent_send_rg_available():
 
 
 
+    def _start_assistant_execution_attempt(self):
+        self._pending_observations = []
+
     def _on_assistant_message_committed(self, message: dict):
+        observations = list(getattr(self, "_pending_observations", []))
+        if observations:
+            message["_observations"] = observations
+        self._pending_observations = []
         self._persist_message(message)
 
     def build_output_for_llm(self, output_chunks):
@@ -1336,10 +1344,37 @@ be removed with unview(). Avoid ad-hoc read(uri) + string searching as a
 substitute for inspection unless you specifically need programmatic processing
 or the preview is too large to safely expand.
 
-REPL output may become a preview after three user interactions. If the most
-recent completed turn should remain in context long-term, call pin(). pin() is
-only for the previous turn; it cannot pin the current turn or other historical
-turns, viewed files, or expanded previews.
+REPL output may become a preview after three user interactions. Previous work
+is preserved in collapsed previews that retain key details.
+
+>>> reflection()
+
+After each substantive turn, call observe() to record what just happened and
+what it means. One sentence about the previous turn is the default.
+
+    observe("Narrowed the filter to synthetic-only; it fixed duplicate output
+    but removed virtual boundaries, so that approach was reverted.")
+
+    observe("The schema change broke replay ordering; reverted and noted the
+    dependency for the next attempt.")
+
+Skip observe() when the previous turn was routine: exploration that found
+nothing new, a think() call, or another observe() call.
+
+Write more when the previous turn revealed an insight worth keeping: a failure
+cause, a discovered invariant, a decision, or a result that changes the
+approach. It is also appropriate to record an insight about an earlier turn
+when a more recent result makes it newly relevant.
+
+Observations survive coalescing and become the visible summary in collapsed
+previews, replacing default code excerpts.
+
+think() is a scratchpad for the current turn—transient reasoning, planning,
+and continuation. think() content is not promoted during coalescing.
+
+pin() preserves the exact previous turn's code and output in full rather than
+summarizing it. pin() is only for the previous turn; it cannot pin the current
+turn or other historical turns, viewed files, or expanded previews.
 
 If you see "Context window is near capacity", reduce active context by calling
 unview(path_or_uri) on no-longer-needed files or expanded previews.
@@ -2676,6 +2711,15 @@ class CodeAgent(MCPMixin, CodeAgentBase):
 
     _preview_counter = 0  # Kept for backwards-compatible instance state.
 
+
+    @REPLAgent.tool
+    def observe(self, content: str = "Reflection on previous substantive work"):
+        """Record a reflective observation about previous work."""
+        text = str(content)
+        if not text.strip():
+            raise ValueError("Observation content must not be empty.")
+        self._pending_observations.append(text)
+        return "[Continuing...]"
 
     @REPLAgent.tool(inject=True)
     def think(self, content: str = "All relevant observations and reasoning"):

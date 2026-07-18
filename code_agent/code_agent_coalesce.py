@@ -15,12 +15,30 @@ def _content_preserves_context_refs(content: str) -> bool:
     )
 
 
-def render_preview_ref(content: str) -> tuple[str, str]:
+def render_preview_ref(content: str, observations=None) -> tuple[str, str]:
     key = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
     uri = f"session://preview/{key}"
     lines = content.split("\n")
     nlines = len(lines)
     nchars = len(content)
+    valid_observations = [
+        observation
+        for observation in observations or []
+        if isinstance(observation, str) and observation.strip()
+    ]
+
+    if valid_observations:
+        parts = ["Observations:"]
+        for observation in valid_observations:
+            observation_lines = observation.split("\n")
+            parts.append(f"- {observation_lines[0]}")
+            parts.extend(
+                f"  {line}" if line else ""
+                for line in observation_lines[1:]
+            )
+        parts.append(f"({nlines} lines, {nchars} chars)")
+        body = "\n".join(parts)
+        return uri, f"[PreviewRef: {uri}]\n{body}\n[/PreviewRef]"
 
     def render_preview_line(line):
         max_preview_line = 500
@@ -427,11 +445,27 @@ def _coalesced_message(content: str, range_messages: list[dict]) -> dict:
     return _coalesced_message_from_refs([rendered], range_messages)
 
 
+def _message_observations(messages: list[dict]) -> list[str]:
+    observations = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        values = msg.get("_observations")
+        if not isinstance(values, list):
+            continue
+        observations.extend(
+            value
+            for value in values
+            if isinstance(value, str) and value.strip()
+        )
+    return observations
+
+
 def _coalesced_ordered_sections(
     range_messages: list[dict],
     release_msg: dict | None,
     release_output_msg: dict | None,
-) -> list[tuple[bool, str]]:
+) -> list[tuple[bool, str, list[str]]]:
     sections = []
     normal = []
 
@@ -443,7 +477,7 @@ def _coalesced_ordered_sections(
             release_output_msg if include_release_output else None,
         )
         if content:
-            sections.append((False, content))
+            sections.append((False, content, _message_observations(normal)))
         normal = []
 
     i = 0
@@ -459,7 +493,7 @@ def _coalesced_ordered_sections(
                     i += 1
             content = _preview_content(turn, None, None)
             if content:
-                sections.append((True, content))
+                sections.append((True, content, _message_observations(turn)))
         else:
             normal.append(msg)
         i += 1
@@ -533,14 +567,17 @@ def coalesce_repl_messages(
         if not section_contents:
             continue
 
-        rendered_refs = [render_preview_ref(section_content)[1] for _, section_content in section_contents]
+        rendered_refs = [
+            render_preview_ref(section_content, observations)[1]
+            for _, section_content, observations in section_contents
+        ]
         projected = _coalesced_message_from_refs(rendered_refs, replacement_range, preserve_preview_refs)
         original_chars = sum(len(m.get("content") or "") for m in replacement_range)
         replacement_chars = len(projected.get("content") or "")
         if original_chars - replacement_chars < min_savings_chars:
             continue
 
-        for pinned, section_content in section_contents:
+        for pinned, section_content, _ in section_contents:
             key = hashlib.sha256(section_content.encode("utf-8")).hexdigest()[:16]
             if save_preview_blob is not None:
                 save_preview_blob(key, section_content)
