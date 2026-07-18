@@ -1,3 +1,6 @@
+import ast
+import warnings
+
 from code_agent.session_replay import replay_display_text
 
 
@@ -144,6 +147,80 @@ def test_replay_only_deepcopies_lists_for_required_snapshots(monkeypatch):
 
     session_replay.replay_session_into_agent(Agent(), "sid", store)
     assert list_copy_count == 2
+
+def test_code_agent_coalesce_suppresses_invalid_escape_parse_warnings():
+    from code_agent.code_agent_coalesce import coalesce_repl_messages
+
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": 'emit("a1\\[", release=True)'},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": 'emit("a2\\[", release=True)'},
+    ]
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        coalesce_repl_messages(
+            messages,
+            keep_last_interactions=0,
+            min_chars=0,
+            min_savings_chars=0,
+        )
+
+    assert not [
+        warning
+        for warning in rec
+        if issubclass(warning.category, (SyntaxWarning, DeprecationWarning))
+    ]
+
+
+def test_replay_display_text_suppresses_invalid_escape_parse_warnings():
+    store = DummyStore([
+        {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
+        {"seq": 2, "event_type": "message_added", "payload": {"message": {
+            "role": "assistant",
+            "content": 'emit("answer\\$", release=True)',
+        }}},
+    ])
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        out = replay_display_text("sid", store)
+
+    assert out == "> question\n\n═ Output ═════════════════════════\nanswer\\$\n"
+    assert not [
+        warning
+        for warning in rec
+        if issubclass(warning.category, (SyntaxWarning, DeprecationWarning))
+    ]
+
+
+def test_exec_prompt_text_suppresses_invalid_escape_parse_warnings():
+    from code_agent.agent import CodeAgentBase
+
+    generated = 'emit("Continue with `adb shell input text \\$TEST`.", release=True)'
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        assert CodeAgentBase._exec_prompt_text(generated) == (
+            "Continue with `adb shell input text \\$TEST`."
+        )
+
+    assert not [
+        warning
+        for warning in rec
+        if issubclass(warning.category, (SyntaxWarning, DeprecationWarning))
+    ]
+
+
+def test_ast_parse_still_warns_for_invalid_escape_without_replay_suppression():
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        ast.parse('emit("answer\\$", release=True)')
+
+    assert any(issubclass(warning.category, SyntaxWarning) for warning in rec)
+
 
 def test_replay_display_text_ignores_non_display_events():
     store = DummyStore([

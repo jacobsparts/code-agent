@@ -2110,7 +2110,9 @@ If you don't know how to proceed:
         text = (content or "").strip()
         try:
             import ast
-            tree = ast.parse(text)
+            from code_agent.session_replay import _silence_parse_warnings
+            with _silence_parse_warnings():
+                tree = ast.parse(text)
         except SyntaxError:
             return text
         if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr):

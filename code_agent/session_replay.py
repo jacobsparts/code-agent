@@ -1,8 +1,23 @@
 import ast
 import base64
+import contextlib
 import copy
 import re
+import warnings
 from .repl_attachment_mixin import MemoryAttachment, decode_attachment_refs
+
+
+@contextlib.contextmanager
+def _silence_parse_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        yield
+
+
+def _parse_silently(content: str) -> ast.AST:
+    with _silence_parse_warnings():
+        return ast.parse(content)
 
 
 def _preview_key(path: str) -> str | None:
@@ -206,7 +221,7 @@ def _extract_released_assistant_text(msg: dict) -> str:
 
     content = msg.get("content") or ""
     try:
-        tree = ast.parse(content)
+        tree = _parse_silently(content)
     except SyntaxError:
         tree = None
     if tree is not None:
@@ -251,7 +266,7 @@ def _is_released_assistant_message(msg: dict) -> bool:
 
     content = msg.get("content") or ""
     try:
-        tree = ast.parse(content)
+        tree = _parse_silently(content)
     except SyntaxError:
         tree = None
     if tree is not None:

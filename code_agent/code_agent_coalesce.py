@@ -3,6 +3,8 @@ import copy
 import hashlib
 import re
 
+from code_agent.session_replay import _parse_silently
+
 
 OMITTED_ECHO_MARKER = "[content omitted from echo]"
 
@@ -67,7 +69,7 @@ def is_release_assistant_message(msg: dict) -> bool:
 
     content = msg.get("content") or ""
     try:
-        tree = ast.parse(content)
+        tree = _parse_silently(content)
     except SyntaxError:
         tree = None
     if tree is not None:
@@ -98,7 +100,7 @@ def released_assistant_text(msg: dict) -> str:
 
     content = msg.get("content") or ""
     try:
-        tree = ast.parse(content)
+        tree = _parse_silently(content)
     except SyntaxError:
         tree = None
     if tree is not None:
