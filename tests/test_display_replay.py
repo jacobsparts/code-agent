@@ -97,6 +97,54 @@ def test_replay_session_into_agent_exec_resets_messages_and_preview_refs():
     ]
     assert agent._expanded_preview_refs == {}
 
+
+def test_replay_only_deepcopies_lists_for_required_snapshots(monkeypatch):
+    from code_agent.conversation import Conversation
+    from code_agent import session_replay
+
+    original_deepcopy = session_replay.copy.deepcopy
+    list_copy_count = 0
+
+    def counting_deepcopy(value):
+        nonlocal list_copy_count
+        if isinstance(value, list):
+            list_copy_count += 1
+        return original_deepcopy(value)
+
+    monkeypatch.setattr(session_replay.copy, "deepcopy", counting_deepcopy)
+
+    display_events = [
+        {"seq": seq, "event_type": "display", "payload": {"kind": "status", "text": f"{seq}\n"}}
+        for seq in range(1, 101)
+    ]
+    assert session_replay.replay_display_text("sid", DummyStore(display_events))
+    assert list_copy_count == 1
+
+    class Client:
+        pass
+
+    class Agent:
+        def __init__(self):
+            self.conversation = Conversation(Client(), "system")
+            self._expanded_preview_refs = {}
+
+        def _configure_conversation(self, conversation):
+            conversation.expanded_preview_refs = self._expanded_preview_refs
+
+    message_events = [
+        {
+            "seq": seq,
+            "event_type": "message_added",
+            "payload": {"message": {"role": "user", "content": str(seq)}},
+        }
+        for seq in range(1, 101)
+    ]
+    store = DummyStore(message_events)
+    store.get_session = lambda session_id: {"cwd": "."}
+
+    session_replay.replay_session_into_agent(Agent(), "sid", store)
+    assert list_copy_count == 2
+
 def test_replay_display_text_ignores_non_display_events():
     store = DummyStore([
         {"seq": 1, "event_type": "message_added", "payload": {"message": {"role": "user"}}},

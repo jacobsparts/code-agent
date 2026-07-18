@@ -92,6 +92,12 @@ def replay_session_into_agent(agent, session_id: str, store):
     base_dir = (session or {}).get("cwd")
 
     snapshots = {}
+    snapshot_seqs = {
+        event["payload"]["target_seq"]
+        for event in events
+        if event["event_type"] == "rewind"
+    }
+    snapshot_seqs.add(0)
     messages = [copy.deepcopy(agent.conversation.messages[0])]
     agent._expanded_preview_refs = {}
     if hasattr(agent, "_configure_conversation"):
@@ -100,7 +106,8 @@ def replay_session_into_agent(agent, session_id: str, store):
     missing_seen = set()
 
     def snapshot(seq):
-        snapshots[seq] = copy.deepcopy(messages)
+        if seq in snapshot_seqs:
+            snapshots[seq] = copy.deepcopy(messages)
 
     snapshot(0)
     for event in events:
@@ -274,12 +281,19 @@ def _section_header(label: str, char: str = "═", width: int = 34) -> str:
 def replay_display_text(session_id: str, store, format_response=None) -> str:
     events = store.get_events(session_id)
     snapshots = {}
+    snapshot_seqs = {
+        event["payload"]["target_seq"]
+        for event in events
+        if event["event_type"] == "rewind"
+    }
+    snapshot_seqs.add(0)
     chunks: list[str] = []
     released_to_user = False
     just_rewound = False
 
     def snapshot(seq):
-        snapshots[seq] = (copy.deepcopy(chunks), released_to_user, just_rewound)
+        if seq in snapshot_seqs:
+            snapshots[seq] = (copy.deepcopy(chunks), released_to_user, just_rewound)
 
     snapshot(0)
     for event in events:
