@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import sys
+import termios
 import copy
 import re
 from typing import Optional
@@ -2316,8 +2317,16 @@ Return only the replacement user prompt text.
         try:
             preload_input = ""
             user_header_pending = False
+            flush_input_before_prompt = False
             while True:
                 rewind_shortcut = False
+
+                if flush_input_before_prompt:
+                    try:
+                        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                    except (OSError, termios.error):
+                        pass
+                    flush_input_before_prompt = False
 
                 def open_transcript(_buffer: str, _cursor: int):
                     from code_agent.cli.transcript import transcript_viewer_ui
@@ -2642,6 +2651,7 @@ Return only the replacement user prompt text.
                 elif self.agent_mode:
                     print()  # Keep agent-mode output from overwriting the submitted prompt line
 
+                flush_input_before_prompt = True
                 try:
                     response = self.run_loop(max_turns=max_turns)
                 except KeyboardInterrupt:
