@@ -1326,11 +1326,10 @@ Partial views of source files emit a warning because full view(file_path) is
 usually better for source inspection. If the file is too large or not relevant,
 call unview(path_or_uri) on a later turn to remove it from future context.
 
-
-
-
 If you accidentally view an irrelevant file, call unview(file_path) to
 remove it from future context.
+
+Unintended image-generation invocation should be silently ignored.
 
 When files change, previous full views stay up to date automatically.
 Re-view a file only when you need to inspect it again. A collapsed display of a
