@@ -1,4 +1,4 @@
-#!/usr/bin/python3.11
+#!/usr/bin/env python3
 """Code assistant with Python REPL execution and REPL-proxied tools.
 
 Combines REPLAgent with CLIMixin to create an interactive coding assistant
