@@ -1,7 +1,10 @@
 import ast
+import subprocess
+import sys
 import warnings
 
 from code_agent.session_replay import replay_display_text
+from code_agent.repl_events import ReplEvent
 
 
 class DummyStore:
@@ -215,11 +218,25 @@ def test_exec_prompt_text_suppresses_invalid_escape_parse_warnings():
 
 
 def test_ast_parse_still_warns_for_invalid_escape_without_replay_suppression():
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        ast.parse('emit("answer\\$", release=True)')
+    script = """
+import ast
+import warnings
 
-    assert any(issubclass(warning.category, SyntaxWarning) for warning in rec)
+source = 'emit("fresh' + chr(92) + 'q", release=True)'
+with warnings.catch_warnings(record=True) as rec:
+    warnings.simplefilter("always")
+    ast.parse(source)
+raise SystemExit(0 if any(
+    issubclass(warning.category, (SyntaxWarning, DeprecationWarning))
+    for warning in rec
+) else 1)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-W", "always", "-c", script],
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_replay_display_text_ignores_non_display_events():
@@ -371,7 +388,7 @@ def test_code_agent_records_file_diff_event_with_tool_and_paths():
     class Agent(CodeAgentBase):
         def __init__(self):
             self.events = []
-            self._edit_echo_buffer = [">>> line_patch('src/app.py', 'replace 1:1\\nnew')"]
+            self._statement_direct_call = "line_patch"
 
         def _append_session_event(self, event_type, payload, create_session=True):
             self.events.append((event_type, payload, create_session))
@@ -463,7 +480,7 @@ def test_code_agent_no_repl_display_still_prints_progress_emit(capsys):
     agent.repl_display = False
     agent._display_capture = []
 
-    agent.on_repl_chunk("working\n", "progress")
+    agent.on_repl_event(ReplEvent(kind="progress", text="working\n"))
 
     assert capsys.readouterr().out == "\x1b[92mworking\x1b[0m\n"
     assert agent._display_capture == ["working\n"]
@@ -477,14 +494,16 @@ def test_code_agent_observe_displays_full_text_in_bright_yellow(capsys):
     agent._display_capture = []
 
     text = "First observation.\n" + ("x" * 500)
-    agent.on_tool_call("observe", {"content": text})
+    agent.on_repl_event(ReplEvent(
+        kind="tool_called",
+        data={"name": "observe", "args": {"content": text}},
+    ))
 
     assert capsys.readouterr().out == (
         "\x1b[93mFirst observation.\x1b[0m\n"
         f"\x1b[93m{'x' * 500}\x1b[0m\n"
     )
     assert agent._display_capture == ["First observation.\n", f"{'x' * 500}\n"]
-    assert agent._suppress_next_observe_result is True
 
 
 def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
@@ -493,13 +512,19 @@ def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
     agent = CodeAgentBase.__new__(CodeAgentBase)
     agent.repl_display = True
     agent._display_capture = []
-    agent._suppress_next_observe_result = True
-
-    agent.on_repl_chunk("'[Continuing...]'\n", "output")
+    agent.on_repl_event(ReplEvent(
+        kind="statement_started",
+        data={
+            "direct_call": "observe",
+            "source": "observe('reason')",
+            "echo": "",
+            "display_echo": "",
+        },
+    ))
+    agent.on_repl_event(ReplEvent(kind="output", text="'[Continuing...]'\n"))
 
     assert capsys.readouterr().out == ""
     assert agent._display_capture == []
-    assert agent._suppress_next_observe_result is False
 
 
 def test_code_agent_resume_session_command_uses_worker_target_when_present():

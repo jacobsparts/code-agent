@@ -241,13 +241,13 @@ def worker_main(port, authkey, model, max_turns):
         def on_repl_execute(self, code):
             pass
 
-        def on_repl_chunk(self, chunk, msg_type="echo"):
+        def on_repl_event(self, event):
             pass
 
-        def on_repl_output(self, output_chunks):
+        def on_repl_events_complete(self, events):
             pass
 
-        def on_statement_output(self, statement_chunks):
+        def on_statement_events(self, events):
             pass
 
         def _handle_tool_request(self, repl, req):
@@ -268,6 +268,9 @@ def worker_main(port, authkey, model, max_turns):
                 return x
 
             args = {k: _deserialize(v) for k, v in args.items()}
+            event_name = "emit" if tool_name == "__emit__" else tool_name
+            if event_name:
+                self._publish_tool_event("tool_called", event_name, args=args)
 
             try:
                 if tool_name == '__emit__':
@@ -280,6 +283,7 @@ def worker_main(port, authkey, model, max_turns):
                         _send_msg(self._host_sock, ("result", str(value) if value is not None else ""))
                     else:
                         _send_msg(self._host_sock, ("progress", str(value) if value is not None else ""))
+                    self._publish_tool_event("tool_returned", "emit", result=None)
                     # No reply needed for emit, just ACK
 
                 else:
@@ -288,10 +292,12 @@ def worker_main(port, authkey, model, max_turns):
                     try:
                         result = self.toolcall(tool_name, args)
                         repl.send_reply(request_id, result=result)
+                        self._publish_tool_event("tool_returned", tool_name, result=result)
                     except _CompleteException:
                         raise
                     except Exception as e:
                         repl.send_reply(request_id, error=str(e))
+                        self._publish_tool_event("tool_failed", tool_name, error=str(e))
             finally:
                 # Always send ACK to unblock the sender
                 repl.send_ack(request_id)

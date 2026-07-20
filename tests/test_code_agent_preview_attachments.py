@@ -3,6 +3,7 @@ import re
 
 from code_agent.agent import CodeAgent
 from code_agent.conversation import Conversation
+from code_agent.repl_events import ReplEvent
 from code_agent.session_store import SessionStore
 
 
@@ -485,8 +486,8 @@ def test_view_full_file_already_in_context_emits_notice(tmp_path):
     assert pure_syntax_error is False
     assert "Notice: file was already in context." in output
     assert any(
-        msg_type == "output" and "Calling view() on files that are already in context is wasteful." in chunk
-        for msg_type, chunk in output_chunks
+        event.kind == "output" and "Calling view() on files that are already in context is wasteful." in event.text
+        for event in output_chunks
     )
 
 
@@ -519,8 +520,8 @@ def test_auto_preview_after_attachment_conversion_does_not_expand_attachment_bod
     agent = make_persistent_agent(tmp_path)
 
     output = agent.build_output_for_llm([
-        ("read_attach", path + "\n"),
-        ("read", large_numbered_content + "\n"),
+        ReplEvent(kind="read_attach", text=path + "\n"),
+        ReplEvent(kind="read", text=large_numbered_content + "\n"),
     ])
     result = agent.process_output_for_llm(output)
 
@@ -579,7 +580,7 @@ def test_line_patch_repeated_calls_adjust_line_changes_between_calls(tmp_path):
     assert pure_syntax_error is False
     assert "Traceback" not in output
     assert path.read_text() == "a\nc\nD\ne\n"
-    assert sum(1 for msg_type, _ in output_chunks if msg_type == "file_diff") == 2
+    assert sum(1 for event in output_chunks if event.kind == "file_diff") == 2
 
 
 def test_line_patch_repeated_calls_reject_overlapping_original_ranges(tmp_path):
@@ -615,8 +616,8 @@ def test_auto_refresh_uses_last_same_turn_write_for_attached_file(tmp_path):
     )
 
     output = agent.build_output_for_llm([
-        ("file_written", json.dumps({"path": path, "content": "first\n"}) + "\n"),
-        ("file_written", json.dumps({"path": path, "content": "second\n"}) + "\n"),
+        ReplEvent(kind="file_written", text=json.dumps({"path": path, "content": "first\n"}) + "\n"),
+        ReplEvent(kind="file_written", text=json.dumps({"path": path, "content": "second\n"}) + "\n"),
     ])
 
 
@@ -635,9 +636,9 @@ def test_auto_refresh_skips_when_file_explicitly_viewed_after_write(tmp_path):
     )
 
     output = agent.build_output_for_llm([
-        ("file_written", json.dumps({"path": path, "content": "written\n"}) + "\n"),
-        ("read_attach", path + "\n"),
-        ("read", "    1→viewed\n"),
+        ReplEvent(kind="file_written", text=json.dumps({"path": path, "content": "written\n"}) + "\n"),
+        ReplEvent(kind="read_attach", text=path + "\n"),
+        ReplEvent(kind="read", text="    1→viewed\n"),
     ])
 
 
@@ -655,9 +656,9 @@ def test_auto_refresh_after_explicit_view_uses_later_write(tmp_path):
     )
 
     output = agent.build_output_for_llm([
-        ("read_attach", path + "\n"),
-        ("read", "    1→viewed\n"),
-        ("file_written", json.dumps({"path": path, "content": "written\n"}) + "\n"),
+        ReplEvent(kind="read_attach", text=path + "\n"),
+        ReplEvent(kind="read", text="    1→viewed\n"),
+        ReplEvent(kind="file_written", text=json.dumps({"path": path, "content": "written\n"}) + "\n"),
     ])
 
     assert output == f"[Attachment: {path}]\n>>> view({path!r})\n[Attachment: {path}]\n"

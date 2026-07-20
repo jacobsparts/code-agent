@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from code_agent.repl_events import ReplEvent, events_output_text
+
 
 DEFAULT_CATEGORIES = (
     "correctness",
@@ -428,9 +430,9 @@ class InstrumentedREPLBenchmarkMixin:
         if kind == "syntax":
             self._benchmark_metrics["syntax_retries"] += 1
 
-    def on_statement_output(self, statement_chunks):
+    def on_statement_events(self, events: list[ReplEvent]):
         self._benchmark_metrics["statement_count"] += 1
-        text = "".join(chunk for _, chunk in statement_chunks)
+        text = events_output_text(events)
         self._benchmark_metrics["statement_text"].append(text)
         if "Traceback" in text or "Error:" in text:
             self._benchmark_metrics["runtime_errors"] += 1
@@ -442,7 +444,12 @@ class InstrumentedREPLBenchmarkMixin:
             if self._benchmark_metrics["turns"] > 1:
                 self._benchmark_metrics["saw_python_state_reuse"] = True
 
-    def on_repl_chunk(self, chunk, msg_type):
+    def on_repl_event(self, event: ReplEvent):
+        msg_type = event.kind
+        if msg_type == "final_emit":
+            msg_type = "emit"
+        elif msg_type == "worker_output":
+            msg_type = event.data.get("message_type", msg_type)
         counts = self._benchmark_metrics["chunk_counts"]
         counts[msg_type] = counts.get(msg_type, 0) + 1
         if msg_type == "progress":

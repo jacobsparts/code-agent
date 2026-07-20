@@ -14,6 +14,7 @@ Dependencies:
 """
 
 from code_agent.code_agent_preprocess import preprocess_code_agent
+import ast
 import base64
 import hashlib
 import json
@@ -26,6 +27,7 @@ from typing import Optional
 from pathlib import Path
 from queue import Empty
 from code_agent.repl_agent import REPLAgent
+from code_agent.repl_events import ReplEvent
 from code_agent.repl_attachment_mixin import REPLAttachmentMixin
 from code_agent.mcp_mixin import MCPMixin
 from code_agent.repl_attachment_mixin import MemoryAttachment, encode_attachment_refs
@@ -290,21 +292,18 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._header_pending = False
             self._repl_printed_header = True
 
-    def _flush_edit_echo_buffer(self):
-        buffer = getattr(self, '_edit_echo_buffer', [])
-        if not buffer:
+    def _flush_statement_echo(self) -> None:
+        echo = getattr(self, "_statement_echo", "")
+        if not echo or getattr(self, "_statement_echo_displayed", False):
             return
         self._show_python_header_if_pending()
-        for line in buffer:
+        for line in echo.rstrip("\n").split("\n"):
             print(line, flush=True)
             self._capture_display_line(line)
-        self._edit_echo_buffer = []
-        self._in_edit_echo = False
+        self._statement_echo_displayed = True
 
-    def _compact_edit_echo(self, diff: str) -> str:
-        buffer = getattr(self, '_edit_echo_buffer', [])
-        first = buffer[0] if buffer else ""
-        func = "line_patch" if first.startswith(">>> line_patch(") else "edit"
+    def _compact_edit_echo(self, diff: str, tool: str | None = None) -> str:
+        func = tool if tool in {"edit", "line_patch"} else "edit"
 
         filename = None
         for prefix in ("+++ ", "--- "):
@@ -338,16 +337,13 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
                 paths.append(path)
         return paths
 
-    def _record_file_diff_event(self, diff: str):
+    def _record_file_diff_event(self, diff: str, tool: str | None = None):
         if not diff:
             return
-        buffer = getattr(self, '_edit_echo_buffer', [])
-        first = buffer[0] if buffer else ""
-        tool = None
-        if first.startswith(">>> edit("):
-            tool = "edit"
-        elif first.startswith(">>> line_patch("):
-            tool = "line_patch"
+        if tool is None:
+            tool = getattr(self, "_statement_direct_call", None)
+        if tool not in {"edit", "line_patch"}:
+            tool = None
         self._append_session_event("file_diff", {
             "kind": "unified_diff",
             "tool": tool,
@@ -944,7 +940,7 @@ def _code_agent_send_rg_available():
         self._pending_observations = []
         self._persist_message(message)
 
-    def build_output_for_llm(self, output_chunks):
+    def build_output_for_llm(self, events: list[ReplEvent]) -> str:
         """Build LLM output, converting complete reads to attachments and large statement output to previews."""
         self._read_attachments = {}
         result = []
@@ -961,7 +957,19 @@ def _code_agent_send_rg_available():
                 result.append(self._auto_preview_output("".join(statement)))
                 statement.clear()
 
-        for chunk_order, (msg_type, chunk) in enumerate(output_chunks):
+        for event_order, event in enumerate(events):
+            msg_type = event.kind
+            chunk = event.text
+            if msg_type == "statement_started":
+                msg_type = "echo"
+                chunk = event.data.get("echo", chunk)
+            elif msg_type in {"statement_finished", "tool_called", "tool_returned", "tool_failed"}:
+                continue
+            elif msg_type == "final_emit":
+                msg_type = "emit"
+            elif msg_type == "worker_output":
+                msg_type = event.data.get("message_type", msg_type)
+
             if msg_type == "emit":
                 continue
             if msg_type == "file_unviewed":
@@ -995,11 +1003,10 @@ def _code_agent_send_rg_available():
                     continue
                 self._invalidate_attachment(path)
                 self._read_attachments[path] = content
-                attachment_read_order[path] = chunk_order
+                attachment_read_order[path] = event_order
                 result.append(f"[Attachment: {path}]\n")
                 continue
             if msg_type == "read" and partial_read_path:
-                path = partial_read_path
                 partial_read_path = None
                 statement.append(chunk)
                 continue
@@ -1010,7 +1017,7 @@ def _code_agent_send_rg_available():
                     item = json.loads(text)
                 except Exception:
                     item = {"path": text, "content": None}
-                item["_order"] = chunk_order
+                item["_order"] = event_order
                 written_files.append(item)
                 continue
             if msg_type == "file_diff":
@@ -1022,7 +1029,6 @@ def _code_agent_send_rg_available():
 
         flush_statement()
 
-        # Auto-refresh attached files from the last same-turn write.
         latest_writes = {}
         for item in written_files:
             path = item.get("path")
@@ -1051,7 +1057,6 @@ def _code_agent_send_rg_available():
             result.append(f">>> view({attached_name!r})\n[Attachment: {attached_name}]\n")
 
         return "".join(result)
-
 
     def _same_file(self, left: str, right: str) -> bool:
         if not isinstance(left, str) or not isinstance(right, str):
@@ -1611,16 +1616,6 @@ If you don't know how to proceed:
         return output
 
     # REPL output hooks
-    def on_tool_call(self, name: str, args: dict) -> None:
-        super().on_tool_call(name, args)
-        if name != "observe":
-            return
-        text = str(args.get("content", ""))
-        for line in text.split("\n"):
-            print(f"\x1b[93m{line}\x1b[0m", flush=True)
-            self._capture_display_line(line)
-        self._suppress_next_observe_result = True
-
     def on_repl_execute(self, code) -> None:
         """Called at start of each turn."""
         if hasattr(self, '_tool_repl'):
@@ -1629,196 +1624,69 @@ If you don't know how to proceed:
             except Exception:
                 pass
 
-    def on_repl_chunk(self, chunk: str, msg_type: str = "echo") -> None:
-        if not self.repl_display:
-            if msg_type == "file_diff":
-                self._record_file_diff_event(chunk)
-            elif msg_type == "progress":
-                text = chunk.rstrip('\n')
-                for line in text.split('\n'):
-                    print(f"\x1b[92m{line}\x1b[0m", flush=True)
-                    self._capture_display_line(line)
-            return
-        """Called for each output chunk. Display echo and progress immediately."""
-        # Suppress display during direct user REPL mode
-        if getattr(self, '_in_user_repl', False):
-            return
-        if msg_type == "echo":
-            # Mark that we've started processing output. Do not clear the
-            # carriage-return status line until we have visible output to draw;
-            # clearing too early can leave a single non-dim character under the
-            # cursor while a long read_attach is processed.
+    def on_repl_event(self, event: ReplEvent) -> None:
+        kind = event.kind
+        chunk = event.text
+
+        if kind == "statement_started":
+            if getattr(self, "_statement_echo", None):
+                self._flush_statement_echo()
+            self._statement_direct_call = event.data.get("direct_call")
+            self._statement_source = event.data.get("source", "")
+            self._statement_echo = event.data.get("display_echo", event.data.get("echo", ""))
+            self._statement_echo_displayed = False
+            self._statement_had_diff = False
+            self._statement_print_uses_variable = False
+
             if not getattr(self, '_turn_output_started', False):
                 self._turn_output_started = True
-                self.console.clear_line()  # Clear status text
-                # Only set header pending if we haven't already printed it this interaction
-                if not getattr(self, '_repl_printed_header', False):
-                    self._header_pending = True
-            # Echo lines already have >>> or ... prefix
-            # Skip emit() calls - user sees progress/result via green text
-            # Buffer print() calls - decide display based on output truncation
-            # Buffer edit()/line_patch() calls - replace with compact echo if a diff arrives
-            for line in chunk.rstrip('\n').split('\n'):
-
-                if line.startswith('>>> '):
-                    # New statement starting - flush any pending print/edit buffers first
-                    # (handles print() with no output or empty output, or edit errors before diff)
-                    if getattr(self, '_print_echo_buffer', []):
-                        for echo_line in self._print_echo_buffer:
-                            self._show_python_header_if_pending()
-                            print(echo_line, flush=True)
-                            self._capture_display_line(echo_line)
-                        self._print_echo_buffer = []
-                        self._in_print_echo = False
-                    self._flush_edit_echo_buffer()
-
-                    # New statement - check if it's emit(), observe(), print(), edit(), or line_patch()
-                    self._in_emit_echo = line.startswith('>>> emit(')
-                    self._in_observe_echo = line.startswith('>>> observe(')
-                    if line.startswith('>>> print('):
-                        self._in_print_echo = True
-                        self._print_echo_buffer = [line]
-                        # Check if argument is a variable (not a string literal)
-                        # String literals start with quotes after print(
-                        # Bare print() is treated like a string literal
-                        arg_start = line[10:].lstrip()
-                        self._print_uses_variable = not (
-                            arg_start.startswith(')') or  # print()
-                            arg_start.startswith('"') or
-                            arg_start.startswith("'") or
-                            arg_start.startswith('f"') or
-                            arg_start.startswith("f'") or
-                            arg_start.startswith('r"') or
-                            arg_start.startswith("r'")
-                        )
-                        continue
-                    if line.startswith('>>> edit(') or line.startswith('>>> line_patch('):
-                        self._in_edit_echo = True
-                        self._edit_echo_buffer = [line]
-                        continue
-                    self._in_print_echo = False
-                    self._in_edit_echo = False
-
-                # Buffer continuation lines for print()
-                if getattr(self, '_in_print_echo', False):
-                    self._print_echo_buffer.append(line)
-                    continue
-                # Buffer continuation lines for edit()/line_patch()
-                if getattr(self, '_in_edit_echo', False):
-                    self._edit_echo_buffer.append(line)
-                    continue
-
-                # Skip emit()/observe() echoes
-                if not (
-                    getattr(self, '_in_emit_echo', False)
-                    or getattr(self, '_in_observe_echo', False)
-                ):
-                    self._show_python_header_if_pending()
-                    print(line, flush=True)
-                    self._capture_display_line(line)
-
-        elif msg_type == "progress":
-            text = chunk.rstrip('\n')
-            for line in text.split('\n'):
-                print(f"\x1b[92m{line}\x1b[0m", flush=True)  # Bright green
-                self._capture_display_line(line)
-        elif msg_type == "emit":
-            return
-        elif msg_type in ("output", "print"):
-            if msg_type == "output" and getattr(self, '_suppress_next_observe_result', False):
-                if chunk.strip() == "'[Continuing...]'":
-                    self._suppress_next_observe_result = False
-                    return
-                self._suppress_next_observe_result = False
-            if msg_type == "output" and getattr(self, '_edit_echo_buffer', []) and chunk.lstrip().startswith("Traceback"):
-                self._flush_edit_echo_buffer()
-            if msg_type == "output" and getattr(self, '_suppress_next_edit_result', False):
-                stripped = chunk.strip()
                 if (
-                    stripped in {"'Edit applied.'", "'Line patch applied.'"}
-                    or re.match(r"^'All \d+ occurrences replaced\.'$", stripped)
+                    self.repl_display
+                    and not getattr(self, '_in_user_repl', False)
+                    and self._statement_direct_call not in {"emit", "observe"}
                 ):
-                    self._suppress_next_edit_result = False
-                    return
+                    self.console.clear_line()
+                    if not getattr(self, '_repl_printed_header', False):
+                        self._header_pending = True
 
-            # Print header if pending (in case output comes before visible echo)
-            self._show_python_header_if_pending()
-
-            text = chunk.rstrip('\n')
-            # For string literals (return values), show value instead of repr
-            if msg_type == "output":
+            if self._statement_direct_call == "print":
                 try:
-                    import ast
-                    value = ast.literal_eval(text)
-                    if isinstance(value, str):
-                        text = value.rstrip('\n')
-                except (ValueError, SyntaxError):
-                    pass
-            # Truncate to 5 lines or 240 chars, unless this already looks like
-            # a PreviewRef summary header.
+                    tree = ast.parse(self._statement_source)
+                    call = tree.body[0].value
+                    arg = call.args[0] if call.args else None
+                    self._statement_print_uses_variable = arg is not None and not isinstance(
+                        arg, (ast.Constant, ast.JoinedStr)
+                    )
+                except Exception:
+                    self._statement_print_uses_variable = True
+            elif (
+                self.repl_display
+                and not getattr(self, '_in_user_repl', False)
+                and self._statement_direct_call not in {"emit", "observe", "edit", "line_patch"}
+            ):
+                self._flush_statement_echo()
+            return
 
-            lines = text.split('\n')
-            total_lines = len(lines)
-            truncated_at_lines = False
-            truncated_at_chars = False
-            disable_truncation = (
-                total_lines > 0
-                and bool(__import__('re').match(r'^\(\d+ lines, \d+ chars\)$', lines[0]))
-            )
-            if not disable_truncation and len(lines) > 5:
-                lines = lines[:5]
-                truncated_at_lines = True
-            display = '\n'.join(lines)
-            if not disable_truncation and len(display) > 240:
-                display = display[:240]
-                truncated_at_chars = True
-            is_truncated = truncated_at_lines or truncated_at_chars
-            # For print(): show echo only if truncated or uses a variable
-            is_print_output = msg_type == "print"
-            print_echo_buffer = getattr(self, '_print_echo_buffer', [])
-            print_uses_variable = getattr(self, '_print_uses_variable', False)
-            if is_print_output and print_echo_buffer:
-                if is_truncated or print_uses_variable:
-                    # Show the buffered echo
-                    for echo_line in print_echo_buffer:
-                        print(echo_line, flush=True)
-                        self._capture_display_line(echo_line)
-                # Clear the buffer
-                self._print_echo_buffer = []
-                self._in_print_echo = False
-            # Print with appropriate continuation
-            if truncated_at_chars and not truncated_at_lines:
-                # Cut mid-line: ellipsis on same line
-                print(f"{DIM}{display}...{RESET}", flush=True)
-                print(f"{DIM}({total_lines} lines total){RESET}", flush=True)
-                self._capture_display_line(f"{display}...")
-                self._capture_display_line(f"({total_lines} lines total)")
-            elif is_truncated:
-                # Cut at line boundary: ellipsis on own line
-                for line in display.split('\n'):
-                    print(f"{DIM}{line}{RESET}", flush=True)
+        if kind == "tool_called":
+            if event.data.get("name") == "observe":
+                text = str((event.data.get("args") or {}).get("content", ""))
+                for line in text.split("\n"):
+                    print(f"\x1b[93m{line}\x1b[0m", flush=True)
                     self._capture_display_line(line)
-                print(f"{DIM}... ({total_lines} lines total){RESET}", flush=True)
-                self._capture_display_line(f"... ({total_lines} lines total)")
-            elif is_print_output:
-                # No truncation for print(): show in yellow, echo already handled
-                for line in display.split('\n'):
-                    print(f"\x1b[33m{line}\x1b[0m", flush=True)
-                    self._capture_display_line(line)
-            else:
-                # No truncation for expression output: show in dim
-                for line in display.split('\n'):
-                    print(f"{DIM}{line}{RESET}", flush=True)
-                    self._capture_display_line(line)
-        elif msg_type == "file_diff":
-            self._record_file_diff_event(chunk)
+            return
+
+        if kind == "file_diff":
+            tool = getattr(self, "_statement_direct_call", None)
+            self._record_file_diff_event(chunk, tool)
+            self._statement_had_diff = True
+            if not self.repl_display or getattr(self, '_in_user_repl', False):
+                return
             self._show_python_header_if_pending()
-            if getattr(self, '_edit_echo_buffer', []):
-                echo_line = self._compact_edit_echo(chunk)
+            if not getattr(self, "_statement_echo_displayed", False):
+                echo_line = self._compact_edit_echo(chunk, tool)
                 print(echo_line, flush=True)
                 self._capture_display_line(echo_line)
-                self._edit_echo_buffer = []
-                self._in_edit_echo = False
+                self._statement_echo_displayed = True
             for line in chunk.rstrip('\n').split('\n'):
                 if line.startswith('--- ') or line.startswith('+++ '):
                     continue
@@ -1832,9 +1700,105 @@ If you don't know how to proceed:
                     color = DIM
                 print(f"{color}{line}{RESET}", flush=True)
                 self._capture_display_line(line)
-            self._suppress_next_edit_result = True
+            return
 
-    max_display_chars = _get_config_value("code_agent_max_display_chars", 200)  # Max chars per line to show user (agent sees full output)
+        if kind == "progress":
+            text = chunk.rstrip('\n')
+            for line in text.split('\n'):
+                print(f"\x1b[92m{line}\x1b[0m", flush=True)
+                self._capture_display_line(line)
+            return
+
+        if kind in {
+            "final_emit",
+            "error",
+            "statement_finished",
+            "tool_returned",
+            "tool_failed",
+            "read_attach",
+            "read_partial",
+            "file_written",
+        }:
+            return
+
+        if not self.repl_display or getattr(self, '_in_user_repl', False):
+            return
+
+        if kind not in {"output", "print"}:
+            return
+
+        direct_call = getattr(self, "_statement_direct_call", None)
+        stripped = chunk.strip()
+        if (
+            kind == "output"
+            and direct_call == "observe"
+            and stripped == "'[Continuing...]'"
+        ):
+            return
+        if (
+            kind == "output"
+            and direct_call in {"edit", "line_patch"}
+            and getattr(self, "_statement_had_diff", False)
+            and (
+                stripped in {"'Edit applied.'", "'Line patch applied.'"}
+                or re.match(r"^'All \d+ occurrences replaced\.'$", stripped)
+            )
+        ):
+            return
+        if kind == "output" and direct_call in {"edit", "line_patch"} and chunk.lstrip().startswith("Traceback"):
+            self._flush_statement_echo()
+
+        self._show_python_header_if_pending()
+        text = chunk.rstrip('\n')
+        if kind == "output":
+            try:
+                value = ast.literal_eval(text)
+                if isinstance(value, str):
+                    text = value.rstrip('\n')
+            except (ValueError, SyntaxError):
+                pass
+
+        lines = text.split('\n')
+        total_lines = len(lines)
+        truncated_at_lines = False
+        truncated_at_chars = False
+        disable_truncation = (
+            total_lines > 0
+            and bool(re.match(r'^\(\d+ lines, \d+ chars\)$', lines[0]))
+        )
+        if not disable_truncation and len(lines) > 5:
+            lines = lines[:5]
+            truncated_at_lines = True
+        display = '\n'.join(lines)
+        if not disable_truncation and len(display) > 240:
+            display = display[:240]
+            truncated_at_chars = True
+        is_truncated = truncated_at_lines or truncated_at_chars
+
+        if kind == "print" and (
+            is_truncated or getattr(self, "_statement_print_uses_variable", False)
+        ):
+            self._flush_statement_echo()
+
+        if truncated_at_chars and not truncated_at_lines:
+            print(f"{DIM}{display}...{RESET}", flush=True)
+            print(f"{DIM}({total_lines} lines total){RESET}", flush=True)
+            self._capture_display_line(f"{display}...")
+            self._capture_display_line(f"({total_lines} lines total)")
+        elif is_truncated:
+            for line in display.split('\n'):
+                print(f"{DIM}{line}{RESET}", flush=True)
+                self._capture_display_line(line)
+            print(f"{DIM}... ({total_lines} lines total){RESET}", flush=True)
+            self._capture_display_line(f"... ({total_lines} lines total)")
+        elif kind == "print":
+            for line in display.split('\n'):
+                print(f"\x1b[33m{line}\x1b[0m", flush=True)
+                self._capture_display_line(line)
+        else:
+            for line in display.split('\n'):
+                print(f"{DIM}{line}{RESET}", flush=True)
+                self._capture_display_line(line)
 
     def _truncate_for_display(self, output: str) -> str:
         import re
@@ -1882,51 +1846,41 @@ If you don't know how to proceed:
 
         return '\n'.join(truncated_lines)
 
-    def on_statement_output(self, statement_chunks: list) -> None:
-        if not self.repl_display:
-            if getattr(self, '_suppress_next_edit_result', False):
-                self._suppress_next_edit_result = False
-            return
-        """Display per-statement summary after each statement completes."""
-        # Suppress display during direct user REPL mode
-        if getattr(self, '_in_user_repl', False):
-            return
-        # Collect error output for this statement
-        error_chunks = []
-        for msg_type, chunk in statement_chunks:
-            if msg_type == "error":
-                error_chunks.append(chunk)
+    def on_statement_events(self, events: list[ReplEvent]) -> None:
+        if self.repl_display and not getattr(self, '_in_user_repl', False):
+            error_display = "".join(event.text for event in events if event.kind == "error")
+            if error_display.strip():
+                self._flush_statement_echo()
+                for line in error_display.rstrip('\n').split('\n'):
+                    print(f"\x1b[91m{line}\x1b[0m", flush=True)
+                    self._capture_display_line(line)
+                self._repl_has_output = True
 
-        error_display = "".join(error_chunks)
+            if (
+                getattr(self, "_statement_direct_call", None) in {"edit", "line_patch"}
+                and not getattr(self, "_statement_had_diff", False)
+            ):
+                self._flush_statement_echo()
+            if (
+                getattr(self, "_statement_direct_call", None) == "print"
+                and not any(event.kind == "print" for event in events)
+            ):
+                self._flush_statement_echo()
 
-        # Display error output
-        if error_display.strip():
-            self._flush_edit_echo_buffer()
-            for line in error_display.rstrip('\n').split('\n'):
-                print(f"\x1b[91m{line}\x1b[0m", flush=True)  # Red for errors
-                self._capture_display_line(line)
-            self._repl_has_output = True
+        self._statement_direct_call = None
+        self._statement_source = ""
+        self._statement_echo = ""
+        self._statement_echo_displayed = False
+        self._statement_had_diff = False
+        self._statement_print_uses_variable = False
 
-        if getattr(self, '_suppress_next_edit_result', False):
-            # A file_diff was displayed for a statement whose return value was
-            # not shown (e.g. assignment or multi-statement exec). Clear the
-            # suppression so it cannot affect later unrelated output.
-            self._suppress_next_edit_result = False
-
-    def on_repl_output(self, output_chunks: list) -> None:
-        if not self.repl_display:
-            self._turn_number = getattr(self, '_turn_number', 1) + 1
-            self._edit_echo_buffer = []
-            self._in_edit_echo = False
-            self._turn_output_started = False
-            return
-        """Called at end of turn. Updates thinking message for next turn."""
-        # Show thinking for next turn
+    def on_repl_events_complete(self, events: list[ReplEvent]) -> None:
         self._turn_number = getattr(self, '_turn_number', 1) + 1
-        self._flush_edit_echo_buffer()
-        self._turn_output_started = False  # Reset for next turn's clear_line
+        self._turn_output_started = False
+        if not self.repl_display:
+            return
+        self.console.clear_line()
         thinking = getattr(self, 'thinking_message', 'Thinking...')
-        self.console.clear_line()  # Clear previous status text
         print(f"{DIM}{thinking} (turn {self._turn_number}){RESET}", end="", flush=True)
 
     def on_retry(self, kind: str, retry_num: int) -> None:
@@ -2009,7 +1963,7 @@ If you don't know how to proceed:
                 result = compile_command(source)
                 if result is not None:
                     # Complete statement - execute with tool handling
-                    # Suppress on_repl_chunk display during direct REPL mode
+                    # Suppress REPL event display during direct REPL mode
                     self._in_user_repl = True
                     try:
                         output, _, _, _ = self._execute_with_tool_handling(repl, source)
@@ -2640,9 +2594,12 @@ Return only the replacement user prompt text.
                 self._turn_number = 1
                 self._turn_output_started = False
                 self._header_pending = False
-                self._in_emit_echo = False
-                self._in_observe_echo = False
-                self._suppress_next_observe_result = False
+                self._statement_direct_call = None
+                self._statement_source = ""
+                self._statement_echo = ""
+                self._statement_echo_displayed = False
+                self._statement_had_diff = False
+                self._statement_print_uses_variable = False
                 self._reset_display_capture()
                 if self.repl_display:
                     print()  # Blank line after user input

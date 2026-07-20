@@ -21,6 +21,7 @@ from code_agent.repl_benchmark import (
     strip_ansi,
 )
 from code_agent.repl_benchmark.code_agent_harness import strip_events
+from code_agent.repl_events import ReplEvent
 from code_agent.repl_benchmark.core import BenchmarkTaskContext, checker_expected_int, default_checker
 from code_agent.repl_benchmark.registry import task_registry
 
@@ -57,7 +58,10 @@ class FakeAgent:
     def run_loop(self, max_turns=10, max_syntax_retries=3):
         self.on_repl_execute(None)
         self._on_assistant_message_committed({"content": 'emit("55", release=True)'})
-        self.on_statement_output([("echo", "x = 1\n"), ("echo", 'emit("55", release=True)\n')])
+        self.on_statement_events([
+            ReplEvent(kind="statement_started", data={"echo": "x = 1\n"}),
+            ReplEvent(kind="statement_started", data={"echo": 'emit("55", release=True)\n'}),
+        ])
         self.llm_client.usage_tracker.history.append((
             self.model,
             {
@@ -77,8 +81,13 @@ class FakeBadAgent(FakeAgent):
         self.on_repl_execute(None)
         self.on_retry("syntax", 1)
         self._on_assistant_message_committed({"content": 'bash("python -c \'print(55)\'")'})
-        self.on_repl_chunk("working", "progress")
-        self.on_statement_output([("echo", 'bash("python -c \'print(55)\'")\n')])
+        self.on_repl_event(ReplEvent(kind="progress", text="working"))
+        self.on_statement_events([
+            ReplEvent(
+                kind="statement_started",
+                data={"echo": 'bash("python -c \'print(55)\'")\n'},
+            ),
+        ])
         self.llm_client.usage_tracker.history.append((
             self.model,
             {
@@ -278,7 +287,7 @@ def test_tool_repl_validation_silences_parent_warning_and_captures_execution_war
     assert pure_syntax_error is False
     assert corrected_code == code
     assert output.count("invalid escape sequence") == 1
-    assert sum(chunk.count("invalid escape sequence") for _, chunk in output_chunks) == 1
+    assert sum(event.text.count("invalid escape sequence") for event in output_chunks) == 1
 
 
 def test_tool_repl_worker_imports_from_current_directory(tmp_path, monkeypatch):
@@ -458,6 +467,8 @@ def test_cli_human_summary_with_fake_agent(tmp_path):
             def __init__(self):
                 self.usage_tracker = FakeUsageTracker()
 
+        from code_agent.repl_events import ReplEvent
+
         class FakeAgent:
             model = "fake-cli-model"
 
@@ -476,7 +487,12 @@ def test_cli_human_summary_with_fake_agent(tmp_path):
             def run_loop(self, max_turns=10, max_syntax_retries=3):
                 self.on_repl_execute(None)
                 self._on_assistant_message_committed({"content": 'emit("55", release=True)'})
-                self.on_statement_output([("echo", 'emit("55", release=True)\\n')])
+                self.on_statement_events([
+                    ReplEvent(
+                        kind="statement_started",
+                        data={"echo": 'emit("55", release=True)\\n'},
+                    ),
+                ])
                 self.llm_client.usage_tracker.history.append((
                     self.model,
                     {
