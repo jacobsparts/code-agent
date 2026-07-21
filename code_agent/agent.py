@@ -1334,7 +1334,7 @@ call unview(path_or_uri) on a later turn to remove it from future context.
 If you accidentally view an irrelevant file, call unview(file_path) to
 remove it from future context.
 
-Unintended image-generation invocation should be silently ignored.
+Unintended image-generation invocation should be silently ignored, do not make observations about them.
 
 When files change, previous full views stay up to date automatically.
 Re-view a file only when you need to inspect it again. A collapsed display of a
