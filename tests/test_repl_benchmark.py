@@ -6,6 +6,8 @@ import subprocess
 import sys
 import threading
 import warnings
+
+import pytest
 from pathlib import Path
 from textwrap import dedent
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -528,7 +530,14 @@ def test_cli_human_summary_with_fake_agent(tmp_path):
     assert "cli/task: PASS" in proc.stdout
 
 
-def test_code_agent_cli_trivial_pty(tmp_path):
+@pytest.mark.parametrize(
+    ("prompt_args", "inputs"),
+    [
+        ([], ["What is 2+2?\n"]),
+        (["--prompt", "What is 2+2?"], []),
+    ],
+)
+def test_code_agent_cli_trivial_pty(tmp_path, prompt_args, inputs):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers["Content-Length"])
@@ -601,8 +610,15 @@ code_agent_model = "test-code-agent"
 
     try:
         result = run_pty_session(
-            [sys.executable, "-m", "code_agent.agent", "--model", "test-code-agent"],
-            inputs=["What is 2+2?\n"],
+            [
+                sys.executable,
+                "-m",
+                "code_agent.agent",
+                "--model",
+                "test-code-agent",
+                *prompt_args,
+            ],
+            inputs=inputs,
             env=env,
             cwd=str(Path.cwd()),
             timeout=20,

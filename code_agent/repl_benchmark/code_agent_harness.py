@@ -86,7 +86,7 @@ def run_pty_session(
         last_output_at = time.monotonic()
         input_queue = list(inputs)
         last_send = 0.0
-        inputs_done = False
+        inputs_done = not input_queue
         saw_wait_for = wait_for is None
         eof_sent_at = 0.0
         self_terminated = False

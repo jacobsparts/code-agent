@@ -2187,7 +2187,12 @@ Return only the replacement user prompt text.
         ]
         self._last_was_repl_output = True
 
-    def cli_run(self, max_turns: int | None = None, resume: str | bool = False):
+    def cli_run(
+        self,
+        max_turns: int | None = None,
+        resume: str | bool = False,
+        initial_prompt: str | None = None,
+    ):
         """Run CLI loop with Python block delimiters."""
         from code_agent.cli.mixin import SQLiteHistory, InputSession
         from code_agent.cli.altmode import AltMode
@@ -2269,6 +2274,7 @@ Return only the replacement user prompt text.
 
         try:
             preload_input = ""
+            pending_initial_prompt = initial_prompt
             user_header_pending = False
             flush_input_before_prompt = False
             while True:
@@ -2303,23 +2309,31 @@ Return only the replacement user prompt text.
                         return None
                     return self._section_header("User")
 
-                try:
-                    user_input = session.prompt(
-                        prompt_str,
-                        initial_text=preload_input,
-                        on_ctrl_o=open_transcript,
-                        on_esc_esc=None if self.agent_mode else trigger_rewind,
-                        accepted_prefix=accepted_user_prefix,
-                    )
-                except KeyboardInterrupt:
-                    print()
-                    preload_input = ""
-                    continue
-                except EOFError:
-                    if not self._run_pre_exit_hooks():
-                        self.console.print("[yellow]Returning to prompt. Try Ctrl+D again to exit.[/yellow]")
+                if pending_initial_prompt is not None:
+                    user_input = pending_initial_prompt
+                    pending_initial_prompt = None
+                    lines = user_input.splitlines() or [""]
+                    print(f"{prompt_str}{lines[0]}")
+                    for line in lines[1:]:
+                        print(line)
+                else:
+                    try:
+                        user_input = session.prompt(
+                            prompt_str,
+                            initial_text=preload_input,
+                            on_ctrl_o=open_transcript,
+                            on_esc_esc=None if self.agent_mode else trigger_rewind,
+                            accepted_prefix=accepted_user_prefix,
+                        )
+                    except KeyboardInterrupt:
+                        print()
+                        preload_input = ""
                         continue
-                    break
+                    except EOFError:
+                        if not self._run_pre_exit_hooks():
+                            self.console.print("[yellow]Returning to prompt. Try Ctrl+D again to exit.[/yellow]")
+                            continue
+                        break
                 preload_input = ""
 
                 if not user_input.strip():
@@ -3776,6 +3790,7 @@ Examples:
   coda --resume                       # Open session picker on startup
   coda --resume <session_id>          # Resume specific session directly
   coda --attach AGENTS.md             # Attach a file on startup
+  coda --prompt "Fix the failing tests"  # Submit an initial prompt on startup
 """
     )
     parser.add_argument(
@@ -3796,6 +3811,11 @@ Examples:
         default=False,
         metavar="SESSION_ID",
         help="Resume a session. With no argument, opens the session picker."
+    )
+    parser.add_argument(
+        "--prompt", "-p",
+        metavar="TEXT",
+        help="Submit an initial prompt automatically on startup.",
     )
     parser.add_argument(
         "--no-repl-display",
@@ -3884,7 +3904,7 @@ Examples:
             repl_transport = remote_transport
     try:
         with ConfiguredAgent() as agent:
-            agent.cli_run(resume=args.resume)
+            agent.cli_run(resume=args.resume, initial_prompt=args.prompt)
     except ModelNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
