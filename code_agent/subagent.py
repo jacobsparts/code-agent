@@ -86,6 +86,8 @@ def _configured_default_model() -> str:
         from code_agent.config import get_user_config
         config = get_user_config()
         value = getattr(config, "code_agent_model", None) if config else None
+        if isinstance(value, list):
+            return value[0] if value else "sonnet"
         if value:
             return value
     except Exception:

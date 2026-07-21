@@ -1,3 +1,5 @@
+import os
+
 from code_agent.cli.terminal import render_markdown, strip_ansi
 
 
@@ -28,3 +30,70 @@ def test_table_columns_keep_readable_minimum_width():
     assert "abcdefghijkl" in rendered
     assert "mnop" in rendered
     assert max(len(line) for line in lines) > 30
+
+
+
+class _NoopRawMode:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+
+class _FakeStdin:
+    def fileno(self):
+        return 0
+
+
+def test_prompt_tab_callback_only_runs_with_empty_input(monkeypatch):
+    import io
+    from code_agent.cli import prompt as prompt_module
+
+    reads = iter([b"x", b"\t", b"\r"])
+    statuses = []
+    output = io.StringIO()
+
+    monkeypatch.setattr(prompt_module, "RawMode", _NoopRawMode)
+    monkeypatch.setattr(prompt_module.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(prompt_module.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(prompt_module.sys, "stdout", output)
+
+    result = prompt_module.prompt(
+        prompt_str="> ",
+        on_tab=lambda: statuses.append("called") or "changed",
+    )
+
+    assert result == "x"
+    assert statuses == []
+
+
+def test_repeated_prompt_tabs_replace_model_status_line(monkeypatch):
+    import io
+    from code_agent.cli import prompt as prompt_module
+
+    reads = iter([b"\t", b"\t", b"\r"])
+    statuses = iter(["model-b", "model-c"])
+    output = io.StringIO()
+
+    monkeypatch.setattr(prompt_module, "RawMode", _NoopRawMode)
+    monkeypatch.setattr(prompt_module.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(prompt_module.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(prompt_module.sys, "stdout", output)
+    monkeypatch.setattr(
+        prompt_module.os,
+        "get_terminal_size",
+        lambda: os.terminal_size((80, 24)),
+    )
+
+    result = prompt_module.prompt(
+        prompt_str="> ",
+        on_tab=lambda: next(statuses),
+    )
+
+    rendered = output.getvalue()
+    assert result == ""
+    assert rendered.count("model-b\n") == 1
+    assert "\x1b[1A\r\x1b[2Kmodel-c\x1b[1B\r\x1b[2C" in rendered
+    assert "\nmodel-c\n" not in rendered

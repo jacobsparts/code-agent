@@ -543,6 +543,50 @@ def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
     assert agent._display_capture == []
 
 
+def test_configured_models_accepts_string_and_list(monkeypatch):
+    from code_agent import agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_get_config_value", lambda name, default: "model-a")
+    assert agent_module._configured_models() == ["model-a"]
+
+    monkeypatch.setattr(
+        agent_module,
+        "_get_config_value",
+        lambda name, default: ["model-a", "model-b"],
+    )
+    assert agent_module._configured_models() == ["model-a", "model-b"]
+
+
+def test_code_agent_cycles_configured_models_and_clears_cached_client():
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.model = "model-a"
+    agent.model_choices = ["model-a", "model-b"]
+    agent._llm_client = object()
+
+    status = agent._cycle_model()
+
+    assert agent.model == "model-b"
+    assert not hasattr(agent, "_llm_client")
+    assert "Model changed: model-b" in status
+    assert "model-a" not in status
+
+    agent._cycle_model()
+    assert agent.model == "model-a"
+
+
+def test_code_agent_does_not_cycle_single_configured_model():
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.model = "model-a"
+    agent.model_choices = ["model-a"]
+
+    assert agent._cycle_model() is None
+    assert agent.model == "model-a"
+
+
 def test_code_agent_resume_session_command_uses_worker_target_when_present():
     from code_agent.agent import CodeAgentBase
 

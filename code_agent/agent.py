@@ -54,6 +54,13 @@ def _get_config_value(attr_name, default):
     return getattr(config, attr_name, default) if config else default
 
 
+def _configured_models() -> list[str]:
+    value = _get_config_value("code_agent_model", "sonnet")
+    if isinstance(value, list):
+        return value or ["sonnet"]
+    return [value]
+
+
 def _skill_description(path: Path) -> str:
     try:
         for line in path.read_text().splitlines():
@@ -71,7 +78,8 @@ def _skill_description(path: Path) -> str:
 class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
     """Code assistant with Python REPL execution."""
 
-    model = _get_config_value("code_agent_model", "sonnet")
+    model_choices = _configured_models()
+    model = model_choices[0]
     worker_host = "local"
     worker_target = None
 
@@ -98,6 +106,29 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._configure_conversation(self._conversation)
 
         self.llm_client.on_retry = self.on_retry
+
+    def _set_model(self, new_model: str) -> bool:
+        old_model = self.model
+        if new_model == old_model:
+            return False
+        self.model = new_model
+        if hasattr(self, "_llm_client"):
+            delattr(self, "_llm_client")
+        if hasattr(self, "_conversation"):
+            self._conversation.llm_client = self.llm_client
+        return True
+
+    def _cycle_model(self) -> str | None:
+        choices = getattr(self, "model_choices", [])
+        if len(choices) < 2:
+            return None
+        try:
+            index = choices.index(self.model)
+        except ValueError:
+            index = -1
+        new_model = choices[(index + 1) % len(choices)]
+        self._set_model(new_model)
+        return f"{DIM}Model changed: {new_model}{RESET}"
 
     def session_host(self) -> str:
         return getattr(self, "worker_host", "local") or "local"
@@ -2233,6 +2264,8 @@ Return only the replacement user prompt text.
         key_help = "Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Ctrl+C = interrupt | Ctrl+D = quit"
         if not self.agent_mode:
             key_help = "Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit"
+        if len(getattr(self, "model_choices", [])) > 1:
+            key_help = f"Tab = model | {key_help}"
         self.console.print(f"[dim]{key_help}[/dim]")
         commands = ["/repl"]
         if not self.agent_mode:
@@ -2325,6 +2358,7 @@ Return only the replacement user prompt text.
                             initial_text=preload_input,
                             on_ctrl_o=open_transcript,
                             on_esc_esc=None if self.agent_mode else trigger_rewind,
+                            on_tab=self._cycle_model,
                             accepted_prefix=accepted_user_prefix,
                         )
                     except KeyboardInterrupt:
@@ -2519,14 +2553,8 @@ Return only the replacement user prompt text.
                         if new_model == old_model:
                             self._display_text(f"{DIM}Current model: {old_model}{RESET}", kind="status")
                             continue
-                        self.model = new_model
-                        # Clear cached client so new model takes effect
-                        if hasattr(self, '_llm_client'):
-                            delattr(self, '_llm_client')
-                        # Update conversation's client reference (preserves message history)
-                        if hasattr(self, '_conversation'):
-                            self._conversation.llm_client = self.llm_client
-                        self._display_text(f"{DIM}Model changed: {old_model} → {new_model}{RESET}", kind="status")
+                        self._set_model(new_model)
+                        self._display_text(f"{DIM}Model changed: {new_model}{RESET}", kind="status")
                     except ModelNotFoundError as e:
                         self._display_text(f"{DIM}{str(e)}{RESET}", kind="status")
                     continue
@@ -3795,9 +3823,10 @@ Examples:
   coda --prompt "Fix the failing tests"  # Submit an initial prompt on startup
 """
     )
+    configured_models = _configured_models()
     parser.add_argument(
         "--model", "-m",
-        default=_get_config_value("code_agent_model", "sonnet"),
+        default=configured_models[0],
         help="LLM model to use (default from config or sonnet)"
     )
     parser.add_argument(
@@ -3868,6 +3897,8 @@ Examples:
 
     try:
         from code_agent.llm_registry import get_model_config
+        for model in configured_models:
+            get_model_config(model)
         get_model_config(args.model)
     except ModelNotFoundError as e:
         print(str(e), file=sys.stderr)
@@ -3895,6 +3926,7 @@ Examples:
 
     class ConfiguredAgent(CodeAgent):
         model = args.model
+        model_choices = configured_models
         max_turns = args.max_turns
         worker_host = remote_host
         worker_target = args.worker_target
