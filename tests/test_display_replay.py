@@ -506,6 +506,22 @@ def test_code_agent_observe_displays_full_text_in_bright_yellow(capsys):
     assert agent._display_capture == ["First observation.\n", f"{'x' * 500}\n"]
 
 
+def test_code_agent_observe_is_hidden_in_agent_mode(capsys):
+    from code_agent.agent import CodeAgentBase
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.agent_mode = True
+    agent._display_capture = []
+
+    agent.on_repl_event(ReplEvent(
+        kind="tool_called",
+        data={"name": "observe", "args": {"content": "Internal observation."}},
+    ))
+
+    assert capsys.readouterr().out == ""
+    assert agent._display_capture == []
+
+
 def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
     from code_agent.agent import CodeAgentBase
 

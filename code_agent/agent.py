@@ -1669,6 +1669,8 @@ If you don't know how to proceed:
 
         if kind == "tool_called":
             if event.data.get("name") == "observe":
+                if getattr(self, "agent_mode", False):
+                    return
                 text = str((event.data.get("args") or {}).get("content", ""))
                 for line in text.split("\n"):
                     print(f"\x1b[93m{line}\x1b[0m", flush=True)
