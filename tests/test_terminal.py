@@ -69,6 +69,29 @@ def test_prompt_tab_callback_only_runs_with_empty_input(monkeypatch):
     assert statuses == []
 
 
+def test_prompt_moves_cursor_to_end_before_submitting(monkeypatch):
+    import io
+    from code_agent.cli import prompt as prompt_module
+
+    reads = iter([b"\x1b[D", b"\x1b[D", b"\x1b[D", b"\x1b[D", b"\r"])
+    output = io.StringIO()
+
+    monkeypatch.setattr(prompt_module, "RawMode", _NoopRawMode)
+    monkeypatch.setattr(prompt_module.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(prompt_module.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(prompt_module.sys, "stdout", output)
+    monkeypatch.setattr(
+        prompt_module.os,
+        "get_terminal_size",
+        lambda: os.terminal_size((80, 24)),
+    )
+
+    result = prompt_module.prompt(prompt_str="> ", initial_text="one\ntwo")
+
+    assert result == "one\ntwo"
+    assert output.getvalue().endswith("\r\x1b[3C\x1b[?25h\n")
+
+
 def test_repeated_prompt_tabs_replace_model_status_line(monkeypatch):
     import io
     from code_agent.cli import prompt as prompt_module

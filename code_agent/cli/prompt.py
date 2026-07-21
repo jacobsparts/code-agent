@@ -608,6 +608,9 @@ def prompt(
                         if alt_input and alt_input.active:
                             alt_input.exit(buf, len(buf))
                             prefix = None
+                        elif cursor != len(buf):
+                            cursor = len(buf)
+                            redraw(buf, cursor)
                         sys.stdout.write('\n')
                         if prefix:
                             sys.stdout.write(f'\x1b[{total_rows}A\r\x1b[L{prefix}\n\x1b[{total_rows}B')
