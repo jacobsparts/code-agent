@@ -130,8 +130,6 @@ register_provider("openai",
 for conf, efforts in (
     ({'model': 'gpt-4.1', 'input_cost': 2.0, 'cached_cost': 0.5, 'output_cost': 8.0}, (None,)),
     ({'model': 'gpt-5-mini', 'input_cost': 0.25, 'cached_cost': 0.025, 'output_cost': 2.0}, ('high',)),
-    ({'model': 'gpt-5.1', 'input_cost': 1.25, 'cached_cost': 0.125, 'output_cost': 10.0}, ('none',)),
-    ({'model': 'gpt-5.2', 'input_cost': 1.75, 'cached_cost': 0.175, 'output_cost': 14.0}, ('none', 'medium', 'high')),
     ({'model': 'gpt-5.4', 'input_cost': 2.5, 'cached_cost': 0.25, 'output_cost': 15.0}, ('none', 'medium', 'high')),
     ({'model': 'gpt-5.4-mini', 'input_cost': 0.75, 'cached_cost': 0.075, 'output_cost': 4.5}, ('high',)),
     ({'model': 'gpt-5.4-nano', 'input_cost': 0.2, 'cached_cost': 0.02, 'output_cost': 1.25}, ('high',)),
