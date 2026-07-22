@@ -558,6 +558,48 @@ def test_configured_models_accepts_string_and_list(monkeypatch):
     assert agent_module._configured_models() == ["model-a", "model-b"]
 
 
+def test_endpoint_registry_resolves_aliases_and_hides_them_from_error_list():
+    from code_agent.llm_registry import EndpointRegistry, ModelNotFoundError
+
+    registry = EndpointRegistry()
+    registry.register_provider("provider", host="example.com", path="/v1")
+    registry.register_model("provider", "model-a", aliases=["short-a", "a"])
+
+    assert registry.resolve_model_name("short-a") == "provider/model-a"
+
+    try:
+        registry.get_model_config("missing")
+    except ModelNotFoundError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected ModelNotFoundError")
+
+    assert message == (
+        "Unknown model 'missing'. Available models:\n"
+        "  - provider/model-a"
+    )
+    assert "short-a" not in message
+
+
+def test_code_agent_set_model_resolves_alias_at_assignment_boundary(monkeypatch):
+    from code_agent.agent import CodeAgentBase
+    from code_agent import llm_registry
+
+    monkeypatch.setattr(
+        llm_registry,
+        "resolve_model_name",
+        lambda name: "provider/model-a" if name == "short-a" else name,
+    )
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.model = "provider/model-b"
+    agent._llm_client = object()
+
+    assert agent._set_model("short-a") is True
+    assert agent.model == "provider/model-a"
+    assert not hasattr(agent, "_llm_client")
+
+
 def test_code_agent_cycles_configured_models_and_clears_cached_client():
     from code_agent.agent import CodeAgentBase
 

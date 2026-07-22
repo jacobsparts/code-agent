@@ -326,6 +326,36 @@ class SessionStore:
             for row in rows
         ]
 
+    def get_transcript_events(self, session_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    seq,
+                    created_at,
+                    json_extract(payload_json, '$.message.role') AS role,
+                    json_extract(payload_json, '$.message.content') AS content
+                FROM session_events
+                WHERE session_id = ? AND event_type = 'message_added'
+                ORDER BY seq ASC
+                """,
+                (session_id,),
+            )
+            return [
+                {
+                    "seq": row["seq"],
+                    "created_at": row["created_at"],
+                    "event_type": "message_added",
+                    "payload": {
+                        "message": {
+                            "role": row["role"],
+                            "content": row["content"],
+                        }
+                    },
+                }
+                for row in rows
+            ]
+
     def get_session(self, session_id: str) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(

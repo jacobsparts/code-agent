@@ -108,6 +108,8 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         self.llm_client.on_retry = self.on_retry
 
     def _set_model(self, new_model: str) -> bool:
+        from code_agent.llm_registry import resolve_model_name
+        new_model = resolve_model_name(new_model)
         old_model = self.model
         if new_model == old_model:
             return False
@@ -128,7 +130,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             index = -1 if direction > 0 else 0
         new_model = choices[(index + direction) % len(choices)]
         self._set_model(new_model)
-        return f"{DIM}Model changed: {new_model}{RESET}"
+        return f"{DIM}Model changed: {self.model}{RESET}"
 
     def _cycle_model_reverse(self) -> str | None:
         return self._cycle_model(-1)
@@ -2253,8 +2255,7 @@ Return only the replacement user prompt text.
         if welcome:
             from code_agent.llm_registry import resolve_model_name
             full_model_name = resolve_model_name(self.model)
-            model_name = full_model_name.split('/')[-1] if '/' in full_model_name else full_model_name
-            banner_lines = [welcome, f"[dim]{model_name}[/dim]"]
+            banner_lines = [welcome, f"[dim]{full_model_name}[/dim]"]
             if self.session_host() != "local":
                 banner_lines.append(f"[dim]{self.session_host()}[/dim]")
             banner = "\n".join(banner_lines)
@@ -2329,7 +2330,7 @@ Return only the replacement user prompt text.
                     from code_agent.cli.transcript import transcript_viewer_ui
                     self._ensure_live_session()
                     self._flush_pending_session_events()
-                    events = self._session_store.get_events(self._session_id) if self._session_id else []
+                    events = self._session_store.get_transcript_events(self._session_id) if self._session_id else []
                     transcript_viewer_ui(altmode, events)
 
                 def trigger_rewind():
@@ -2552,8 +2553,9 @@ Return only the replacement user prompt text.
                     old_model = self.model
                     try:
                         # Validate the model exists by trying to get its config
-                        from code_agent.llm_registry import get_model_config
+                        from code_agent.llm_registry import get_model_config, resolve_model_name
                         get_model_config(new_model)
+                        new_model = resolve_model_name(new_model)
                         if new_model == old_model:
                             self._display_text(f"{DIM}Current model: {old_model}{RESET}", kind="status")
                             continue
@@ -3900,10 +3902,12 @@ Examples:
         logger.propagate = False
 
     try:
-        from code_agent.llm_registry import get_model_config
+        from code_agent.llm_registry import get_model_config, resolve_model_name
         for model in configured_models:
             get_model_config(model)
         get_model_config(args.model)
+        configured_models = [resolve_model_name(model) for model in configured_models]
+        args.model = resolve_model_name(args.model)
     except ModelNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)

@@ -90,11 +90,9 @@ class EndpointRegistry:
         
         # Check if model exists
         if resolved_name not in self._models:
-            # Provide helpful error message
-            available = list(self._models.keys()) + list(self._aliases.keys())
             raise ModelNotFoundError(
-                f"Unknown model '{name}'. Available models and aliases:\n" +
-                "\n".join(f"  - {m}" for m in sorted(available))
+                f"Unknown model '{name}'. Available models:\n" +
+                "\n".join(f"  - {m}" for m in sorted(self._models))
             )
         
         model_obj = self._models[resolved_name]

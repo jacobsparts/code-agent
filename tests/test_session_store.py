@@ -24,6 +24,37 @@ def test_fork_session_copies_events_and_preview_blobs_without_lock(tmp_path):
     assert store.get_session_lock(source)["owner"] == "owner-a"
 
 
+def test_get_transcript_events_only_loads_visible_message_fields(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(
+        session_id,
+        1,
+        "message_added",
+        {
+            "message": {
+                "role": "user",
+                "content": "visible",
+                "_stdout": "large private output",
+                "_render_segments": [{"content": "large private output"}],
+            }
+        },
+    )
+    store.append_event(session_id, 2, "display", {"kind": "status", "text": "ignored"})
+    store.append_event(
+        session_id,
+        3,
+        "message_added",
+        {"message": {"role": "assistant", "content": "emit('done')", "_final_result": "done"}},
+    )
+
+    events = store.get_transcript_events(session_id)
+
+    assert [event["seq"] for event in events] == [1, 3]
+    assert events[0]["payload"]["message"] == {"role": "user", "content": "visible"}
+    assert events[1]["payload"]["message"] == {"role": "assistant", "content": "emit('done')"}
+
+
 def test_session_lock_blocks_other_owner_until_released(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
