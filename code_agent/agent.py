@@ -1700,7 +1700,7 @@ If you don't know how to proceed:
 
         if kind == "tool_called":
             if event.data.get("name") == "observe":
-                if getattr(self, "agent_mode", False):
+                if not self.repl_display:
                     return
                 text = str((event.data.get("args") or {}).get("content", ""))
                 for line in text.split("\n"):

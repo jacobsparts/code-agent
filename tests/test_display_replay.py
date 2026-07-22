@@ -491,6 +491,7 @@ def test_code_agent_observe_displays_full_text_in_bright_yellow(capsys):
     from code_agent.agent import CodeAgentBase
 
     agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.repl_display = True
     agent._display_capture = []
 
     text = "First observation.\n" + ("x" * 500)
@@ -506,11 +507,11 @@ def test_code_agent_observe_displays_full_text_in_bright_yellow(capsys):
     assert agent._display_capture == ["First observation.\n", f"{'x' * 500}\n"]
 
 
-def test_code_agent_observe_is_hidden_in_agent_mode(capsys):
+def test_code_agent_observe_is_hidden_when_repl_display_is_disabled(capsys):
     from code_agent.agent import CodeAgentBase
 
     agent = CodeAgentBase.__new__(CodeAgentBase)
-    agent.agent_mode = True
+    agent.repl_display = False
     agent._display_capture = []
 
     agent.on_repl_event(ReplEvent(
