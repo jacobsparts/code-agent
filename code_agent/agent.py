@@ -2859,6 +2859,21 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         import subprocess
         cmd = ['rg', '--color=never', '-n']  # Always show line numbers
 
+        default_excludes = [
+            '.git', '.hg', '.svn', '.venv', 'venv', 'env', 'node_modules',
+            '__pycache__', '.mypy_cache', '.pytest_cache', '.ruff_cache',
+            '.tox', '.nox', '.cache', 'dist', 'build', 'coverage', '.coverage',
+        ]
+        default_file_excludes = [
+            '*.min.js', '*.min.css', '*.map', '*.pyc', '*.pyo',
+            '*.db', '*.db-*', '*.sqlite', '*.sqlite-*',
+            '*.sqlite3', '*.sqlite3-*', '*.log',
+        ]
+        for directory in default_excludes:
+            cmd.extend(['--glob', f'!**/{directory}/**'])
+        for file_glob in default_file_excludes:
+            cmd.extend(['--glob', f'!{file_glob}'])
+
         if files_only:
             cmd.append('-l')
         if case_insensitive:
@@ -2876,14 +2891,26 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         if path:
             cmd.append(path)
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        output = result.stdout.strip()
+        max_output_bytes = 2 * 1024 * 1024
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        raw_output = process.stdout.read(max_output_bytes + 1)
+        if len(raw_output) > max_output_bytes:
+            process.kill()
+            process.wait()
+            raise ValueError(
+                "grep output exceeded 2 MiB; narrow the path or pattern."
+            )
+        process.wait()
+        output = raw_output.decode(errors="replace").strip()
 
         if not output:
             return "No matches found"
         if files_only:
-            files = output.split('\n')
-            return files
+            return output.split('\n')
         return output
 
     @REPLAgent.tool(inject=True)

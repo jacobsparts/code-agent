@@ -1,6 +1,8 @@
 import json
 import re
 
+import pytest
+
 from code_agent.agent import CodeAgent
 from code_agent.conversation import Conversation
 from code_agent.repl_events import ReplEvent
@@ -32,6 +34,136 @@ def make_agent():
     agent._auto_context_attachment_names = set()
     agent._pending_attachments = {}
     return agent
+
+
+def test_grep_rejects_output_over_two_mib(monkeypatch):
+    class FakeStdout:
+        def read(self, size):
+            assert size == 2 * 1024 * 1024 + 1
+            return b"x" * size
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def __init__(self):
+            self.killed = False
+            self.waited = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self):
+            self.waited = True
+
+    process = FakeProcess()
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: process)
+
+    agent = make_agent()
+    with pytest.raises(ValueError, match="grep output exceeded 2 MiB"):
+        agent.grep("needle", ".")
+
+    assert process.killed is True
+    assert process.waited is True
+
+
+def test_grep_returns_output_at_two_mib_limit(monkeypatch):
+    limit = 2 * 1024 * 1024
+
+    class FakeStdout:
+        def read(self, size):
+            assert size == limit + 1
+            return b"x" * limit
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def __init__(self):
+            self.killed = False
+            self.waited = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self):
+            self.waited = True
+
+    process = FakeProcess()
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: process)
+
+    result = make_agent().grep("needle", ".", files_only=False)
+
+    assert len(result) == limit
+    assert process.killed is False
+    assert process.waited is True
+
+
+def test_grep_excludes_generated_and_large_data_paths_by_default(monkeypatch):
+    captured = {}
+
+    class FakeStdout:
+        def read(self, size):
+            return b"match"
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def wait(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProcess()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    assert make_agent().grep("needle", ".", files_only=False) == "match"
+
+    cmd = captured["cmd"]
+    globs = [cmd[index + 1] for index, value in enumerate(cmd) if value == "--glob"]
+    assert "!**/.git/**" in globs
+    assert "!**/.venv/**" in globs
+    assert "!**/node_modules/**" in globs
+    assert "!**/.cache/**" in globs
+    assert "!**/dist/**" in globs
+    assert "!**/build/**" in globs
+    assert "!*.min.js" in globs
+    assert "!*.map" in globs
+    assert "!*.db" in globs
+    assert "!*.sqlite3" in globs
+    assert "!*.log" in globs
+
+
+def test_grep_explicit_glob_can_override_default_exclusion(monkeypatch):
+    captured = {}
+
+    class FakeStdout:
+        def read(self, size):
+            return b"match"
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def wait(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProcess()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    make_agent().grep("needle", ".", glob="*.map")
+
+    cmd = captured["cmd"]
+    default_index = max(
+        index for index, value in enumerate(cmd)
+        if value == "!*.map"
+    )
+    explicit_index = max(
+        index for index, value in enumerate(cmd)
+        if value == "*.map"
+    )
+    assert explicit_index > default_index
 
 
 def test_observe_records_runtime_text_and_commits_metadata():
