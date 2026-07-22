@@ -1,4 +1,5 @@
 import warnings
+from pathlib import Path
 
 from code_agent.repl_agent import REPLMixin, ToolREPL
 from code_agent.repl_events import (
@@ -83,6 +84,28 @@ def test_execute_publishes_statement_boundaries_in_order():
     assert len(completed_statements) == 2
     assert completed_statements[0][0].data["direct_call"] is None
     assert completed_statements[1][0].data["direct_call"] == "print"
+
+
+def test_statement_output_spills_over_limit(monkeypatch):
+    monkeypatch.setattr("code_agent.repl_agent._MAX_REPL_OUTPUT_CHARS", 10)
+    agent = REPLMixin()
+    repl = ToolREPL(echo=False)
+    repl.inject_builtins()
+    try:
+        output, _, events, _ = agent._execute_with_tool_handling(repl, "print('x' * 11)")
+        path = output.split("written to ", 1)[1].split(" (", 1)[0]
+        assert output == f">>> print('x' * 11)\n[large output written to {path} (0.0MB)]\n"
+        assert Path(path).read_text() == "x" * 11 + "\n"
+        assert "x" * 11 not in output
+        assert [event.kind for event in events] == [
+            "statement_started",
+            "output",
+            "statement_finished",
+        ]
+    finally:
+        repl.close()
+        if "path" in locals():
+            Path(path).unlink()
 
 
 class _ReplyRecorder:

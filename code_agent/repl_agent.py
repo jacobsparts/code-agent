@@ -20,6 +20,7 @@ import logging
 import os
 import signal
 import sys
+import tempfile
 import warnings
 from multiprocessing import Queue
 
@@ -209,7 +210,7 @@ def _wait_for_ack(expected_id):
 # Queue-based transport for ToolREPL
 QUEUE_TRANSPORT_CODE = '''
 def _send_output(msg_type, data):
-    _output_queue.put((msg_type, data))
+    _statement_output.send(msg_type, data)
 def _send_tool_request(msg):
     _tool_request_queue.put(msg)
 def _recv_tool_response():
@@ -218,29 +219,69 @@ def _recv_tool_response():
 
 
 
-class _StreamingWriter:
-    """Sends output to queue in real-time. Replaces sys.stdout/stderr."""
+_MAX_REPL_OUTPUT_CHARS = 2_000_000
 
-    def __init__(self, queue: Queue, original: Any) -> None:
-        self._queue = queue
-        self._original = original
-        self._buffer = ""
 
-    def write(self, text: str) -> int:
-        if text:
-            self._buffer += text
-            while "\n" in self._buffer:
-                line, self._buffer = self._buffer.split("\n", 1)
-                self._queue.put(("output", line + "\n"))
+class _StatementOutput:
+    """Buffer one statement, spilling oversized output to a worker-side file.
+
+    Buffering intentionally prevents the live streaming that would otherwise
+    occur within a long-running statement.
+    """
+
+    def __init__(self, queue: Queue) -> None:
+        self.queue = queue
+        self.chunks: list[tuple[str, str]] = []
+        self.size = 0
+        self.file = None
+
+    def send(self, kind: str, text: str) -> int:
+        if self.file is None and self.size + len(text) > _MAX_REPL_OUTPUT_CHARS:
+            self.file = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix="code-agent-output-", suffix=".txt", delete=False
+            )
+            for _, chunk in self.chunks:
+                self.file.write(chunk)
+            self.chunks.clear()
+        if self.file:
+            self.file.write(text)
+        else:
+            self.chunks.append((kind, text))
+        self.size += len(text)
         return len(text)
 
+    def write(self, text: str) -> int:
+        return self.send("output", text)
+
     def flush(self) -> None:
-        if self._buffer:
-            self._queue.put(("output", self._buffer))
-            self._buffer = ""
+        pass
+
+    def finish(self) -> None:
+        if self.file:
+            path = self.file.name
+            self.file.close()
+            self.queue.put((
+                "output",
+                f"[large output written to {path} ({self.size / 1_000_000:.1f}MB)]\n",
+            ))
+        else:
+            for chunk in self.chunks:
+                self.queue.put(chunk)
+
+
+class _OutputWriter:
+    def __init__(self, output: _StatementOutput, original: Any) -> None:
+        self.output = output
+        self.original = original
+
+    def write(self, text: str) -> int:
+        return self.output.write(text)
+
+    def flush(self) -> None:
+        pass
 
     def fileno(self) -> int:
-        return self._original.fileno()
+        return self.original.fileno()
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +333,10 @@ def _tool_worker_main(
 
             old_stdout = sys.stdout
             old_stderr = sys.stderr
-            stdout_writer = _StreamingWriter(output_queue, old_stdout)
-            stderr_writer = _StreamingWriter(output_queue, old_stderr)
-            sys.stdout = stdout_writer
-            sys.stderr = stderr_writer
+            statement_output = _StatementOutput(output_queue)
+            repl_locals["_statement_output"] = statement_output
+            sys.stdout = _OutputWriter(statement_output, old_stdout)
+            sys.stderr = _OutputWriter(statement_output, old_stderr)
 
             had_error = False
             try:
@@ -309,7 +350,7 @@ def _tool_worker_main(
                                 code_obj = compile(ast.Expression(node.value), "<repl>", "eval")
                                 result = eval(code_obj, repl_locals)
                                 if result is not None:
-                                    output_queue.put(("output", repr(result) + "\n"))
+                                    statement_output.send("output", repr(result) + "\n")
                             else:
                                 # Other statement - just exec
                                 mod = ast.Module(body=[node], type_ignores=[])
@@ -337,10 +378,9 @@ def _tool_worker_main(
                     sys.stderr.write("".join(traceback.format_tb(tb)))
                 sys.stderr.write(f"{type(e).__name__}: {e}\n")
             finally:
-                stdout_writer.flush()
-                stderr_writer.flush()
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
+                statement_output.finish()
 
             output_queue.put(("done", (seq_id, had_error)))
 
