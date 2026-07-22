@@ -21,7 +21,11 @@ def call(code, name="repl_execute"):
 def test_tool_call_normalizes_to_python():
     assert normalize_openai_repl_response({
         "role": "assistant", "content": None, "tool_calls": [call("x = 1")]
-    }) == {"role": "assistant", "content": "x = 1"}
+    }) == {
+        "role": "assistant",
+        "content": "x = 1",
+        "_tool_call_ids": ["provider-id"],
+    }
 
 
 def test_text_and_multiple_calls_are_joined_safely():
@@ -31,6 +35,7 @@ def test_text_and_multiple_calls_are_joined_safely():
         "tool_calls": [call("x = 1"), call("print(x)")],
     })
     assert result["content"] == "emit(\"I'll inspect it.\")\nx = 1\nprint(x)"
+    assert result["_tool_call_ids"] == ["provider-id", "provider-id"]
 
 
 def test_raw_python_and_text_fallbacks():
@@ -74,6 +79,22 @@ def test_projection_uses_stable_calls_and_results():
     assert result[5] == {
         "role": "tool", "tool_call_id": "repl_000002", "content": ""
     }
+
+
+def test_projection_reuses_provider_tool_call_id():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "x = 1",
+            "_tool_call_ids": ["provider-call-123"],
+        },
+        {"role": "user", "content": ">>> x = 1\n", "_stdout": ">>> x = 1\n"},
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert result[0]["tool_calls"][0]["id"] == "provider-call-123"
+    assert result[1]["tool_call_id"] == "provider-call-123"
 
 
 def test_projection_splits_appended_human_input():
