@@ -77,7 +77,11 @@ def normalize_openai_repl_response(message):
             raise ReplExecuteResponseError("repl_execute code must be a string")
         parts.append(code)
 
-    return {"role": "assistant", "content": _join_python(parts)}
+    return {
+        "role": "assistant",
+        "content": _join_python(parts),
+        "_tool_call_ids": [call.get("id") for call in tool_calls],
+    }
 
 
 def _public_message(message):
@@ -141,7 +145,7 @@ def project_openai_repl_messages(messages):
 
         code = message.get("content") or ""
         call_number += 1
-        call_id = f"repl_{call_number:06d}"
+        call_id = (message.get("_tool_call_ids") or [None])[0] or f"repl_{call_number:06d}"
         projected.append({
             "role": "assistant",
             "content": None,
