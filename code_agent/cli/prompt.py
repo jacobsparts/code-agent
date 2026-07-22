@@ -62,6 +62,7 @@ def prompt(
     on_ctrl_o: Optional[Callable[[str, int], None]] = None,
     on_esc_esc: Optional[Callable[[], Optional[str]]] = None,
     on_tab: Optional[Callable[[], Optional[str]]] = None,
+    on_shift_tab: Optional[Callable[[], Optional[str]]] = None,
     accepted_prefix: Optional[Callable[[str], Optional[str]]] = None,
 ) -> str:
     """
@@ -299,6 +300,40 @@ def prompt(
         saved_line = []
         pending_esc = False
         tab_status_visible = False
+
+        def show_tab_status(status):
+            nonlocal prev_lines, prev_cursor_row, tab_status_visible
+            if not status:
+                return
+            if tab_status_visible:
+                try:
+                    term_width = os.get_terminal_size().columns or 80
+                except OSError:
+                    term_width = 80
+                cursor_col = len(display_prompt) % term_width
+                out = [
+                    '\x1b[1A\r\x1b[2K',
+                    status,
+                    '\x1b[1B\r',
+                ]
+                if cursor_col > 0:
+                    out.append(f'\x1b[{cursor_col}C')
+                sys.stdout.write(''.join(out))
+                sys.stdout.flush()
+            else:
+                if alt_input and alt_input.active:
+                    cursor_row = alt_input.exit(buf, cursor)
+                    prev_cursor_row = cursor_row or 0
+                out = []
+                if prev_cursor_row > 0:
+                    out.append(f'\x1b[{prev_cursor_row}A')
+                out.append(f'\r\x1b[J{status}\n')
+                sys.stdout.write(''.join(out))
+                sys.stdout.flush()
+                prev_lines = 1
+                prev_cursor_row = 0
+                redraw(buf, cursor)
+                tab_status_visible = True
         
         try:
             while True:
@@ -407,6 +442,8 @@ def prompt(
                             cursor += len(paste_content)
                             redraw(buf, cursor)
                             i = len(k)
+                        elif seq == 90 and on_shift_tab and not buf:  # Shift+Tab
+                            show_tab_status(on_shift_tab())
                         elif seq == 68 and cursor > 0:  # Left
                             cursor -= 1
                             redraw(buf, cursor)
@@ -545,37 +582,7 @@ def prompt(
 
                     # Tab cycles models only before any input has been entered.
                     if c == 9 and on_tab and not buf:
-                        status = on_tab()
-                        if status:
-                            if tab_status_visible:
-                                try:
-                                    term_width = os.get_terminal_size().columns or 80
-                                except OSError:
-                                    term_width = 80
-                                cursor_col = len(display_prompt) % term_width
-                                out = [
-                                    '\x1b[1A\r\x1b[2K',
-                                    status,
-                                    '\x1b[1B\r',
-                                ]
-                                if cursor_col > 0:
-                                    out.append(f'\x1b[{cursor_col}C')
-                                sys.stdout.write(''.join(out))
-                                sys.stdout.flush()
-                            else:
-                                if alt_input and alt_input.active:
-                                    cursor_row = alt_input.exit(buf, cursor)
-                                    prev_cursor_row = cursor_row or 0
-                                out = []
-                                if prev_cursor_row > 0:
-                                    out.append(f'\x1b[{prev_cursor_row}A')
-                                out.append(f'\r\x1b[J{status}\n')
-                                sys.stdout.write(''.join(out))
-                                sys.stdout.flush()
-                                prev_lines = 1
-                                prev_cursor_row = 0
-                                redraw(buf, cursor)
-                                tab_status_visible = True
+                        show_tab_status(on_tab())
                         i += 1
                         continue
 

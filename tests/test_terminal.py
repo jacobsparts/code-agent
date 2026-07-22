@@ -120,3 +120,61 @@ def test_repeated_prompt_tabs_replace_model_status_line(monkeypatch):
     assert rendered.count("model-b\n") == 1
     assert "\x1b[1A\r\x1b[2Kmodel-c\x1b[1B\r\x1b[2C" in rendered
     assert "\nmodel-c\n" not in rendered
+
+
+def test_prompt_shift_tab_callback_only_runs_with_empty_input(monkeypatch):
+    import io
+    from code_agent.cli import prompt as prompt_module
+
+    reads = iter([b"x", b"\x1b[Z", b"\r"])
+    statuses = []
+    output = io.StringIO()
+
+    monkeypatch.setattr(prompt_module, "RawMode", _NoopRawMode)
+    monkeypatch.setattr(prompt_module.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(prompt_module.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(prompt_module.sys, "stdout", output)
+
+    result = prompt_module.prompt(
+        prompt_str="> ",
+        on_shift_tab=lambda: statuses.append("called") or "changed",
+    )
+
+    assert result == "x"
+    assert statuses == []
+
+
+def test_prompt_shift_tab_runs_reverse_callback(monkeypatch):
+    import io
+    from code_agent.cli import prompt as prompt_module
+
+    reads = iter([b"\x1b[Z", b"\r"])
+    statuses = []
+    output = io.StringIO()
+
+    monkeypatch.setattr(prompt_module, "RawMode", _NoopRawMode)
+    monkeypatch.setattr(prompt_module.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(prompt_module.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(prompt_module.sys, "stdout", output)
+
+    result = prompt_module.prompt(
+        prompt_str="> ",
+        on_shift_tab=lambda: statuses.append("called") or "model-c",
+    )
+
+    assert result == ""
+    assert statuses == ["called"]
+    assert "model-c\n" in output.getvalue()
+
+
+def test_cycle_model_reverse_wraps_to_last_choice():
+    from code_agent.agent import CodeAgentBase
+
+    agent = object.__new__(CodeAgentBase)
+    agent.model_choices = ["model-a", "model-b", "model-c"]
+    agent.model = "model-a"
+
+    status = agent._cycle_model_reverse()
+
+    assert agent.model == "model-c"
+    assert "Model changed: model-c" in status

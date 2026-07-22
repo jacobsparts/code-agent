@@ -118,17 +118,20 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._conversation.llm_client = self.llm_client
         return True
 
-    def _cycle_model(self) -> str | None:
+    def _cycle_model(self, direction: int = 1) -> str | None:
         choices = getattr(self, "model_choices", [])
         if len(choices) < 2:
             return None
         try:
             index = choices.index(self.model)
         except ValueError:
-            index = -1
-        new_model = choices[(index + 1) % len(choices)]
+            index = -1 if direction > 0 else 0
+        new_model = choices[(index + direction) % len(choices)]
         self._set_model(new_model)
         return f"{DIM}Model changed: {new_model}{RESET}"
+
+    def _cycle_model_reverse(self) -> str | None:
+        return self._cycle_model(-1)
 
     def session_host(self) -> str:
         return getattr(self, "worker_host", "local") or "local"
@@ -2265,7 +2268,7 @@ Return only the replacement user prompt text.
         if not self.agent_mode:
             key_help = "Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit"
         if len(getattr(self, "model_choices", [])) > 1:
-            key_help = f"Tab = model | {key_help}"
+            key_help = f"Tab/Shift+Tab = model | {key_help}"
         self.console.print(f"[dim]{key_help}[/dim]")
         commands = ["/repl"]
         if not self.agent_mode:
@@ -2359,6 +2362,7 @@ Return only the replacement user prompt text.
                             on_ctrl_o=open_transcript,
                             on_esc_esc=None if self.agent_mode else trigger_rewind,
                             on_tab=self._cycle_model,
+                            on_shift_tab=self._cycle_model_reverse,
                             accepted_prefix=accepted_user_prefix,
                         )
                     except KeyboardInterrupt:
