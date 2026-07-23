@@ -224,6 +224,36 @@ def test_saving_conflicting_content_for_existing_key_fails(tmp_path):
     assert store.get_preview_blob(second, "abc") is None
 
 
+def test_saving_content_overwrites_redacted_preview(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    first = store.create_session("/repo", "model")
+    second = store.create_session("/repo", "model")
+    store.save_preview_blob(
+        first,
+        "abc",
+        "[Preview content redacted during database migration]",
+    )
+
+    store.save_preview_blob(second, "abc", "restored content")
+
+    assert store.get_preview_blob(first, "abc") == "restored content"
+    assert store.get_preview_blob(second, "abc") == "restored content"
+
+
+def test_restored_preview_rejects_later_conflict(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    first = store.create_session("/repo", "model")
+    second = store.create_session("/repo", "model")
+    third = store.create_session("/repo", "model")
+    store.save_preview_blob(first, "abc", "[Preview content redacted by retention policy]")
+    store.save_preview_blob(second, "abc", "restored content")
+
+    with pytest.raises(RuntimeError, match="Key conflict"):
+        store.save_preview_blob(third, "abc", "different content")
+
+    assert store.get_preview_blob(third, "abc") is None
+
+
 def test_forks_and_copy_only_add_preview_associations(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     source = store.create_session("/repo", "model")

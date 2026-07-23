@@ -429,6 +429,15 @@ class SessionStore:
                     """,
                     (key, now, content),
                 )
+            elif existing["content"].startswith("[Preview content redacted"):
+                conn.execute(
+                    """
+                    UPDATE preview_blobs
+                    SET created_at = ?, content = ?
+                    WHERE key = ?
+                    """,
+                    (now, content, key),
+                )
             elif existing["content"] != content:
                 raise RuntimeError("Key conflict")
             conn.execute(
