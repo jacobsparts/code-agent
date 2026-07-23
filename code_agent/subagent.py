@@ -225,9 +225,9 @@ def worker_main(port, authkey, model, max_turns):
         raise RuntimeError("Authentication failed")
 
     # Import agent classes
-    from code_agent.agent import CodeAgentBase
+    from code_agent.agent import CodeAgent
 
-    class SubagentWorker(CodeAgentBase):
+    class SubagentWorker(CodeAgent):
         """Headless Code Agent for subprocess execution."""
 
         interactive = True
@@ -253,12 +253,14 @@ def worker_main(port, authkey, model, max_turns):
             pass
 
         def _handle_tool_request(self, repl, req):
-            """Override to send progress/result via socket."""
+            """Send emit progress/results via socket; delegate other tools normally."""
             tool_name = req.get('tool')
+            if tool_name != '__emit__':
+                return super()._handle_tool_request(repl, req)
+
             request_id = req.get('request_id')
             args = req.get('args', {})
 
-            # Deserialize special types (bytes encoded as base64)
             def _deserialize(x):
                 if isinstance(x, dict) and "__b64__" in x:
                     import base64
@@ -270,39 +272,22 @@ def worker_main(port, authkey, model, max_turns):
                 return x
 
             args = {k: _deserialize(v) for k, v in args.items()}
-            event_name = "emit" if tool_name == "__emit__" else tool_name
-            if event_name:
-                self._publish_tool_event("tool_called", event_name, args=args)
+            self._publish_tool_event("tool_called", "emit", args=args)
 
             try:
-                if tool_name == '__emit__':
-                    value = args.get('value')
-                    release = args.get('release', False)
-                    self._final_result = value
+                value = args.get('value')
+                release = args.get('release', False)
+                self._final_result = value
 
-                    if release:
-                        self.complete = True
-                        _send_msg(self._host_sock, ("result", str(value) if value is not None else ""))
-                    else:
-                        _send_msg(self._host_sock, ("progress", str(value) if value is not None else ""))
-                    self._publish_tool_event("tool_returned", "emit", result=None)
-                    # No reply needed for emit, just ACK
-
+                if release:
+                    self.complete = True
+                    _send_msg(self._host_sock, ("result", str(value) if value is not None else ""))
                 else:
-                    # Normal tool call - send reply with result
-                    from code_agent.agent import _CompleteException
-                    try:
-                        result = self.toolcall(tool_name, args)
-                        repl.send_reply(request_id, result=result)
-                        self._publish_tool_event("tool_returned", tool_name, result=result)
-                    except _CompleteException:
-                        raise
-                    except Exception as e:
-                        repl.send_reply(request_id, error=str(e))
-                        self._publish_tool_event("tool_failed", tool_name, error=str(e))
+                    _send_msg(self._host_sock, ("progress", str(value) if value is not None else ""))
+                self._publish_tool_event("tool_returned", "emit", result=None)
             finally:
-                # Always send ACK to unblock the sender
-                repl.send_ack(request_id)
+                if request_id is not None:
+                    repl.send_ack(request_id)
 
     # Create agent
     agent = SubagentWorker(sock, model, max_turns)
