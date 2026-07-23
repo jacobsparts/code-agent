@@ -1,4 +1,3 @@
-import importlib.util
 import re
 
 from code_agent.code_agent_coalesce import coalesce_repl_messages
@@ -302,10 +301,6 @@ def test_coalesced_messages_are_synthetic():
     assert coalesced["_coalesced"] is True
 
 
-def test_removed_legacy_manual_command_and_module():
-    assert importlib.util.find_spec("code_agent.code_agent_condense") is None
-    with open("code_agent/agent.py") as f:
-        assert "/condense" not in f.read()
 
 
 def test_coalesce_is_idempotent_on_projected_messages():

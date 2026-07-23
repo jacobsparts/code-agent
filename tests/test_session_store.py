@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import pytest
 
 from code_agent.session_store import SessionStore
 
@@ -193,3 +194,48 @@ def test_existing_session_db_gets_local_host_column(tmp_path):
     migrated = SessionStore(str(db_path))
 
     assert migrated.get_session(session_id)["host"] == "local"
+
+
+def test_preview_content_is_global_but_access_is_session_scoped(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    first = store.create_session("/repo", "model")
+    second = store.create_session("/repo", "model")
+
+    store.save_preview_blob(first, "abc", "shared")
+    assert store.get_preview_blob(first, "abc") == "shared"
+    assert store.get_preview_blob(second, "abc") is None
+
+    store.save_preview_blob(second, "abc", "shared")
+
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM preview_blobs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM session_preview_blobs").fetchone()[0] == 2
+
+
+def test_saving_conflicting_content_for_existing_key_fails(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    first = store.create_session("/repo", "model")
+    second = store.create_session("/repo", "model")
+    store.save_preview_blob(first, "abc", "original")
+
+    with pytest.raises(RuntimeError, match="Key conflict"):
+        store.save_preview_blob(second, "abc", "collision")
+
+    assert store.get_preview_blob(second, "abc") is None
+
+
+def test_forks_and_copy_only_add_preview_associations(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    source = store.create_session("/repo", "model")
+    store.save_preview_blob(source, "abc", "shared")
+
+    forked = store.fork_session(source)
+    target = store.create_session("/repo", "model")
+    store.copy_preview_blobs(source, target)
+    store.copy_preview_blobs(source, target)
+
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM preview_blobs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM session_preview_blobs").fetchone()[0] == 3
+    assert store.get_preview_blob(forked, "abc") == "shared"
+    assert store.get_preview_blob(target, "abc") == "shared"

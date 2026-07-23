@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+SCHEMA_VERSION = 2
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -29,10 +32,21 @@ class SessionStore:
     def _connect(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_db(self):
         with self._connect() as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, SCHEMA_VERSION):
+                raise RuntimeError("Unsupported schema")
+            preview_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(preview_blobs)").fetchall()
+            }
+            if "session_id" in preview_columns:
+                raise RuntimeError("Migration required")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
@@ -65,12 +79,19 @@ class SessionStore:
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS preview_blobs (
+                    key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    content TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS session_preview_blobs (
                     session_id TEXT NOT NULL,
                     key TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    content TEXT NOT NULL,
                     PRIMARY KEY(session_id, key),
-                    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id),
+                    FOREIGN KEY(key) REFERENCES preview_blobs(key)
                 )
             """)
             conn.execute("""
@@ -89,6 +110,8 @@ class SessionStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_host_cwd ON sessions(host, cwd)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, seq)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_session_locks_expires_at ON session_locks(expires_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_session_preview_blobs_key ON session_preview_blobs(key)")
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
 
     def create_session(self, cwd: str, model: str | None = None, host: str = "local") -> str:
@@ -114,7 +137,7 @@ class SessionStore:
                 (source_session_id,),
             ).fetchone()
             if source is None:
-                raise ValueError(f"Session not found: {source_session_id}")
+                raise ValueError("Session not found")
 
             conn.execute(
                 """
@@ -144,9 +167,9 @@ class SessionStore:
             )
             conn.execute(
                 """
-                INSERT INTO preview_blobs(session_id, key, created_at, content)
-                SELECT ?, key, created_at, content
-                FROM preview_blobs
+                INSERT INTO session_preview_blobs(session_id, key, created_at)
+                SELECT ?, key, created_at
+                FROM session_preview_blobs
                 WHERE session_id = ?
                 """,
                 (new_session_id, source_session_id),
@@ -157,9 +180,9 @@ class SessionStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO preview_blobs(session_id, key, created_at, content)
-                SELECT ?, key, created_at, content
-                FROM preview_blobs
+                INSERT OR IGNORE INTO session_preview_blobs(session_id, key, created_at)
+                SELECT ?, key, created_at
+                FROM session_preview_blobs
                 WHERE session_id = ?
                 """,
                 (target_session_id, source_session_id),
@@ -393,12 +416,27 @@ class SessionStore:
     def save_preview_blob(self, session_id: str, key: str, content: str) -> None:
         now = utc_now_iso()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT content FROM preview_blobs WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO preview_blobs(key, created_at, content)
+                    VALUES (?, ?, ?)
+                    """,
+                    (key, now, content),
+                )
+            elif existing["content"] != content:
+                raise RuntimeError("Key conflict")
             conn.execute(
                 """
-                INSERT OR IGNORE INTO preview_blobs(session_id, key, created_at, content)
-                VALUES (?, ?, ?, ?)
+                INSERT OR IGNORE INTO session_preview_blobs(session_id, key, created_at)
+                VALUES (?, ?, ?)
                 """,
-                (session_id, key, now, content),
+                (session_id, key, now),
             )
             conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
@@ -409,7 +447,12 @@ class SessionStore:
     def get_preview_blob(self, session_id: str, key: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT content FROM preview_blobs WHERE session_id = ? AND key = ?",
+                """
+                SELECT b.content
+                FROM session_preview_blobs AS s
+                JOIN preview_blobs AS b ON b.key = s.key
+                WHERE s.session_id = ? AND s.key = ?
+                """,
                 (session_id, key),
             ).fetchone()
         return row["content"] if row else None
