@@ -2590,7 +2590,10 @@ Return only the replacement user prompt text.
                         parts = user_input.strip().split(None, 1)
                         if len(parts) > 1:
                             # Model specified administratively
+                            from code_agent.llm_registry import get_model_config, resolve_model_name
                             subagent_model = parts[1].strip()
+                            get_model_config(subagent_model)
+                            subagent_model = resolve_model_name(subagent_model)
                             model_locked = True
                         else:
                             # Inherit parent's model
