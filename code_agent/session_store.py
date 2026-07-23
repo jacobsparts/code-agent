@@ -418,8 +418,14 @@ class SessionStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT content FROM preview_blobs WHERE key = ?",
-                (key,),
+                """
+                SELECT b.content, s.session_id IS NOT NULL AS associated
+                FROM preview_blobs AS b
+                LEFT JOIN session_preview_blobs AS s
+                    ON s.key = b.key AND s.session_id = ?
+                WHERE b.key = ?
+                """,
+                (session_id, key),
             ).fetchone()
             if existing is None:
                 conn.execute(
@@ -440,13 +446,14 @@ class SessionStore:
                 )
             elif existing["content"] != content:
                 raise RuntimeError("Key conflict")
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO session_preview_blobs(session_id, key, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (session_id, key, now),
-            )
+            if existing is None or not existing["associated"]:
+                conn.execute(
+                    """
+                    INSERT INTO session_preview_blobs(session_id, key, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (session_id, key, now),
+                )
             conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
                 (now, session_id),
