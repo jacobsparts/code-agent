@@ -320,7 +320,7 @@ def test_tool_repl_worker_imports_from_current_directory(tmp_path, monkeypatch):
     finally:
         repl.close()
 
-    assert ("output", "123\n") in items
+    assert "".join(data for kind, data in items if kind == "output") == "123\n"
     assert items[-1] == ("done", (1, False))
 
 

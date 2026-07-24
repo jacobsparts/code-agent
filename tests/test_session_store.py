@@ -4,6 +4,30 @@ import pytest
 from code_agent.session_store import SessionStore
 
 
+def _append_preview_events(store, session_id, **kwargs):
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT seq, event_type, payload_json FROM session_events WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+    with store._connect() as conn:
+        associated_preview_keys = {
+            row["key"]
+            for row in conn.execute(
+                "SELECT key FROM session_preview_blobs WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+    definitions, placements, exec_start_seq = store._active_persisted_preview_state(
+        rows,
+        associated_preview_keys,
+    )
+    kwargs.setdefault("expected_exec_start_seq", exec_start_seq)
+    kwargs.setdefault("expected_definitions", definitions)
+    kwargs.setdefault("expected_active_placements", placements)
+    return store.append_preview_events(session_id, **kwargs)
+
+
 def test_fork_session_copies_events_and_preview_blobs_without_lock(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     source = store.create_session("/repo", "model-a")
@@ -269,3 +293,128 @@ def test_forks_and_copy_only_add_preview_associations(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM session_preview_blobs").fetchone()[0] == 3
     assert store.get_preview_blob(forked, "abc") == "shared"
     assert store.get_preview_blob(target, "abc") == "shared"
+
+
+
+def test_append_preview_events_uses_minimal_payloads_and_is_atomic(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    store.save_preview_blob(session_id, "abc", "content")
+
+    assert _append_preview_events(store,
+        session_id,
+        expected_next_seq=2,
+        preview_key="abc",
+        summary="summary",
+        source_start_seq=1,
+        source_end_seq=1,
+    ) == (2, 3)
+
+    events = store.get_events(session_id)
+    assert events[1]["payload"] == {"preview_key": "abc", "summary": "summary"}
+    assert events[2]["payload"] == {
+        "preview_event_seq": 2,
+        "source_start_seq": 1,
+        "source_end_seq": 1,
+    }
+
+    store.append_event(session_id, 5, "display", {"kind": "status", "text": "existing"})
+    with pytest.raises(Exception):
+        _append_preview_events(store,
+            session_id,
+            expected_next_seq=4,
+            preview_key="abc",
+            summary="bad",
+            source_start_seq=1,
+            source_end_seq=1,
+        )
+    assert [event["seq"] for event in store.get_events(session_id)] == [1, 2, 3, 5]
+
+
+def test_fork_session_copies_persisted_preview_events_and_blob(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    source = store.create_session("/repo", "model")
+    store.append_event(source, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    store.save_preview_blob(source, "abc", "content")
+    _append_preview_events(store,
+        source,
+        expected_next_seq=2,
+        preview_key="abc",
+        summary="summary",
+        source_start_seq=1,
+        source_end_seq=1,
+    )
+
+    forked = store.fork_session(source)
+
+    assert store.get_events(forked) == store.get_events(source)
+    assert store.has_preview_blob(forked, "abc")
+
+
+def test_append_preview_events_rejects_stale_missing_unassociated_exec_and_bool(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    other = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    store.save_preview_blob(session_id, "ok", "content")
+    other.save_preview_blob(other.create_session("/repo", "model"), "unassociated", "content")
+
+    cases = [
+        {"preview_key": "missing", "expected_next_seq": 2},
+        {"preview_key": "unassociated", "expected_next_seq": 2},
+        {"preview_key": "ok", "expected_next_seq": 1},
+        {"preview_key": "ok", "expected_next_seq": True},
+    ]
+    for case in cases:
+        with pytest.raises(ValueError):
+            _append_preview_events(store,
+                session_id,
+                summary="summary",
+                source_start_seq=1,
+                source_end_seq=1,
+                **case,
+            )
+        assert [event["seq"] for event in store.get_events(session_id)] == [1]
+
+    other.append_event(session_id, 2, "exec", {})
+    with pytest.raises(ValueError, match="stale persisted preview state"):
+        _append_preview_events(store,
+            session_id,
+            expected_next_seq=3,
+            expected_exec_start_seq=0,
+            preview_key="ok",
+            summary="summary",
+            source_start_seq=1,
+            source_end_seq=1,
+        )
+    assert [event["seq"] for event in store.get_events(session_id)] == [1, 2]
+
+
+def test_two_store_instances_cannot_commit_same_expected_preview_sequence(tmp_path):
+    path = str(tmp_path / "sessions.db")
+    first = SessionStore(path)
+    second = SessionStore(path)
+    session_id = first.create_session("/repo", "model")
+    first.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    first.save_preview_blob(session_id, "a", "a")
+    first.save_preview_blob(session_id, "b", "b")
+
+    assert _append_preview_events(first,
+        session_id,
+        expected_next_seq=2,
+        preview_key="a",
+        summary="a",
+        source_start_seq=1,
+        source_end_seq=1,
+    ) == (2, 3)
+    with pytest.raises(ValueError, match="stale preview event sequence"):
+        _append_preview_events(second,
+            session_id,
+            expected_next_seq=2,
+            preview_key="b",
+            summary="b",
+            source_start_seq=1,
+            source_end_seq=1,
+        )
+    assert [event["seq"] for event in first.get_events(session_id)] == [1, 2, 3]

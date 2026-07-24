@@ -2,7 +2,9 @@ import ast
 import copy
 import hashlib
 import re
+from dataclasses import dataclass
 
+from code_agent.persisted_preview_state import PersistedPreviewState
 from code_agent.session_replay import _parse_silently
 
 
@@ -17,9 +19,55 @@ def _content_preserves_context_refs(content: str) -> bool:
     )
 
 
-def render_preview_ref(content: str, observations=None) -> tuple[str, str]:
-    key = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+@dataclass(frozen=True)
+class Preview:
+    summary: str
+    content: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.summary, str) or not self.summary.strip():
+            raise ValueError("preview summary must be a non-empty string")
+        if self.content is not None and not isinstance(self.content, str):
+            raise ValueError("preview content must be a string or None")
+
+
+@dataclass(frozen=True)
+class ProjectedSpan:
+    start_index: int
+    end_index: int
+    source_start_seq: int
+    source_end_seq: int
+
+
+class PreviewPlacementError(ValueError):
+    pass
+
+
+class PreviewBoundaryError(PreviewPlacementError):
+    pass
+
+
+def message_source_range(message: dict) -> tuple[int, int] | None:
+    start = message.get("_source_start_seq")
+    end = message.get("_source_end_seq")
+    if start is not None and end is not None:
+        return start, end
+    seq = message.get("_event_seq")
+    if seq is not None:
+        return seq, seq
+    return None
+
+
+def preview_key(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def render_preview_ref(key: str, summary: str) -> str:
     uri = f"session://preview/{key}"
+    return f"[PreviewRef: {uri}]\n{summary}\n[/PreviewRef]"
+
+
+def render_default_preview_summary(content: str, observations=None) -> str:
     lines = content.split("\n")
     nlines = len(lines)
     nchars = len(content)
@@ -28,7 +76,6 @@ def render_preview_ref(content: str, observations=None) -> tuple[str, str]:
         for observation in observations or []
         if isinstance(observation, str) and observation.strip()
     ]
-
     if valid_observations:
         parts = ["Observations:"]
         for observation in valid_observations:
@@ -39,8 +86,7 @@ def render_preview_ref(content: str, observations=None) -> tuple[str, str]:
                 for line in observation_lines[1:]
             )
         parts.append(f"({nlines} lines, {nchars} chars)")
-        body = "\n".join(parts)
-        return uri, f"[PreviewRef: {uri}]\n{body}\n[/PreviewRef]"
+        return "\n".join(parts)
 
     def render_preview_line(line):
         max_preview_line = 500
@@ -53,14 +99,111 @@ def render_preview_ref(content: str, observations=None) -> tuple[str, str]:
     head_indexes = list(range(min(head, nlines)))
     tail_start = max(len(head_indexes), nlines - tail)
     omitted = nlines - len(head_indexes) - (nlines - tail_start)
-
     parts = [f"({nlines} lines, {nchars} chars)"]
     parts.extend(render_preview_line(lines[i]) for i in head_indexes)
     if omitted:
         parts.append(f"  ... ({omitted} lines omitted)")
     parts.extend(render_preview_line(lines[i]) for i in range(tail_start, nlines))
-    body = "\n".join(parts)
-    return uri, f"[PreviewRef: {uri}]\n{body}\n[/PreviewRef]"
+    return "\n".join(parts)
+
+
+
+
+def select_projected_span(
+    messages: list[dict],
+    *,
+    source_start_seq: int,
+    source_end_seq: int,
+) -> ProjectedSpan:
+    if type(source_start_seq) is not int or type(source_end_seq) is not int:
+        raise PreviewPlacementError("preview source boundaries must be integers")
+    if source_start_seq > source_end_seq:
+        raise PreviewPlacementError(
+            f"invalid preview source range [{source_start_seq}, {source_end_seq}]"
+        )
+
+    requested = f"[{source_start_seq}, {source_end_seq}]"
+    overlapping = []
+    start_matches = []
+    end_matches = []
+    for index, message in enumerate(messages):
+        source_range = message_source_range(message)
+        if source_range is None:
+            continue
+        node_start, node_end = source_range
+        if type(node_start) is not int or type(node_end) is not int:
+            raise PreviewPlacementError("projected-node source boundaries must be integers")
+        if node_start > node_end:
+            raise PreviewPlacementError(
+                f"invalid projected-node source range [{node_start}, {node_end}]"
+            )
+        if node_end < source_start_seq or node_start > source_end_seq:
+            continue
+        overlapping.append((index, node_start, node_end))
+        if node_start == source_start_seq:
+            start_matches.append(index)
+        if node_end == source_end_seq:
+            end_matches.append(index)
+        if node_start < source_start_seq or node_end > source_end_seq:
+            raise PreviewBoundaryError(
+                f"requested range {requested} splits or partially overlaps "
+                f"projected node [{node_start}, {node_end}]"
+            )
+
+    if len(start_matches) > 1:
+        raise PreviewBoundaryError(
+            f"ambiguous projected start boundary for requested range {requested}"
+        )
+    if len(end_matches) > 1:
+        raise PreviewBoundaryError(
+            f"ambiguous projected end boundary for requested range {requested}"
+        )
+    if not start_matches or not end_matches:
+        raise PreviewBoundaryError(
+            f"missing projected boundary for requested range {requested}"
+        )
+
+    start_index = start_matches[0]
+    end_index = end_matches[0] + 1
+    if start_index >= end_index:
+        raise PreviewBoundaryError(
+            f"source-aware projected nodes are not ordered for requested range {requested}"
+        )
+
+    expected_indexes = list(range(start_index, end_index))
+    overlapping_indexes = [index for index, _, _ in overlapping]
+    if overlapping_indexes != expected_indexes:
+        for index in expected_indexes:
+            if message_source_range(messages[index]) is None:
+                raise PreviewBoundaryError(
+                    f"source-less projected node at index {index} lies inside "
+                    f"source-aware requested range {requested}"
+                )
+        raise PreviewBoundaryError(
+            f"source-aware nodes do not form one exact projected span for "
+            f"requested range {requested}"
+        )
+
+    previous = None
+    for _, node_start, node_end in overlapping:
+        if previous is not None and node_start <= previous[1]:
+            raise PreviewPlacementError(
+                f"non-contiguous projected span: node [{node_start}, {node_end}] "
+                f"overlaps or precedes [{previous[0]}, {previous[1]}]"
+            )
+        previous = (node_start, node_end)
+
+    if overlapping[0][1] != source_start_seq or overlapping[-1][2] != source_end_seq:
+        raise PreviewBoundaryError(
+            f"selected projected nodes do not uniquely cover requested range {requested}"
+        )
+
+    return ProjectedSpan(
+        start_index=start_index,
+        end_index=end_index,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+    )
 
 
 def is_release_assistant_message(msg: dict) -> bool:
@@ -419,10 +562,18 @@ def _coalesced_message_from_refs(
     rendered_refs: list[str],
     range_messages: list[dict],
     preserved_preview_refs=None,
+    *,
+    replacement_prefix: str | None = None,
+    source_start_seq: int | None = None,
+    source_end_seq: int | None = None,
 ) -> dict:
     placeholders = _attachment_placeholders(range_messages)
     preview_placeholders = _preserved_preview_ref_blocks(range_messages, preserved_preview_refs or set())
-    visible_parts = ["[Assistant work and REPL output coalesced into preview]"]
+    visible_parts = [
+        replacement_prefix
+        if replacement_prefix is not None
+        else "[Assistant work and REPL output coalesced into preview]"
+    ]
     visible_parts.extend(placeholders)
     visible_parts.extend(preview_placeholders)
     visible_parts.extend(["", *rendered_refs])
@@ -434,6 +585,9 @@ def _coalesced_message_from_refs(
         "_synthetic": True,
         "_coalesced": True,
     }
+    if source_start_seq is not None and source_end_seq is not None:
+        msg["_source_start_seq"] = source_start_seq
+        msg["_source_end_seq"] = source_end_seq
     attachments, attachment_refs = _merge_message_attachments(range_messages)
     if attachments:
         msg["_attachments"] = attachments
@@ -442,9 +596,263 @@ def _coalesced_message_from_refs(
     return msg
 
 
-def _coalesced_message(content: str, range_messages: list[dict]) -> dict:
-    _, rendered = render_preview_ref(content)
-    return _coalesced_message_from_refs([rendered], range_messages)
+
+def render_projected_span(messages: list[dict]) -> str:
+    return _preview_content(messages, None, None)
+
+
+def materialize_preview(preview: Preview, derived_content: str) -> tuple[str, str, str]:
+    content = derived_content if preview.content is None else preview.content
+    key = preview_key(content)
+    return key, content, render_preview_ref(key, preview.summary)
+
+
+def make_preview_replacement(
+    rendered_refs: list[str],
+    selected_messages: list[dict],
+    *,
+    source_start_seq: int | None = None,
+    source_end_seq: int | None = None,
+    replacement_prefix: str | None = None,
+    preserve_preview_refs=None,
+) -> dict:
+    return _coalesced_message_from_refs(
+        rendered_refs,
+        selected_messages,
+        preserve_preview_refs,
+        replacement_prefix=replacement_prefix,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+    )
+
+
+def replace_projected_span(
+    messages: list[dict],
+    span: ProjectedSpan,
+    replacement: dict,
+) -> list[dict]:
+    return [
+        *copy.deepcopy(messages[:span.start_index]),
+        copy.deepcopy(replacement),
+        *copy.deepcopy(messages[span.end_index:]),
+    ]
+
+
+def _resolved_preview_placement(
+    messages: list[dict],
+    *,
+    source_start_seq: int,
+    source_end_seq: int,
+    preview_key: str,
+    summary: str,
+    content: str | None = None,
+    replacement_prefix: str | None = None,
+    preserve_preview_refs=None,
+    persisted: bool = False,
+) -> tuple[list[dict], str | None]:
+    span = select_projected_span(
+        messages,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+    )
+    selected = messages[span.start_index:span.end_index]
+    replacement = make_preview_replacement(
+        [render_preview_ref(preview_key, summary)],
+        selected,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+        replacement_prefix=replacement_prefix,
+        preserve_preview_refs=preserve_preview_refs,
+    )
+    if persisted:
+        replacement["_persisted_preview"] = True
+    return replace_projected_span(messages, span, replacement), content
+
+
+def _resolve_preview(
+    messages: list[dict],
+    preview: Preview,
+    *,
+    source_start_seq: int,
+    source_end_seq: int,
+    persisted: bool = False,
+) -> tuple[list[dict], str, str]:
+    span = select_projected_span(
+        messages,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+    )
+    selected = messages[span.start_index:span.end_index]
+    key, content, _ = materialize_preview(preview, render_projected_span(selected))
+    projected, _ = _resolved_preview_placement(
+        messages,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+        preview_key=key,
+        summary=preview.summary,
+        content=content,
+        persisted=persisted,
+    )
+    return projected, key, content
+
+
+def apply_preview_placement(
+    messages: list[dict],
+    *,
+    preview_key: str,
+    summary: str,
+    source_start_seq: int,
+    source_end_seq: int,
+) -> list[dict]:
+    if not isinstance(preview_key, str) or not preview_key:
+        raise PreviewPlacementError("preview key must be a non-empty string")
+    preview = Preview(summary=summary)
+    projected, _ = _resolved_preview_placement(
+        messages,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+        preview_key=preview_key,
+        summary=preview.summary,
+        persisted=True,
+    )
+    return projected
+
+
+def create_persisted_preview(
+    messages: list[dict],
+    preview: Preview,
+    *,
+    source_start_seq: int,
+    source_end_seq: int,
+    store,
+    session_id: str,
+    expected_next_seq: int | None = None,
+    state: PersistedPreviewState,
+) -> tuple[list[dict], str, int, int]:
+    if not isinstance(state, PersistedPreviewState):
+        raise TypeError("complete persisted preview state is required")
+    if type(source_start_seq) is not int or type(source_end_seq) is not int:
+        raise PreviewPlacementError("preview source boundaries must be integers")
+    if source_start_seq <= state.exec_start_seq:
+        raise PreviewPlacementError("preview placement crosses the active exec boundary")
+    status = state.placement_status(-1, source_start_seq, source_end_seq)
+    if status != "apply":
+        raise PreviewPlacementError(f"persisted preview range is not available: {status}")
+    projected, key, content = _resolve_preview(
+        messages,
+        preview,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+        persisted=True,
+    )
+    created_seq, placed_seq = store.append_preview_events(
+        session_id,
+        expected_next_seq=expected_next_seq,
+        preview_key=key,
+        summary=preview.summary,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+        expected_exec_start_seq=state.exec_start_seq,
+        expected_definitions=state.definitions,
+        expected_active_placements=state.active_placements,
+        preview_content=content,
+    )
+    state.definitions[created_seq] = (key, preview.summary)
+    state.install_placement(created_seq, source_start_seq, source_end_seq)
+    return projected, key, created_seq, placed_seq
+
+
+def place_preview(
+    messages: list[dict],
+    previews: Preview | list[Preview],
+    *,
+    source_start_seq: int | None = None,
+    source_end_seq: int | None = None,
+    start_index: int | None = None,
+    end_index: int | None = None,
+    save_preview_blob=None,
+    replacement_prefix: str | None = None,
+    preserve_preview_refs=None,
+) -> tuple[list[dict], list[str]]:
+    single_preview = isinstance(previews, Preview)
+    previews = [previews] if single_preview else list(previews)
+    if not previews or any(not isinstance(preview, Preview) for preview in previews):
+        raise TypeError("previews must be a Preview or non-empty sequence of Preview values")
+
+    has_source_boundary = source_start_seq is not None or source_end_seq is not None
+    has_index_boundary = start_index is not None or end_index is not None
+    if has_source_boundary:
+        if source_start_seq is None or source_end_seq is None or has_index_boundary:
+            raise PreviewPlacementError(
+                "provide either a complete canonical source range or a complete legacy index span"
+            )
+        span = select_projected_span(
+            messages,
+            source_start_seq=source_start_seq,
+            source_end_seq=source_end_seq,
+        )
+    else:
+        if start_index is None or end_index is None:
+            raise PreviewPlacementError(
+                "provide either a complete canonical source range or a complete legacy index span"
+            )
+        if not 0 <= start_index < end_index <= len(messages):
+            raise PreviewPlacementError(
+                f"invalid legacy projected span [{start_index}, {end_index})"
+            )
+        selected_ranges = [
+            message_source_range(message)
+            for message in messages[start_index:end_index]
+            if message_source_range(message) is not None
+        ]
+        if selected_ranges:
+            raise PreviewPlacementError(
+                "legacy index placement is only supported for source-less projected nodes"
+            )
+        span = ProjectedSpan(start_index, end_index, 0, 0)
+
+    selected = messages[span.start_index:span.end_index]
+    if single_preview and has_source_boundary:
+        projected, key, content = _resolve_preview(
+            messages,
+            previews[0],
+            source_start_seq=source_start_seq,
+            source_end_seq=source_end_seq,
+        )
+        if replacement_prefix is not None or preserve_preview_refs:
+            projected, _ = _resolved_preview_placement(
+                messages,
+                source_start_seq=source_start_seq,
+                source_end_seq=source_end_seq,
+                preview_key=key,
+                summary=previews[0].summary,
+                content=content,
+                replacement_prefix=replacement_prefix,
+                preserve_preview_refs=preserve_preview_refs,
+            )
+        if save_preview_blob is not None:
+            save_preview_blob(key, content)
+        return projected, key
+
+    derived_content = render_projected_span(selected)
+    materialized = [
+        materialize_preview(preview, derived_content)
+        for preview in previews
+    ]
+    replacement = make_preview_replacement(
+        [rendered for _, _, rendered in materialized],
+        selected,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+        replacement_prefix=replacement_prefix,
+        preserve_preview_refs=preserve_preview_refs,
+    )
+    projected = replace_projected_span(messages, span, replacement)
+    if save_preview_blob is not None:
+        for key, content, _ in materialized:
+            save_preview_blob(key, content)
+    keys = [key for key, _, _ in materialized]
+    return projected, keys[0] if single_preview else keys
 
 
 def _message_observations(messages: list[dict]) -> list[str]:
@@ -511,7 +919,6 @@ def coalesce_repl_messages(
     *,
     keep_last_interactions: int = 3,
     keep_last_execution_interactions: int = 1,
-    min_chars: int = 2000,
     min_savings_chars: int = 1000,
     save_preview_blob=None,
     auto_expand_preview_refs: list[str] | None = None,
@@ -569,24 +976,60 @@ def coalesce_repl_messages(
         if not section_contents:
             continue
 
-        rendered_refs = [
-            render_preview_ref(section_content, observations)[1]
+        previews = [
+            Preview(
+                summary=render_default_preview_summary(section_content, observations),
+                content=section_content,
+            )
             for _, section_content, observations in section_contents
         ]
-        projected = _coalesced_message_from_refs(rendered_refs, replacement_range, preserve_preview_refs)
+        source_ranges = [
+            message_source_range(message)
+            for message in replacement_range
+        ]
+        if all(source_range is not None for source_range in source_ranges):
+            if any(
+                current[0] <= previous[1]
+                for previous, current in zip(source_ranges, source_ranges[1:])
+            ):
+                continue
+            placement_kwargs = {
+                "source_start_seq": source_ranges[0][0],
+                "source_end_seq": source_ranges[-1][1],
+            }
+        elif all(source_range is None for source_range in source_ranges):
+            placement_kwargs = {
+                "start_index": start + 1,
+                "end_index": release,
+            }
+        else:
+            continue
+
+        materialized_contents = {}
+        try:
+            candidate, keys = place_preview(
+                messages,
+                previews,
+                save_preview_blob=materialized_contents.setdefault,
+                preserve_preview_refs=preserve_preview_refs,
+                **placement_kwargs,
+            )
+        except PreviewPlacementError:
+            continue
+        projected_replacement = candidate[start + 1]
         original_chars = sum(len(m.get("content") or "") for m in replacement_range)
-        replacement_chars = len(projected.get("content") or "")
+        replacement_chars = len(projected_replacement.get("content") or "")
         if original_chars - replacement_chars < min_savings_chars:
             continue
 
-        for pinned, section_content, _ in section_contents:
-            key = hashlib.sha256(section_content.encode("utf-8")).hexdigest()[:16]
-            if save_preview_blob is not None:
-                save_preview_blob(key, section_content)
+        if save_preview_blob is not None:
+            for key in keys:
+                save_preview_blob(key, materialized_contents[key])
+        for (pinned, _, _), key in zip(section_contents, keys):
             if pinned and auto_expand_preview_refs is not None:
                 auto_expand_preview_refs.append(f"session://preview/{key}")
 
-        replacements[start] = projected
+        replacements[start] = projected_replacement
         skip_indexes.update(range(start + 1, release))
 
     projected = [copy.deepcopy(messages[0])]
@@ -596,6 +1039,5 @@ def coalesce_repl_messages(
         projected.append(copy.deepcopy(msg))
         if i in by_start and i in replacements:
             projected.append(replacements[i])
-
 
     return projected

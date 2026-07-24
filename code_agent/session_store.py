@@ -1,8 +1,11 @@
+import copy
 import json
 import os
 import socket
 import sqlite3
 import uuid
+
+from .persisted_preview_state import PersistedPreviewTransitions
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -328,6 +331,224 @@ class SessionStore:
             conn.commit()
         return seq
 
+    @staticmethod
+    def _active_persisted_preview_state(event_rows, associated_preview_keys) -> tuple[dict, dict, int]:
+        transitions = PersistedPreviewTransitions()
+        projected_ranges = []
+        projected_snapshots = {0: []}
+
+        def apply_placement(_preview_event_seq, _definition, source_start_seq, source_end_seq):
+            overlapping = [
+                (index, start, end)
+                for index, (start, end) in enumerate(projected_ranges)
+                if not (end < source_start_seq or start > source_end_seq)
+            ]
+            if not overlapping:
+                return False
+            indexes = [item[0] for item in overlapping]
+            if indexes != list(range(indexes[0], indexes[-1] + 1)):
+                return False
+            if overlapping[0][1] != source_start_seq or overlapping[-1][2] != source_end_seq:
+                return False
+            if any(start < source_start_seq or end > source_end_seq for _, start, end in overlapping):
+                return False
+            for previous, current in zip(overlapping, overlapping[1:]):
+                if current[1] <= previous[2]:
+                    return False
+            projected_ranges[indexes[0]:indexes[-1] + 1] = [(source_start_seq, source_end_seq)]
+            return True
+
+        for row in event_rows:
+            seq = row["seq"]
+            event_type = row["event_type"]
+            try:
+                payload = json.loads(row["payload_json"])
+            except Exception:
+                payload = None
+
+            if event_type == "message_added" and isinstance(payload, dict):
+                if isinstance(payload.get("message"), dict):
+                    projected_ranges.append((seq, seq))
+            elif event_type == "rewind" and isinstance(payload, dict):
+                target_seq = payload.get("target_seq")
+                if type(target_seq) is int:
+                    projected_ranges = copy.deepcopy(
+                        projected_snapshots.get(target_seq, projected_snapshots[0])
+                    )
+            elif event_type == "exec":
+                projected_ranges = []
+
+            transitions.apply(
+                seq=seq,
+                event_type=event_type,
+                payload=payload,
+                has_preview_blob=lambda key: key in associated_preview_keys,
+                apply_placement=apply_placement,
+            )
+            projected_snapshots[seq] = copy.deepcopy(projected_ranges)
+
+        state = transitions.state
+        return state.definitions, state.active_placements, state.exec_start_seq
+
+    def append_preview_events(
+        self,
+        session_id: str,
+        *,
+        preview_key: str,
+        summary: str,
+        source_start_seq: int,
+        source_end_seq: int,
+        expected_next_seq: int | None = None,
+        expected_exec_start_seq: int,
+        expected_definitions: dict,
+        expected_active_placements: dict,
+        preview_content: str | None = None,
+    ) -> tuple[int, int]:
+        if expected_next_seq is not None and type(expected_next_seq) is not int:
+            raise ValueError("expected next sequence must be an integer")
+        if type(expected_exec_start_seq) is not int:
+            raise ValueError("expected exec sequence must be an integer")
+        if not isinstance(expected_definitions, dict):
+            raise ValueError("expected preview definitions must be a dictionary")
+        if not isinstance(expected_active_placements, dict):
+            raise ValueError("expected active placements must be a dictionary")
+        if not isinstance(preview_key, str) or not preview_key:
+            raise ValueError("preview key must be a non-empty string")
+        if preview_content is not None and not isinstance(preview_content, str):
+            raise ValueError("preview content must be a string")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("preview summary must be a non-empty string")
+        if type(source_start_seq) is not int or type(source_end_seq) is not int:
+            raise ValueError("preview source boundaries must be integers")
+        if source_start_seq > source_end_seq:
+            raise ValueError("invalid preview source range")
+
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM session_events WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                created_seq = int(row["max_seq"]) + 1
+                placed_seq = created_seq + 1
+                if expected_next_seq is not None and expected_next_seq != created_seq:
+                    raise ValueError("stale preview event sequence")
+
+                event_rows = conn.execute(
+                    """
+                    SELECT seq, event_type, payload_json
+                    FROM session_events
+                    WHERE session_id = ?
+                    ORDER BY seq
+                    """,
+                    (session_id,),
+                ).fetchall()
+                associated_preview_keys = {
+                    item["key"]
+                    for item in conn.execute(
+                        "SELECT key FROM session_preview_blobs WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchall()
+                }
+                active_definitions, active_placements, active_exec_start_seq = (
+                    self._active_persisted_preview_state(
+                        event_rows,
+                        associated_preview_keys,
+                    )
+                )
+                if (
+                    active_exec_start_seq != expected_exec_start_seq
+                    or active_definitions != expected_definitions
+                    or active_placements != expected_active_placements
+                ):
+                    raise ValueError("stale persisted preview state")
+                if source_end_seq >= created_seq:
+                    raise ValueError("preview source range must precede preview creation")
+                if source_start_seq <= active_exec_start_seq:
+                    raise ValueError("preview placement crosses the active exec boundary")
+                requested = (source_start_seq, source_end_seq)
+                if requested in active_placements:
+                    raise ValueError("preview range already has an active placement")
+                for start, end in active_placements:
+                    if source_start_seq <= end and start <= source_end_seq:
+                        contains = source_start_seq <= start and end <= source_end_seq
+                        contained = start <= source_start_seq and source_end_seq <= end
+                        if contained:
+                            raise ValueError("preview range is inside an active placement")
+                        if not contains:
+                            raise ValueError("preview range partially overlaps an active placement")
+
+                blob = conn.execute(
+                    "SELECT content FROM preview_blobs WHERE key = ?",
+                    (preview_key,),
+                ).fetchone()
+                associated = conn.execute(
+                    "SELECT 1 FROM session_preview_blobs WHERE session_id = ? AND key = ?",
+                    (session_id, preview_key),
+                ).fetchone()
+                if preview_content is None:
+                    if associated is None:
+                        raise ValueError("preview blob is not associated with session")
+                else:
+                    if blob is None:
+                        conn.execute(
+                            "INSERT INTO preview_blobs(key, created_at, content) VALUES (?, ?, ?)",
+                            (preview_key, now, preview_content),
+                        )
+                    elif blob["content"].startswith("[Preview content redacted"):
+                        conn.execute(
+                            "UPDATE preview_blobs SET created_at = ?, content = ? WHERE key = ?",
+                            (now, preview_content, preview_key),
+                        )
+                    elif blob["content"] != preview_content:
+                        raise RuntimeError("Key conflict")
+                    if associated is None:
+                        conn.execute(
+                            """
+                            INSERT INTO session_preview_blobs(session_id, key, created_at)
+                            VALUES (?, ?, ?)
+                            """,
+                            (session_id, preview_key, now),
+                        )
+
+                created_payload = json.dumps(
+                    {"preview_key": preview_key, "summary": summary},
+                    ensure_ascii=False,
+                )
+                placed_payload = json.dumps(
+                    {
+                        "preview_event_seq": created_seq,
+                        "source_start_seq": source_start_seq,
+                        "source_end_seq": source_end_seq,
+                    },
+                    ensure_ascii=False,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO session_events(session_id, seq, created_at, event_type, payload_json)
+                    VALUES (?, ?, ?, 'preview_created', ?)
+                    """,
+                    (session_id, created_seq, now, created_payload),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO session_events(session_id, seq, created_at, event_type, payload_json)
+                    VALUES (?, ?, ?, 'preview_placed', ?)
+                    """,
+                    (session_id, placed_seq, now, placed_payload),
+                )
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (now, session_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return created_seq, placed_seq
+
     def get_events(self, session_id: str) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -459,6 +680,18 @@ class SessionStore:
                 (now, session_id),
             )
             conn.commit()
+
+    def has_preview_blob(self, session_id: str, key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM session_preview_blobs
+                WHERE session_id = ? AND key = ?
+                """,
+                (session_id, key),
+            ).fetchone()
+        return row is not None
 
     def get_preview_blob(self, session_id: str, key: str) -> str | None:
         with self._connect() as conn:

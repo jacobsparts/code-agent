@@ -1,6 +1,16 @@
 import re
 
+import pytest
+
+import code_agent.code_agent_coalesce as coalesce_module
+
+from code_agent.code_agent_coalesce import Preview
+from code_agent.code_agent_coalesce import PreviewBoundaryError
 from code_agent.code_agent_coalesce import coalesce_repl_messages
+from code_agent.code_agent_coalesce import message_source_range
+from code_agent.code_agent_coalesce import place_preview
+from code_agent.code_agent_coalesce import preview_key
+from code_agent.code_agent_coalesce import render_default_preview_summary
 from code_agent.code_agent_coalesce import render_preview_ref
 
 
@@ -25,10 +35,14 @@ def five_interactions():
 
 def test_render_preview_ref_uses_observations_instead_of_excerpt():
     content = "head\n" + ("x" * 2500) + "\ntail"
+    key = preview_key(content)
+    summary = render_default_preview_summary(
+        content,
+        ["First result.", "Second result."],
+    )
+    rendered = render_preview_ref(key, summary)
 
-    uri, rendered = render_preview_ref(content, ["First result.", "Second result."])
-
-    assert f"[PreviewRef: {uri}]" in rendered
+    assert f"[PreviewRef: session://preview/{key}]" in rendered
     assert "Observations:\n- First result.\n- Second result." in rendered
     assert "(3 lines, 2510 chars)" in rendered
     assert "x" * 500 not in rendered
@@ -37,10 +51,12 @@ def test_render_preview_ref_uses_observations_instead_of_excerpt():
 
 
 def test_render_preview_ref_formats_multiline_observations():
-    _, rendered = render_preview_ref(
-        "canonical",
+    content = "canonical"
+    summary = render_default_preview_summary(
+        content,
         ["The attempt exposed two invariants.\n\nVirtual boundaries matter.\nFiltering broke them."],
     )
+    rendered = render_preview_ref(preview_key(content), summary)
 
     assert (
         "Observations:\n"
@@ -52,20 +68,26 @@ def test_render_preview_ref_formats_multiline_observations():
     ) in rendered
 
 
-def test_render_preview_ref_without_observations_is_unchanged():
+def test_default_preview_summary_without_observations_is_unchanged():
     content = "head\nbody\ntail"
 
-    assert render_preview_ref(content) == render_preview_ref(content, [])
-    assert "Observations:" not in render_preview_ref(content)[1]
+    assert render_default_preview_summary(content) == render_default_preview_summary(content, [])
+    assert "Observations:" not in render_default_preview_summary(content)
 
 
 def test_preview_key_depends_only_on_canonical_content():
     content = "same canonical content"
 
-    plain_uri, _ = render_preview_ref(content)
-    observed_uri, _ = render_preview_ref(content, ["Different collapsed rendering."])
+    plain = render_preview_ref(
+        preview_key(content),
+        render_default_preview_summary(content),
+    )
+    observed = render_preview_ref(
+        preview_key(content),
+        render_default_preview_summary(content, ["Different collapsed rendering."]),
+    )
 
-    assert observed_uri == plain_uri
+    assert plain.split("]", 1)[0] == observed.split("]", 1)[0]
 
 
 def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
@@ -86,7 +108,6 @@ def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
     )
@@ -120,7 +141,6 @@ def test_pinned_and_normal_sections_keep_their_own_observations():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
     )
     coalesced = next(msg for msg in projected if msg.get("_coalesced"))
@@ -134,7 +154,7 @@ def test_pinned_and_normal_sections_keep_their_own_observations():
 def test_keeps_last_three_interactions_uncoalesced():
     messages = five_interactions()
 
-    projected = coalesce_repl_messages(messages, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, min_savings_chars=1)
 
     assert projected[0] == messages[0]
     assert sum(1 for m in projected if m.get("_coalesced")) == 2
@@ -150,7 +170,6 @@ def test_preserves_real_user_inputs_and_release_assistant_messages():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
     )
@@ -167,8 +186,8 @@ def test_saves_preview_blob_deterministically():
     saved1 = {}
     saved2 = {}
 
-    projected1 = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1, save_preview_blob=saved1.setdefault)
-    projected2 = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1, save_preview_blob=saved2.setdefault)
+    projected1 = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved1.setdefault)
+    projected2 = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved2.setdefault)
 
     assert saved1 == saved2
     assert projected1 == projected2
@@ -179,7 +198,7 @@ def test_saves_preview_blob_deterministically():
 def test_skips_small_interactions():
     messages = [{"role": "system", "content": "system"}] + interaction(0, work_size=1)
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=2000, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
 
     assert projected == messages
 
@@ -192,14 +211,12 @@ def test_can_coalesce_last_interactions_for_resume_compaction():
         messages,
         keep_last_interactions=3,
         keep_last_execution_interactions=1,
-        min_chars=1,
         min_savings_chars=1,
     )
     aggressive = coalesce_repl_messages(
         messages,
         keep_last_interactions=3,
         keep_last_execution_interactions=1,
-        min_chars=1,
         min_savings_chars=1,
         protect_last_interactions=False,
     )
@@ -225,7 +242,7 @@ def test_attachment_placeholders_and_payloads_survive():
         {"role": "assistant", "content": "emit('Done', release=True)"},
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     coalesced = next(m for m in projected if m.get("_coalesced"))
 
     assert "[Attachment: src/foo.py]" in coalesced["content"]
@@ -243,7 +260,7 @@ def test_nested_preview_refs_remain_placeholders():
         {"role": "assistant", "content": "emit('Done', release=True)"},
     ]
 
-    coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1, save_preview_blob=saved.setdefault)
+    coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
     content = next(iter(saved.values()))
 
     assert "[PreviewRef: session://preview/abc]" in content
@@ -265,7 +282,7 @@ def test_appended_user_content_is_preserved():
         },
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     assert any(m["role"] == "user" and m.get("_user_content") == "Next task" for m in projected)
     coalesced = next(m for m in projected if m.get("_coalesced"))
     assert "Next task" not in coalesced["content"]
@@ -282,7 +299,7 @@ def test_release_output_is_preserved_live_not_saved_to_preview():
         {"role": "user", "content": ">>> emit('Done', release=True)\nDone\nextra line\n"},
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1, save_preview_blob=saved.setdefault)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
     visible = "\n".join(m.get("content") or "" for m in projected)
 
     assert any(m["role"] == "assistant" and m["content"] == "emit('Done', release=True)" for m in projected)
@@ -294,7 +311,7 @@ def test_release_output_is_preserved_live_not_saved_to_preview():
 def test_coalesced_messages_are_synthetic():
     messages = [{"role": "system", "content": "system"}] + interaction(0)
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     coalesced = next(m for m in projected if m.get("_coalesced"))
 
     assert coalesced["_synthetic"] is True
@@ -311,7 +328,6 @@ def test_coalesce_is_idempotent_on_projected_messages():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
     )
@@ -319,7 +335,6 @@ def test_coalesce_is_idempotent_on_projected_messages():
         projected,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
     )
@@ -337,7 +352,7 @@ def test_release_detection_accepts_emit_value_metadata_when_final_result_is_none
         {"role": "assistant", "content": "emit(result, release=True)", "_final_result": None, "_emit_value": ""},
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
 
     assert any(m.get("_coalesced") for m in projected)
     assert projected[-1]["role"] == "assistant"
@@ -352,7 +367,7 @@ def test_release_detection_finds_top_level_emit_after_non_emit_work():
         {"role": "assistant", "content": "result = 'done'\nemit(result, release=True)"},
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
 
     assert any(m.get("_coalesced") for m in projected)
 
@@ -366,7 +381,7 @@ def test_render_segment_input_is_preserved_as_real_user_input():
         {"role": "assistant", "content": "emit('Done', release=True)"},
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
 
     assert projected[1]["_render_segments"] == [{"type": "input", "content": "Segment task"}]
     assert any(m.get("_coalesced") for m in projected)
@@ -383,7 +398,7 @@ def test_omitted_echo_is_reconstructed_in_preview_blob():
         {"role": "assistant", "content": "emit('Done', release=True)"},
     ]
 
-    coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1, save_preview_blob=saved.setdefault)
+    coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
     content = next(iter(saved.values()))
 
     assert ">>> for i in range(2):" in content
@@ -404,7 +419,7 @@ def test_attachment_placeholder_order_is_first_seen_and_deduplicated():
         {"role": "assistant", "content": "emit('Done', release=True)"},
     ]
 
-    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     coalesced = next(m for m in projected if m.get("_coalesced"))
     lines = coalesced["content"].splitlines()
 
@@ -419,7 +434,6 @@ def test_small_interaction_does_not_save_preview_blob():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=2000,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
     )
@@ -459,7 +473,6 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
         agent.conversation.messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=lambda key, content: store.save_preview_blob(session_id, key, content),
     )
@@ -473,7 +486,6 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
         replayed_agent.conversation.messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=lambda key, content: store.save_preview_blob(session_id, key, content),
     )
@@ -511,7 +523,6 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
         agent.conversation.messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=lambda key, content: store.save_preview_blob(session_id, key, content),
     )
@@ -530,7 +541,6 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
         resumed.conversation.messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=lambda key, content: store.save_preview_blob(session_id, key, content),
     )
@@ -560,7 +570,6 @@ def test_coalesce_preserves_expanded_preview_ref_placeholder():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         preserve_preview_refs={"session://preview/keep"},
     )
@@ -658,7 +667,6 @@ def test_pinned_turn_creates_auto_expanded_preview_ref():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
         auto_expand_preview_refs=auto_expand,
@@ -687,7 +695,6 @@ def test_pinned_turn_without_repl_output_is_preserved():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
         auto_expand_preview_refs=auto_expand,
@@ -718,7 +725,6 @@ def test_multiple_pinned_turns_keep_ordered_preview_sections():
         messages,
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
         save_preview_blob=saved.setdefault,
         auto_expand_preview_refs=auto_expand,
@@ -753,7 +759,7 @@ def test_default_keeps_most_recent_execution_interaction_even_past_last_three():
     for i in range(3):
         messages.extend(chat_interaction(i))
 
-    projected = coalesce_repl_messages(messages, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, min_savings_chars=1)
 
     assert sum(1 for m in projected if m.get("_coalesced")) == 1
     visible = "\n".join(m.get("content") or "" for m in projected)
@@ -772,7 +778,7 @@ def test_release_output_is_not_treated_as_next_interaction_start_for_execution_p
     for i in range(3):
         messages.extend(chat_interaction(i))
 
-    projected = coalesce_repl_messages(messages, min_chars=1, min_savings_chars=1)
+    projected = coalesce_repl_messages(messages, min_savings_chars=1)
 
     visible = "\n".join(m.get("content") or "" for m in projected)
     assert sum(1 for m in projected if m.get("_coalesced")) == 1
@@ -805,7 +811,6 @@ def test_virtual_interaction_boundary_counts_as_completed_interaction_on_both_si
         messages,
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
     )
 
@@ -868,7 +873,6 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
         agent.conversation.messages,
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
-        min_chars=1,
         min_savings_chars=1,
     )
 
@@ -877,3 +881,801 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
     visible = "\n".join(m.get("content") or "" for m in projected)
     assert "a" * 600 not in visible
     assert "b" * 600 not in visible
+
+
+
+
+def test_preview_validates_summary_and_content():
+    assert Preview(" summary ").content is None
+    assert Preview("summary", "content").content == "content"
+
+    for summary in ("", "   ", None):
+        try:
+            Preview(summary)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("blank or non-string summary was accepted")
+
+    try:
+        Preview("summary", 123)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-string preview content was accepted")
+
+
+def test_message_source_range_prefers_synthetic_coverage():
+    assert message_source_range({"_event_seq": 4}) == (4, 4)
+    assert message_source_range({
+        "_event_seq": 4,
+        "_source_start_seq": 2,
+        "_source_end_seq": 6,
+    }) == (2, 6)
+    assert message_source_range({"role": "system"}) is None
+
+
+def test_place_preview_uses_explicit_content_and_does_not_mutate_input():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "raw", "_event_seq": 10},
+        {
+            "role": "user",
+            "content": ">>> raw\noutput",
+            "_event_seq": 11,
+            "_attachments": {"a.py": "body"},
+            "_attachment_refs": {"a.py": "a.py"},
+        },
+    ]
+    original = [dict(message) for message in messages]
+    saved = {}
+
+    projected, key = place_preview(
+        messages,
+        Preview(
+            "custom summary",
+            "explicit [PreviewRef: session://preview/child]\nchild\n[/PreviewRef]",
+        ),
+        source_start_seq=10,
+        source_end_seq=11,
+        save_preview_blob=saved.setdefault,
+    )
+
+    content = "explicit [PreviewRef: session://preview/child]\nchild\n[/PreviewRef]"
+    assert messages == original
+    assert key == preview_key(content)
+    assert saved == {key: content}
+    replacement = projected[1]
+    assert replacement["_source_start_seq"] == 10
+    assert replacement["_source_end_seq"] == 11
+    assert replacement["_attachments"] == {"a.py": "body"}
+    assert replacement["_attachment_refs"] == {"a.py": "a.py"}
+    assert "custom summary" in replacement["content"]
+
+
+def test_place_preview_derives_content_from_current_projection():
+    messages = [
+        {"role": "assistant", "content": "print('x')", "_event_seq": 1},
+        {"role": "user", "content": ">>> print('x')\nx", "_event_seq": 2},
+    ]
+    saved = {}
+
+    projected, key = place_preview(
+        messages,
+        Preview("derived"),
+        source_start_seq=1,
+        source_end_seq=2,
+        save_preview_blob=saved.setdefault,
+    )
+
+    assert saved[key] == "print('x')\n\n>>> print('x')\nx"
+    assert projected[0]["_source_start_seq"] == 1
+    assert projected[0]["_source_end_seq"] == 2
+
+
+def test_preview_summary_does_not_affect_blob_key():
+    messages = [{"role": "assistant", "content": "body", "_event_seq": 1}]
+    saved = {}
+
+    first, first_key = place_preview(
+        messages,
+        Preview("first", "same"),
+        source_start_seq=1,
+        source_end_seq=1,
+        save_preview_blob=saved.setdefault,
+    )
+    second, second_key = place_preview(
+        messages,
+        Preview("second", "same"),
+        source_start_seq=1,
+        source_end_seq=1,
+        save_preview_blob=saved.setdefault,
+    )
+
+    assert first_key == second_key
+    assert "first" in first[0]["content"]
+    assert "second" in second[0]["content"]
+    assert saved == {first_key: "same"}
+
+
+def test_place_preview_rejects_split_and_partial_overlap_boundaries():
+    messages = [
+        {
+            "role": "user",
+            "content": "child",
+            "_source_start_seq": 100,
+            "_source_end_seq": 150,
+        },
+        {"role": "assistant", "content": "later", "_event_seq": 160},
+    ]
+
+    for start, end in ((110, 140), (80, 120), (120, 160)):
+        try:
+            place_preview(
+                messages,
+                Preview("invalid"),
+                source_start_seq=start,
+                source_end_seq=end,
+            )
+        except PreviewBoundaryError as exc:
+            assert f"[{start}, {end}]" in str(exc)
+            assert "[100, 150]" in str(exc)
+        else:
+            raise AssertionError(f"invalid range [{start}, {end}] was accepted")
+
+
+def test_recursive_parent_preview_preserves_child_ref_verbatim():
+    canonical = [
+        {"role": "assistant", "content": "child work", "_event_seq": 1},
+        {"role": "user", "content": ">>> child work\nresult", "_event_seq": 2},
+        {"role": "assistant", "content": "parent tail", "_event_seq": 3},
+    ]
+    saved = {}
+
+    with_child, child_key = place_preview(
+        canonical,
+        Preview("child summary"),
+        source_start_seq=1,
+        source_end_seq=2,
+        save_preview_blob=saved.setdefault,
+    )
+    child_ref = with_child[0]["content"].split("\n\n", 1)[1]
+    with_parent, parent_key = place_preview(
+        with_child,
+        Preview("parent summary"),
+        source_start_seq=1,
+        source_end_seq=3,
+        save_preview_blob=saved.setdefault,
+    )
+
+    assert child_ref in saved[parent_key]
+    assert f"session://preview/{child_key}" in saved[parent_key]
+    assert with_parent[0]["_source_start_seq"] == 1
+    assert with_parent[0]["_source_end_seq"] == 3
+
+
+def test_disjoint_preview_placements_work():
+    messages = [
+        {"role": "assistant", "content": "one", "_event_seq": 1},
+        {"role": "assistant", "content": "two", "_event_seq": 2},
+        {"role": "assistant", "content": "three", "_event_seq": 3},
+    ]
+
+    projected, _ = place_preview(
+        messages,
+        Preview("first"),
+        source_start_seq=1,
+        source_end_seq=1,
+    )
+    projected, _ = place_preview(
+        projected,
+        Preview("third"),
+        source_start_seq=3,
+        source_end_seq=3,
+    )
+
+    assert message_source_range(projected[0]) == (1, 1)
+    assert message_source_range(projected[1]) == (2, 2)
+    assert message_source_range(projected[2]) == (3, 3)
+
+
+def test_place_preview_supports_multiple_ordered_previews_in_one_replacement():
+    messages = [
+        {"role": "assistant", "content": "one", "_event_seq": 1},
+        {"role": "user", "content": ">>> one\n1", "_event_seq": 2},
+    ]
+    saved = {}
+
+    projected, keys = place_preview(
+        messages,
+        [Preview("first", "first content"), Preview("second", "second content")],
+        source_start_seq=1,
+        source_end_seq=2,
+        save_preview_blob=saved.setdefault,
+    )
+
+    assert keys == [preview_key("first content"), preview_key("second content")]
+    assert list(saved) == keys
+    content = projected[0]["content"]
+    assert content.index("first") < content.index("second")
+    assert message_source_range(projected[0]) == (1, 2)
+
+
+def test_source_aware_placement_rejects_source_less_node_inside_span():
+    messages = [
+        {"role": "assistant", "content": "one", "_event_seq": 1},
+        {"role": "user", "content": "legacy output"},
+        {"role": "assistant", "content": "three", "_event_seq": 3},
+    ]
+
+    try:
+        place_preview(
+            messages,
+            Preview("invalid"),
+            source_start_seq=1,
+            source_end_seq=3,
+        )
+    except PreviewBoundaryError as exc:
+        assert "source-less projected node" in str(exc)
+        assert "[1, 3]" in str(exc)
+    else:
+        raise AssertionError("source-less interior node was silently absorbed")
+
+
+def test_source_aware_placement_rejects_duplicate_boundaries_and_ranges():
+    cases = [
+        [
+            {"role": "assistant", "content": "first", "_event_seq": 1},
+            {"role": "assistant", "content": "duplicate start", "_source_start_seq": 1, "_source_end_seq": 2},
+            {"role": "assistant", "content": "last", "_event_seq": 3},
+        ],
+        [
+            {"role": "assistant", "content": "first", "_event_seq": 1},
+            {"role": "assistant", "content": "duplicate end", "_source_start_seq": 2, "_source_end_seq": 3},
+            {"role": "assistant", "content": "last", "_event_seq": 3},
+        ],
+        [
+            {"role": "assistant", "content": "same", "_source_start_seq": 1, "_source_end_seq": 3},
+            {"role": "assistant", "content": "same again", "_source_start_seq": 1, "_source_end_seq": 3},
+        ],
+    ]
+
+    for messages in cases:
+        try:
+            place_preview(
+                messages,
+                Preview("invalid"),
+                source_start_seq=1,
+                source_end_seq=3,
+            )
+        except PreviewBoundaryError as exc:
+            assert "ambiguous projected" in str(exc)
+        else:
+            raise AssertionError("duplicate source boundary was accepted")
+
+
+def test_production_skips_mixed_provenance_candidate_without_saving():
+    saved = {}
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "request", "_event_seq": 1},
+        {"role": "assistant", "content": "work " * 300, "_event_seq": 2},
+        {"role": "user", "content": ">>> work\n" + ("output " * 200)},
+        {
+            "role": "assistant",
+            "content": "emit('done', release=True)",
+            "_final_result": "done",
+            "_event_seq": 4,
+        },
+    ]
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+        save_preview_blob=saved.setdefault,
+    )
+
+    assert projected == messages
+    assert saved == {}
+
+
+def test_production_skips_invalid_duplicate_source_candidate_safely():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "request", "_event_seq": 1},
+        {"role": "assistant", "content": "work " * 300, "_event_seq": 2},
+        {
+            "role": "user",
+            "content": ">>> work\n" + ("output " * 200),
+            "_source_start_seq": 2,
+            "_source_end_seq": 3,
+        },
+        {
+            "role": "assistant",
+            "content": "emit('done', release=True)",
+            "_final_result": "done",
+            "_event_seq": 4,
+        },
+    ]
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+    )
+
+    assert projected == messages
+
+
+def test_production_normal_pinned_normal_uses_one_ordered_shared_placement(monkeypatch):
+    calls = []
+    original = coalesce_module.place_preview
+
+    def recording_place_preview(messages, previews, **kwargs):
+        calls.append((list(previews), kwargs))
+        return original(messages, previews, **kwargs)
+
+    monkeypatch.setattr(coalesce_module, "place_preview", recording_place_preview)
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "request", "_event_seq": 1},
+        {"role": "assistant", "content": "normal before " * 200, "_event_seq": 2},
+        {"role": "user", "content": ">>> before\n" + ("before output " * 100), "_event_seq": 3},
+        {
+            "role": "assistant",
+            "content": "print('pinned')",
+            "_pinned_coalesce": {"label": "Pinned previous turn"},
+            "_event_seq": 4,
+        },
+        {"role": "user", "content": ">>> print('pinned')\npinned", "_event_seq": 5},
+        {"role": "assistant", "content": "normal after " * 200, "_event_seq": 6},
+        {"role": "user", "content": ">>> after\n" + ("after output " * 100), "_event_seq": 7},
+        {
+            "role": "assistant",
+            "content": "emit('done', release=True)",
+            "_final_result": "done",
+            "_event_seq": 8,
+        },
+    ]
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+    )
+
+    assert len(calls) == 1
+    previews, kwargs = calls[0]
+    assert len(previews) == 3
+    assert [preview.content for preview in previews] == [
+        coalesce_module._preview_content(messages[2:4], None, None),
+        coalesce_module._preview_content(messages[4:6], None, None),
+        coalesce_module._preview_content(messages[6:8], None, None),
+    ]
+    assert kwargs["source_start_seq"] == 2
+    assert kwargs["source_end_seq"] == 7
+    coalesced = next(message for message in projected if message.get("_coalesced"))
+    refs = re.findall(r"session://preview/[0-9a-f]{16}", coalesced["content"])
+    assert refs == [
+        f"session://preview/{preview_key(preview.content)}"
+        for preview in previews
+    ]
+
+
+
+
+def test_coalesce_skips_release_normalization_with_nonmonotonic_event_provenance():
+    saved = {}
+    release_text = "done " * 400
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": "...",
+            "_user_content": "...",
+            "_event_seq": 4452,
+        },
+        {
+            "role": "assistant",
+            "content": "work before release " * 200,
+            "_event_seq": 4453,
+        },
+        {
+            "role": "user",
+            "content": ">>> work before release\n" + ("output " * 300),
+            "_event_seq": 4454,
+        },
+        {
+            "role": "assistant",
+            "content": "more work " * 200,
+            "_event_seq": 4456,
+        },
+        {
+            "role": "user",
+            "content": ">>> more work\n" + ("more output " * 300),
+            "_event_seq": 4457,
+        },
+        {
+            "role": "assistant",
+            "content": "emit(result, release=True)",
+            "_final_result": release_text,
+            "_event_seq": 4459,
+        },
+        {
+            "role": "user",
+            "content": (
+                ">>> final work\n"
+                + ("final output " * 300)
+                + "\n>>> emit(result, release=True)\n"
+                + release_text
+                + "\nNext request"
+            ),
+            "_stdout": (
+                ">>> final work\n"
+                + ("final output " * 300)
+                + "\n>>> emit(result, release=True)\n"
+                + release_text
+            ),
+            "_user_content": "Next request",
+            "_event_seq": 4462,
+        },
+    ]
+
+    normalized = coalesce_module._split_repl_messages_with_appended_user(messages)
+    assert [
+        message_source_range(message)
+        for message in normalized[2:8]
+    ] == [
+        (4453, 4453),
+        (4454, 4454),
+        (4456, 4456),
+        (4457, 4457),
+        (4462, 4462),
+        (4459, 4459),
+    ]
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+        save_preview_blob=saved.setdefault,
+    )
+
+    assert not any(message.get("_coalesced") for message in projected)
+    assert saved == {}
+    assert any(
+        message.get("_event_seq") == 4459
+        and message.get("role") == "assistant"
+        for message in projected
+    )
+    assert any(
+        message.get("_event_seq") == 4462
+        and "final output" in (message.get("content") or "")
+        for message in projected
+    )
+def test_create_persisted_preview_and_recursive_parent(tmp_path):
+    from code_agent.code_agent_coalesce import Preview, PersistedPreviewState, create_persisted_preview
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "one", "_event_seq": 1},
+        {"role": "user", "content": "two", "_event_seq": 2},
+    ]
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "user", "content": "two"}})
+    state = PersistedPreviewState.empty()
+    child_projection, child_key, child_seq, _ = create_persisted_preview(
+        messages, Preview("child summary"),
+        source_start_seq=1, source_end_seq=1,
+        store=store, session_id=session_id, state=state,
+    )
+    parent_projection, parent_key, parent_seq, _ = create_persisted_preview(
+        child_projection, Preview("parent summary"),
+        source_start_seq=1, source_end_seq=2,
+        store=store, session_id=session_id, state=state,
+    )
+
+    assert (child_seq, parent_seq) == (3, 5)
+    assert f"session://preview/{child_key}" in store.get_preview_blob(session_id, parent_key)
+    assert f"session://preview/{parent_key}" in parent_projection[1]["content"]
+    events = store.get_events(session_id)
+    assert events[2]["payload"] == {"preview_key": child_key, "summary": "child summary"}
+    assert events[3]["payload"] == {
+        "preview_event_seq": child_seq,
+        "source_start_seq": 1,
+        "source_end_seq": 1,
+    }
+
+
+def test_same_blob_can_have_distinct_persisted_summaries(tmp_path):
+    from code_agent.code_agent_coalesce import Preview, PersistedPreviewState, create_persisted_preview
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "same", "_event_seq": 1},
+        {"role": "assistant", "content": "same", "_event_seq": 2},
+    ]
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "same"}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": "same"}})
+    state = PersistedPreviewState.empty()
+    projected, first_key, first_seq, _ = create_persisted_preview(
+        messages, Preview("first"), source_start_seq=1, source_end_seq=1,
+        store=store, session_id=session_id, state=state,
+    )
+    _, second_key, second_seq, _ = create_persisted_preview(
+        projected, Preview("second"), source_start_seq=2, source_end_seq=2,
+        store=store, session_id=session_id, state=state,
+    )
+
+    assert first_key == second_key
+    assert first_seq != second_seq
+    created = [e for e in store.get_events(session_id) if e["event_type"] == "preview_created"]
+    assert [e["payload"]["summary"] for e in created] == ["first", "second"]
+
+
+def test_code_agent_base_create_persisted_preview_installs_only_committed_state(tmp_path):
+    from code_agent.agent import CodeAgentBase
+    from code_agent.code_agent_coalesce import Preview, PersistedPreviewState
+    from code_agent.conversation import Conversation
+    from code_agent.session_store import SessionStore
+
+    class Client:
+        pass
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": "two"}})
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent._session_store = store
+    agent._session_id = session_id
+    agent._next_event_seq = 3
+    agent._persisted_preview_state = PersistedPreviewState.empty()
+    agent._pending_session_events = []
+    agent._suspend_persistence = False
+    agent._conversation = Conversation(Client(), "system")
+    agent.conversation.messages.extend([
+        {"role": "assistant", "content": "one", "_event_seq": 1},
+        {"role": "assistant", "content": "two", "_event_seq": 2},
+    ])
+    agent._ensure_live_session = lambda: None
+    agent._flush_pending_session_events = lambda: None
+
+    key, created_seq = agent.create_persisted_preview(
+        Preview("summary"), source_start_seq=1, source_end_seq=1,
+    )
+
+    assert created_seq == 3
+    assert agent._next_event_seq == 5
+    assert agent._persisted_preview_state.active_placements == {(1, 1): 3}
+    assert f"session://preview/{key}" in agent.conversation.messages[1]["content"]
+
+    before_messages = list(agent.conversation.messages)
+    before_state = dict(agent._persisted_preview_state.active_placements)
+    before_events = store.get_events(session_id)
+    agent._next_event_seq = 3
+    with pytest.raises(ValueError, match="stale preview event sequence"):
+        agent.create_persisted_preview(
+            Preview("second"), source_start_seq=2, source_end_seq=2,
+        )
+    assert agent.conversation.messages == before_messages
+    assert agent._persisted_preview_state.active_placements == before_state
+    assert store.get_events(session_id) == before_events
+
+
+
+def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_atomic(tmp_path):
+    from code_agent.agent import CodeAgentBase
+    from code_agent.code_agent_coalesce import Preview, PersistedPreviewState, create_persisted_preview
+    from code_agent.conversation import Conversation
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    class Client:
+        pass
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    raw = [
+        {"role": "user", "content": "Task", "_user_content": "Task"},
+        {"role": "assistant", "content": "work " * 600},
+        {"role": "user", "content": ">>> work\n" + ("output " * 600)},
+        {"role": "assistant", "content": "emit('done', release=True)"},
+    ]
+    for seq, message in enumerate(raw, 1):
+        store.append_event(session_id, seq, "message_added", {"message": message})
+    canonical = [{"role": "system", "content": "system"}] + [
+        dict(message, _event_seq=seq) for seq, message in enumerate(raw, 1)
+    ]
+    _, key, _, _ = create_persisted_preview(
+        canonical, Preview("persisted"), source_start_seq=2, source_end_seq=3,
+        store=store, session_id=session_id, expected_next_seq=5,
+        state=PersistedPreviewState.empty(),
+    )
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent._conversation = Conversation(Client(), "system")
+    agent._expanded_preview_refs = {}
+    agent._session_store = store
+    agent._session_id = session_id
+    agent.code_agent_coalesce_keep_last_execution_interactions = 0
+    agent.code_agent_coalesce_min_savings_chars = 0
+    replay_session_into_agent(agent, session_id, store)
+    before_events = store.get_events(session_id)
+    agent._coalesce_context(protect_last_interactions=False)
+
+    persisted = [message for message in agent.conversation.messages if message.get("_persisted_preview")]
+    assert len(persisted) == 1
+    assert persisted[0]["_source_start_seq"] == 2
+    assert persisted[0]["_source_end_seq"] == 3
+    assert f"session://preview/{key}" in persisted[0]["content"]
+    assert store.get_events(session_id) == before_events
+
+
+def test_module_persistence_requires_complete_authoritative_state(tmp_path):
+    from code_agent.code_agent_coalesce import (
+        Preview,
+        PersistedPreviewState,
+        PreviewPlacementError,
+        create_persisted_preview,
+    )
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": "two"}})
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "one", "_event_seq": 1},
+        {"role": "assistant", "content": "two", "_event_seq": 2},
+    ]
+
+    before = store.get_events(session_id)
+    with pytest.raises(TypeError, match="complete persisted preview state"):
+        create_persisted_preview(
+            messages,
+            Preview("omitted"),
+            source_start_seq=1,
+            source_end_seq=1,
+            store=store,
+            session_id=session_id,
+            state=None,
+        )
+    assert store.get_events(session_id) == before
+
+    state = PersistedPreviewState.empty()
+    projected, _, _, _ = create_persisted_preview(
+        messages,
+        Preview("first"),
+        source_start_seq=1,
+        source_end_seq=1,
+        store=store,
+        session_id=session_id,
+        state=state,
+    )
+    committed = store.get_events(session_id)
+    with store._connect() as conn:
+        committed_keys = [
+            row["key"]
+            for row in conn.execute(
+                "SELECT key FROM session_preview_blobs WHERE session_id = ? ORDER BY key",
+                (session_id,),
+            ).fetchall()
+        ]
+
+    stale = PersistedPreviewState.empty()
+    with pytest.raises(ValueError, match="stale persisted preview state"):
+        create_persisted_preview(
+            projected,
+            Preview("disjoint with stale state"),
+            source_start_seq=2,
+            source_end_seq=2,
+            store=store,
+            session_id=session_id,
+            state=stale,
+        )
+    assert store.get_events(session_id) == committed
+    with store._connect() as conn:
+        assert [
+            row["key"]
+            for row in conn.execute(
+                "SELECT key FROM session_preview_blobs WHERE session_id = ? ORDER BY key",
+                (session_id,),
+            ).fetchall()
+        ] == committed_keys
+    assert stale.definitions == {}
+    assert stale.active_placements == {}
+
+    with pytest.raises(PreviewPlacementError, match="conflict"):
+        create_persisted_preview(
+            projected,
+            Preview("equal-range conflict"),
+            source_start_seq=1,
+            source_end_seq=1,
+            store=store,
+            session_id=session_id,
+            state=state,
+        )
+    assert store.get_events(session_id) == committed
+
+
+def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
+    from code_agent.agent import CodeAgentBase
+    from code_agent.code_agent_coalesce import Preview
+    from code_agent.conversation import Conversation
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    class Client:
+        pass
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {
+        "message": {"role": "assistant", "content": "pre-exec"}
+    })
+    store.append_event(session_id, 2, "exec", {})
+    store.append_event(session_id, 3, "message_added", {
+        "message": {"role": "assistant", "content": "post-exec"}
+    })
+    store.append_event(session_id, 4, "rewind", {"target_seq": 1})
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent._conversation = Conversation(Client(), "system")
+    agent._expanded_preview_refs = {}
+    agent._session_store = store
+    agent._session_id = session_id
+    agent._next_event_seq = 5
+    agent._pending_session_events = []
+    agent._suspend_persistence = False
+    agent._ensure_live_session = lambda: None
+    agent._flush_pending_session_events = lambda: None
+
+    replay_session_into_agent(agent, session_id, store)
+    assert agent._persisted_preview_state.exec_start_seq == 0
+    assert agent.conversation.messages == [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "pre-exec", "_event_seq": 1},
+    ]
+
+    key, created_seq = agent.create_persisted_preview(
+        Preview("restored branch"),
+        source_start_seq=1,
+        source_end_seq=1,
+    )
+    assert created_seq == 5
+    live_messages = agent.conversation.messages
+    live_state = agent._persisted_preview_state
+
+    resumed = CodeAgentBase.__new__(CodeAgentBase)
+    resumed._conversation = Conversation(Client(), "system")
+    resumed._expanded_preview_refs = {}
+    replay_session_into_agent(resumed, session_id, store)
+
+    assert resumed.conversation.messages == live_messages
+    assert resumed._persisted_preview_state == live_state
+    assert resumed._persisted_preview_state.exec_start_seq == 0
+    assert resumed._persisted_preview_state.active_placements == {(1, 1): 5}
+    assert f"session://preview/{key}" in resumed.conversation.messages[1]["content"]
+
+    before = store.get_events(session_id)
+    with pytest.raises(Exception):
+        agent.create_persisted_preview(
+            Preview("cross boundary"),
+            source_start_seq=0,
+            source_end_seq=1,
+        )
+    assert store.get_events(session_id) == before

@@ -99,6 +99,8 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._pending_observations = []
             self._auto_context_attachment_names = set()
             self._expanded_preview_refs = {}
+            from code_agent.code_agent_coalesce import PersistedPreviewState
+            self._persisted_preview_state = PersistedPreviewState.empty()
             self._rg_available = None
             self._rg_warning_printed = False
 
@@ -189,7 +191,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             return None
         print(f"{DIM}Forked session: {new_session_id}{RESET}")
         return new_session_id
-    code_agent_coalesce_min_chars = _get_config_value("code_agent_coalesce_min_chars", 2000)
     code_agent_coalesce_min_savings_chars = _get_config_value("code_agent_coalesce_min_savings_chars", 1000)
     code_agent_coalesce_keep_last_execution_interactions = _get_config_value("code_agent_coalesce_keep_last_execution_interactions", 1)
 
@@ -213,7 +214,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         self.conversation.messages = coalesce_repl_messages(
             self.conversation.messages,
             keep_last_execution_interactions=self.code_agent_coalesce_keep_last_execution_interactions,
-            min_chars=self.code_agent_coalesce_min_chars,
             min_savings_chars=self.code_agent_coalesce_min_savings_chars,
             save_preview_blob=lambda key, content: self._session_store.save_preview_blob(self._session_id, key, content),
             auto_expand_preview_refs=auto_expand_preview_refs,
@@ -284,6 +284,36 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         self._session_store.append_event(self._session_id, seq, event_type, payload)
         self._next_event_seq += 1
         return seq
+
+    def create_persisted_preview(
+        self,
+        preview,
+        *,
+        source_start_seq: int,
+        source_end_seq: int,
+    ) -> tuple[str, int]:
+        from code_agent.code_agent_coalesce import create_persisted_preview
+
+        self._ensure_live_session()
+        self._flush_pending_session_events()
+        state = getattr(self, "_persisted_preview_state", None)
+        if state is None:
+            from code_agent.code_agent_coalesce import PersistedPreviewState
+            state = PersistedPreviewState.empty()
+        projected, key, preview_event_seq, placed_event_seq = create_persisted_preview(
+            self.conversation.messages,
+            preview,
+            source_start_seq=source_start_seq,
+            source_end_seq=source_end_seq,
+            store=self._session_store,
+            session_id=self._session_id,
+            expected_next_seq=self._next_event_seq,
+            state=state,
+        )
+        self.conversation.messages = projected
+        self._persisted_preview_state = state
+        self._next_event_seq = placed_event_seq + 1
+        return key, preview_event_seq
 
     def _record_display_event(self, kind: str, text: str, create_session: bool = False):
         if not text:

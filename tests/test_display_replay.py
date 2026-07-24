@@ -7,6 +7,30 @@ from code_agent.session_replay import replay_display_text
 from code_agent.repl_events import ReplEvent
 
 
+def _append_preview_events(store, session_id, **kwargs):
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT seq, event_type, payload_json FROM session_events WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+    with store._connect() as conn:
+        associated_preview_keys = {
+            row["key"]
+            for row in conn.execute(
+                "SELECT key FROM session_preview_blobs WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+    definitions, placements, exec_start_seq = store._active_persisted_preview_state(
+        rows,
+        associated_preview_keys,
+    )
+    kwargs.setdefault("expected_exec_start_seq", exec_start_seq)
+    kwargs.setdefault("expected_definitions", definitions)
+    kwargs.setdefault("expected_active_placements", placements)
+    return store.append_preview_events(session_id, **kwargs)
+
+
 class DummyStore:
     def __init__(self, events):
         self._events = events
@@ -167,7 +191,6 @@ def test_code_agent_coalesce_suppresses_invalid_escape_parse_warnings():
         coalesce_repl_messages(
             messages,
             keep_last_interactions=0,
-            min_chars=0,
             min_savings_chars=0,
         )
 
@@ -732,3 +755,314 @@ def test_code_agent_diff_history_tool_bridge():
         None,
     )]
     assert repl.acks == [123]
+
+
+def _replay_agent():
+    from code_agent.conversation import Conversation
+
+    class Client:
+        pass
+
+    class Agent:
+        def __init__(self):
+            self.conversation = Conversation(Client(), "system")
+            self._expanded_preview_refs = {}
+
+        def _configure_conversation(self, conversation):
+            conversation.expanded_preview_refs = self._expanded_preview_refs
+
+    return Agent()
+
+
+def test_persisted_preview_replay_does_not_load_blob_content(tmp_path, monkeypatch):
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.save_preview_blob(session_id, "abc", "one")
+    _append_preview_events(store,
+        session_id,
+        expected_next_seq=2,
+        preview_key="abc",
+        summary="summary",
+        source_start_seq=1,
+        source_end_seq=1,
+    )
+    monkeypatch.setattr(store, "get_preview_blob", lambda *args: (_ for _ in ()).throw(AssertionError("blob loaded")))
+
+    agent = _replay_agent()
+    replay_session_into_agent(agent, session_id, store)
+
+    assert len(agent.conversation.messages) == 2
+    assert "[PreviewRef: session://preview/abc]\nsummary\n[/PreviewRef]" in agent.conversation.messages[1]["content"]
+    assert agent.conversation.messages[1]["_persisted_preview"] is True
+
+
+def test_persisted_preview_replay_recursive_rewind_and_inactive_definition(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "user", "content": "two"}})
+    store.save_preview_blob(session_id, "child", "one")
+    _append_preview_events(store,
+        session_id, expected_next_seq=3, preview_key="child", summary="child",
+        source_start_seq=1, source_end_seq=1,
+    )
+    store.save_preview_blob(session_id, "parent", "parent content")
+    _append_preview_events(store,
+        session_id, expected_next_seq=5, preview_key="parent", summary="parent",
+        source_start_seq=1, source_end_seq=2,
+    )
+    store.append_event(session_id, 7, "rewind", {"target_seq": 5})
+
+    agent = _replay_agent()
+    replay_session_into_agent(agent, session_id, store)
+
+    visible = "\n".join(message.get("content", "") for message in agent.conversation.messages)
+    assert "session://preview/child" in visible
+    assert "session://preview/parent" not in visible
+
+
+def test_persisted_preview_replay_rejects_malformed_missing_partial_and_cross_exec(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "old"}})
+    store.append_event(session_id, 2, "exec", {})
+    store.append_event(session_id, 3, "message_added", {"message": {"role": "user", "content": "new"}})
+    store.save_preview_blob(session_id, "abc", "new")
+    store.append_event(session_id, 4, "preview_created", {"preview_key": "abc", "summary": "ok"})
+    store.append_event(session_id, 5, "preview_placed", {
+        "preview_event_seq": 4, "source_start_seq": 1, "source_end_seq": 3,
+    })
+    store.append_event(session_id, 6, "preview_placed", {
+        "preview_event_seq": 999, "source_start_seq": 3, "source_end_seq": 3,
+    })
+    store.append_event(session_id, 7, "preview_created", {
+        "preview_key": "missing", "summary": "bad", "extra": 1,
+    })
+
+    agent = _replay_agent()
+    replay_session_into_agent(agent, session_id, store)
+
+    assert agent.conversation.messages == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "new", "_event_seq": 3},
+    ]
+
+
+def test_rewind_restores_preview_expansion_and_rendered_conversation(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.save_preview_blob(session_id, "abc", "expanded body")
+    uri = "session://preview/abc"
+    store.append_event(session_id, 1, "message_added", {
+        "message": {"role": "user", "content": f"[PreviewRef: {uri}]\nsummary\n[/PreviewRef]"}
+    })
+    store.append_event(session_id, 2, "preview_expanded", {"uri": uri, "numbered": False})
+    store.append_event(session_id, 3, "preview_collapsed", {"uri": uri})
+    store.append_event(session_id, 4, "rewind", {"target_seq": 2})
+
+    agent = _replay_agent()
+    agent.conversation.preview_loader = lambda value: store.get_preview_blob(session_id, value.rsplit("/", 1)[1])
+    replay_session_into_agent(agent, session_id, store)
+
+    assert agent._expanded_preview_refs == {uri: {"numbered": False}}
+    agent.conversation.preview_loader = lambda value: store.get_preview_blob(session_id, value.rsplit("/", 1)[1])
+    assert "expanded body" in agent.conversation._messages()[1]["content"]
+
+
+def test_rewind_restores_collapsed_state_after_later_expand(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    uri = "session://preview/abc"
+    store.save_preview_blob(session_id, "abc", "expanded body")
+    store.append_event(session_id, 1, "message_added", {
+        "message": {"role": "user", "content": f"[PreviewRef: {uri}]\nsummary\n[/PreviewRef]"}
+    })
+    store.append_event(session_id, 2, "preview_expanded", {"uri": uri, "numbered": False})
+    store.append_event(session_id, 3, "preview_collapsed", {"uri": uri})
+    store.append_event(session_id, 4, "preview_expanded", {"uri": uri, "numbered": True})
+    store.append_event(session_id, 5, "rewind", {"target_seq": 3})
+
+    agent = _replay_agent()
+    replay_session_into_agent(agent, session_id, store)
+
+    assert agent._expanded_preview_refs == {}
+    assert "expanded body" not in agent.conversation._messages()[1]["content"]
+
+
+def test_replay_duplicate_is_idempotent_and_same_range_conflict_is_skipped(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    for key in ("a", "b"):
+        store.save_preview_blob(session_id, key, "one")
+    store.append_event(session_id, 2, "preview_created", {"preview_key": "a", "summary": "first"})
+    placement = {"preview_event_seq": 2, "source_start_seq": 1, "source_end_seq": 1}
+    store.append_event(session_id, 3, "preview_placed", placement)
+    store.append_event(session_id, 4, "preview_placed", placement)
+    store.append_event(session_id, 5, "preview_created", {"preview_key": "b", "summary": "second"})
+    store.append_event(session_id, 6, "preview_placed", {
+        "preview_event_seq": 5, "source_start_seq": 1, "source_end_seq": 1,
+    })
+
+    agent = _replay_agent()
+    replay_session_into_agent(agent, session_id, store)
+
+    visible = agent.conversation.messages[1]["content"]
+    assert "session://preview/a" in visible
+    assert "session://preview/b" not in visible
+    assert agent._persisted_preview_state.active_placements == {(1, 1): 2}
+
+
+def test_create_resume_expand_fork_resume_end_to_end(tmp_path):
+    from code_agent.code_agent_coalesce import Preview, PersistedPreviewState, create_persisted_preview
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "body"}})
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "body", "_event_seq": 1},
+    ]
+    projected, key, created_seq, placed_seq = create_persisted_preview(
+        messages, Preview("summary"), source_start_seq=1, source_end_seq=1,
+        store=store, session_id=session_id, expected_next_seq=2,
+        state=PersistedPreviewState.empty(),
+    )
+    assert (created_seq, placed_seq) == (2, 3)
+    assert f"session://preview/{key}" in projected[1]["content"]
+
+    resumed = _replay_agent()
+    replay_session_into_agent(resumed, session_id, store)
+    uri = f"session://preview/{key}"
+    assert uri in resumed.conversation.messages[1]["content"]
+    assert store.get_preview_blob(session_id, key) == "body"
+
+    store.append_event(session_id, 4, "preview_expanded", {"uri": uri, "numbered": False})
+    expanded = _replay_agent()
+    replay_session_into_agent(expanded, session_id, store)
+    expanded.conversation.preview_loader = lambda value: store.get_preview_blob(session_id, value.rsplit("/", 1)[1])
+    assert "body" in expanded.conversation._messages()[1]["content"]
+
+    forked_id = store.fork_session(session_id)
+    forked = _replay_agent()
+    replay_session_into_agent(forked, forked_id, store)
+    forked.conversation.preview_loader = lambda value: store.get_preview_blob(forked_id, value.rsplit("/", 1)[1])
+    assert uri in forked.conversation.messages[1]["content"]
+    assert "body" in forked.conversation._messages()[1]["content"]
+
+
+def test_adversarial_history_shared_authoritative_state_matches_replay_and_allows_creation(tmp_path):
+    from code_agent.agent import CodeAgentBase
+    from code_agent.code_agent_coalesce import Preview
+    from code_agent.conversation import Conversation
+    from code_agent.session_replay import replay_session_into_agent
+    from code_agent.session_store import SessionStore
+
+    class Client:
+        pass
+
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    for key, content in {
+        "valid": "one",
+        "other": "one",
+        "post": "post",
+    }.items():
+        store.save_preview_blob(session_id, key, content)
+
+    events = [
+        (1, "message_added", {"message": {"role": "assistant", "content": "one"}}),
+        (2, "preview_created", {"preview_key": "valid", "summary": "bad", "extra": 1}),
+        (3, "preview_created", {"preview_key": "missing", "summary": "missing"}),
+        (4, "preview_created", {"preview_key": "valid", "summary": ""}),
+        (5, "preview_placed", {"preview_event_seq": 9, "source_start_seq": 1, "source_end_seq": 1}),
+        (6, "preview_created", {"preview_key": "valid", "summary": "bool range"}),
+        (7, "preview_placed", {"preview_event_seq": 6, "source_start_seq": True, "source_end_seq": 1}),
+        (8, "preview_placed", {"preview_event_seq": 9, "source_start_seq": 1, "source_end_seq": 1}),
+        (9, "preview_created", {"preview_key": "valid", "summary": "valid"}),
+        (10, "preview_placed", {"preview_event_seq": 9, "source_start_seq": 1, "source_end_seq": 1}),
+        (11, "preview_created", {"preview_key": "other", "summary": "conflict"}),
+        (12, "preview_placed", {"preview_event_seq": 11, "source_start_seq": 1, "source_end_seq": 1}),
+        (13, "message_added", {"message": {"role": "assistant", "content": "two"}}),
+        (14, "preview_created", {"preview_key": "other", "summary": "partial"}),
+        (15, "preview_placed", {"preview_event_seq": 14, "source_start_seq": 1, "source_end_seq": 13}),
+        (16, "exec", {}),
+        (17, "message_added", {"message": {"role": "assistant", "content": "post"}}),
+        (18, "preview_created", {"preview_key": "post", "summary": "cross exec"}),
+        (19, "preview_placed", {"preview_event_seq": 18, "source_start_seq": 13, "source_end_seq": 17}),
+        (20, "preview_created", {"preview_key": "valid", "summary": "malformed before rewind", "extra": False}),
+        (21, "rewind", {"target_seq": 13}),
+    ]
+    for seq, event_type, payload in events:
+        store.append_event(session_id, seq, event_type, payload)
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent._conversation = Conversation(Client(), "system")
+    agent._expanded_preview_refs = {}
+    agent._session_store = store
+    agent._session_id = session_id
+    agent._next_event_seq = 22
+    agent._pending_session_events = []
+    agent._suspend_persistence = False
+    agent._ensure_live_session = lambda: None
+    agent._flush_pending_session_events = lambda: None
+    replay_session_into_agent(agent, session_id, store)
+
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT seq, event_type, payload_json FROM session_events WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        keys = {
+            row["key"]
+            for row in conn.execute(
+                "SELECT key FROM session_preview_blobs WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+    definitions, placements, exec_start_seq = store._active_persisted_preview_state(rows, keys)
+    assert definitions == agent._persisted_preview_state.definitions
+    assert placements == agent._persisted_preview_state.active_placements
+    assert exec_start_seq == agent._persisted_preview_state.exec_start_seq
+    assert placements == {(1, 1): 9}
+    assert exec_start_seq == 0
+
+    key, created_seq = agent.create_persisted_preview(
+        Preview("later valid"),
+        source_start_seq=13,
+        source_end_seq=13,
+    )
+    assert created_seq == 22
+    assert agent._persisted_preview_state.active_placements == {
+        (1, 1): 9,
+        (13, 13): 22,
+    }
+
+    resumed = CodeAgentBase.__new__(CodeAgentBase)
+    resumed._conversation = Conversation(Client(), "system")
+    resumed._expanded_preview_refs = {}
+    replay_session_into_agent(resumed, session_id, store)
+    assert resumed._persisted_preview_state == agent._persisted_preview_state
+    assert resumed.conversation.messages == agent.conversation.messages
+    assert f"session://preview/{key}" in resumed.conversation.messages[-1]["content"]

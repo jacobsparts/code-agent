@@ -4,6 +4,7 @@ import contextlib
 import copy
 import re
 import warnings
+from .persisted_preview_state import PersistedPreviewTransitions
 from .repl_attachment_mixin import MemoryAttachment, decode_attachment_refs
 
 
@@ -107,6 +108,8 @@ def replay_session_into_agent(agent, session_id: str, store):
     base_dir = (session or {}).get("cwd")
 
     snapshots = {}
+    persisted_transitions = PersistedPreviewTransitions()
+    persisted_preview_state = persisted_transitions.state
     snapshot_seqs = {
         event["payload"]["target_seq"]
         for event in events
@@ -122,7 +125,11 @@ def replay_session_into_agent(agent, session_id: str, store):
 
     def snapshot(seq):
         if seq in snapshot_seqs:
-            snapshots[seq] = copy.deepcopy(messages)
+            snapshots[seq] = (
+                copy.deepcopy(messages),
+                copy.deepcopy(persisted_preview_state),
+                copy.deepcopy(agent._expanded_preview_refs),
+            )
 
     snapshot(0)
     for event in events:
@@ -170,6 +177,38 @@ def replay_session_into_agent(agent, session_id: str, store):
                         "label": payload.get("label") or "Pinned previous turn"
                     }
                     break
+        elif event_type in {"preview_created", "preview_placed"}:
+            def apply_persisted_placement(
+                _preview_event_seq,
+                definition,
+                source_start_seq,
+                source_end_seq,
+            ):
+                nonlocal messages
+                from code_agent.code_agent_coalesce import (
+                    PreviewPlacementError,
+                    apply_preview_placement,
+                )
+                try:
+                    messages = apply_preview_placement(
+                        messages,
+                        preview_key=definition[0],
+                        summary=definition[1],
+                        source_start_seq=source_start_seq,
+                        source_end_seq=source_end_seq,
+                    )
+                except PreviewPlacementError:
+                    return False
+                return True
+
+            persisted_transitions.apply(
+                seq=seq,
+                event_type=event_type,
+                payload=payload,
+                has_preview_blob=lambda key: store.has_preview_blob(session_id, key),
+                apply_placement=apply_persisted_placement,
+            )
+            persisted_preview_state = persisted_transitions.state
         elif event_type == "preview_expanded":
             uri = payload.get("uri")
             if uri:
@@ -180,10 +219,41 @@ def replay_session_into_agent(agent, session_id: str, store):
                 agent._expanded_preview_refs.pop(uri, None)
         elif event_type == "rewind":
             target_seq = payload["target_seq"]
-            messages = copy.deepcopy(snapshots.get(target_seq, snapshots[0]))
+            restored = copy.deepcopy(snapshots.get(target_seq, snapshots[0]))
+            messages, _, expanded_preview_refs = restored
+            persisted_transitions.apply(
+                seq=seq,
+                event_type=event_type,
+                payload=payload,
+                has_preview_blob=lambda key: store.has_preview_blob(session_id, key),
+            )
+            persisted_preview_state = persisted_transitions.state
+            agent._expanded_preview_refs = expanded_preview_refs
+            if hasattr(agent, "_configure_conversation"):
+                agent._configure_conversation(agent.conversation)
         elif event_type == "exec":
-            messages = copy.deepcopy(snapshots[0])
+            messages, _, _ = copy.deepcopy(snapshots[0])
+            persisted_transitions.apply(
+                seq=seq,
+                event_type=event_type,
+                payload=payload,
+                has_preview_blob=lambda key: store.has_preview_blob(session_id, key),
+            )
+            persisted_preview_state = persisted_transitions.state
             agent._expanded_preview_refs.clear()
+        if event_type not in {
+            "preview_created",
+            "preview_placed",
+            "rewind",
+            "exec",
+        }:
+            persisted_transitions.apply(
+                seq=seq,
+                event_type=event_type,
+                payload=payload,
+                has_preview_blob=lambda key: store.has_preview_blob(session_id, key),
+            )
+            persisted_preview_state = persisted_transitions.state
         snapshot(seq)
 
     final_missing = []
@@ -204,6 +274,7 @@ def replay_session_into_agent(agent, session_id: str, store):
         if "_attachments" in msg and not msg["_attachments"]:
             del msg["_attachments"]
     agent.conversation.messages = messages
+    agent._persisted_preview_state = persisted_preview_state
     deduped = []
     seen = set()
     for item in final_missing:
