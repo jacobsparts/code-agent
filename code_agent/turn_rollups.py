@@ -496,7 +496,7 @@ def eligible_rollup_units(
 
 
 def eligible_rollup_line(units: list[RollupUnit]) -> str:
-    if not units:
+    if sum(len(unit.turn_ids) for unit in units) < 2:
         return ""
     entries = [
         str(unit.start_turn)

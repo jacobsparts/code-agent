@@ -13,6 +13,7 @@ from code_agent.persisted_preview_state import PersistedPreviewState
 from code_agent.session_store import SessionStore, utc_now_iso
 from code_agent.turn_rollups import (
     CompletedTurn,
+    RollupUnit,
     completed_turns,
     eligible_rollup_line,
     eligible_rollup_units,
@@ -278,6 +279,18 @@ def test_active_child_is_atomic_and_eligibility_line_is_single_ordered_line():
         f"Eligible rollup turns: {ids[0]}, {ids[1]}-{ids[2]}, {ids[3]}, {ids[4]}"
     )
     assert eligible_rollup_line([]) == ""
+
+
+def test_eligibility_line_hides_a_single_completed_turn():
+    unit = RollupUnit(6, 6, 6, 7, (6,))
+
+    assert eligible_rollup_line([unit]) == ""
+
+
+def test_eligibility_line_keeps_one_atomic_multi_turn_unit():
+    unit = RollupUnit(6, 14, 6, 15, (6, 10, 14))
+
+    assert eligible_rollup_line([unit]) == "Eligible rollup turns: 6-14"
 
 
 def test_structured_stdout_is_not_a_turn_and_counts_as_execution():
