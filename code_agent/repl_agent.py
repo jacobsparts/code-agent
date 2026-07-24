@@ -51,6 +51,21 @@ def _parse_silently(code: str, filename: str = '<unknown>') -> ast.AST:
         return ast.parse(code, filename=filename)
 
 
+def _join_native_repl_code(*parts: str) -> str:
+    return "\n".join(part.rstrip("\n") for part in parts if part)
+
+
+def _strip_native_repl_prefix(code: str, prefix: str) -> str:
+    if not prefix:
+        return code
+    if code == prefix:
+        return ""
+    prefix_with_newline = prefix.rstrip("\n") + "\n"
+    if code.startswith(prefix_with_newline):
+        return code[len(prefix_with_newline):]
+    return code
+
+
 _EVENT_PREFIX = "[[CODE_AGENT_EVENT:"
 _EVENT_SUFFIX = "]]"
 
@@ -1000,6 +1015,7 @@ Call help(function_name) for parameter descriptions.
             return self.llm_client.text_call(self.conversation._messages())
 
 
+
     def run_loop(self, max_turns: int = 50, max_syntax_retries: int = 3) -> Any:
         """
         Main agent loop using REPL-first paradigm.
@@ -1070,12 +1086,47 @@ Call help(function_name) for parameter descriptions.
                     if not content:
                         break
 
-                    output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)
+                    native_calls = resp.get("_repl_execute_calls")
+                    if native_calls:
+                        prefix = resp.get("_repl_execute_prefix") or ""
+                        outputs = []
+                        events = []
+                        corrected_calls = []
+                        pure_syntax_error = False
+                        for call_index, call in enumerate(native_calls):
+                            call_code = call.get("code") or ""
+                            execution_code = _join_native_repl_code(
+                                prefix if call_index == 0 else "",
+                                call_code,
+                            )
+                            call_output, call_syntax_error, call_events, corrected_code = (
+                                self._execute_with_tool_handling(repl, execution_code)
+                            )
+                            outputs.append(call_output)
+                            events.extend(call_events)
+                            corrected_calls.append({
+                                "id": call.get("id"),
+                                "code": _strip_native_repl_prefix(
+                                    corrected_code,
+                                    prefix if call_index == 0 else "",
+                                ),
+                            })
+                            pure_syntax_error = pure_syntax_error or call_syntax_error
+                        output = "".join(outputs)
+                        resp["_tool_call_outputs"] = outputs
+                        resp["_repl_execute_calls"] = corrected_calls
+                        content = _join_native_repl_code(
+                            prefix,
+                            *(call["code"] for call in corrected_calls),
+                        )
+                        resp["content"] = content
+                    else:
+                        output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)
 
-                    # Apply silent corrections to conversation (both sides see corrected code)
-                    if corrected_code != content:
-                        resp['content'] = corrected_code
-                        content = corrected_code
+                        # Apply silent corrections to conversation (both sides see corrected code)
+                        if corrected_code != content:
+                            resp['content'] = corrected_code
+                            content = corrected_code
 
                     if not pure_syntax_error:
                         break

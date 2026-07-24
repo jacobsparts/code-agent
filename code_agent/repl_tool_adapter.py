@@ -54,6 +54,7 @@ def normalize_openai_repl_response(message):
         return {"role": "assistant", "content": f"emit({text!r}, release=True)"}
 
     parts = []
+    calls = []
     if content:
         parts.append(f"emit({content!r})")
 
@@ -76,11 +77,14 @@ def normalize_openai_repl_response(message):
         if not isinstance(code, str):
             raise ReplExecuteResponseError("repl_execute code must be a string")
         parts.append(code)
+        calls.append({"id": call.get("id"), "code": code})
 
     return {
         "role": "assistant",
         "content": _join_python(parts),
-        "_tool_call_ids": [call.get("id") for call in tool_calls],
+        "_tool_call_ids": [call["id"] for call in calls],
+        "_repl_execute_calls": calls,
+        "_repl_execute_prefix": f"emit({content!r})" if content else "",
     }
 
 
@@ -143,20 +147,33 @@ def project_openai_repl_messages(messages):
             index += 1
             continue
 
-        code = message.get("content") or ""
-        call_number += 1
-        call_id = (message.get("_tool_call_ids") or [None])[0] or f"repl_{call_number:06d}"
+        calls = message.get("_repl_execute_calls")
+        if calls:
+            normalized_calls = []
+            for call in calls:
+                call_number += 1
+                normalized_calls.append({
+                    "id": call.get("id") or f"repl_{call_number:06d}",
+                    "code": call.get("code") or "",
+                })
+        else:
+            call_number += 1
+            normalized_calls = [{
+                "id": (message.get("_tool_call_ids") or [None])[0] or f"repl_{call_number:06d}",
+                "code": message.get("content") or "",
+            }]
+
         projected.append({
             "role": "assistant",
             "content": None,
             "tool_calls": [{
-                "id": call_id,
+                "id": call["id"],
                 "type": "function",
                 "function": {
                     "name": "repl_execute",
-                    "arguments": json.dumps({"code": code}),
+                    "arguments": json.dumps({"code": call["code"]}),
                 },
-            }],
+            } for call in normalized_calls],
         })
 
         output = ""
@@ -167,7 +184,15 @@ def project_openai_repl_messages(messages):
                 pending_human_input,
             )
             index += 1
-        projected.append({"role": "tool", "tool_call_id": call_id, "content": output})
+        call_outputs = message.get("_tool_call_outputs")
+        if call_outputs is None:
+            call_outputs = [output] + [""] * (len(normalized_calls) - 1)
+        for call, call_output in zip(normalized_calls, call_outputs):
+            projected.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": call_output,
+            })
         projected.extend({"role": "user", "content": value} for value in human_inputs)
         pending_human_input = human_inputs[-1] if human_inputs else None
         index += 1

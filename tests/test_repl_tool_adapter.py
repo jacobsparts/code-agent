@@ -25,6 +25,8 @@ def test_tool_call_normalizes_to_python():
         "role": "assistant",
         "content": "x = 1",
         "_tool_call_ids": ["provider-id"],
+        "_repl_execute_calls": [{"id": "provider-id", "code": "x = 1"}],
+        "_repl_execute_prefix": "",
     }
 
 
@@ -36,6 +38,10 @@ def test_text_and_multiple_calls_are_joined_safely():
     })
     assert result["content"] == "emit(\"I'll inspect it.\")\nx = 1\nprint(x)"
     assert result["_tool_call_ids"] == ["provider-id", "provider-id"]
+    assert result["_repl_execute_calls"] == [
+        {"id": "provider-id", "code": "x = 1"},
+        {"id": "provider-id", "code": "print(x)"},
+    ]
 
 
 def test_raw_python_and_text_fallbacks():
@@ -95,6 +101,42 @@ def test_projection_reuses_provider_tool_call_id():
 
     assert result[0]["tool_calls"][0]["id"] == "provider-call-123"
     assert result[1]["tool_call_id"] == "provider-call-123"
+
+
+def test_projection_returns_one_result_per_native_call_id():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "x = 1\nprint(x)",
+            "_repl_execute_calls": [
+                {"id": "call-1", "code": "x = 1"},
+                {"id": "call-2", "code": "print(x)"},
+            ],
+            "_tool_call_outputs": [
+                ">>> x = 1\n",
+                ">>> print(x)\n1\n",
+            ],
+        },
+        {
+            "role": "user",
+            "content": ">>> x = 1\n>>> print(x)\n1\n",
+            "_stdout": ">>> x = 1\n>>> print(x)\n1\n",
+        },
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert [call["id"] for call in result[0]["tool_calls"]] == ["call-1", "call-2"]
+    assert result[1] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": ">>> x = 1\n",
+    }
+    assert result[2] == {
+        "role": "tool",
+        "tool_call_id": "call-2",
+        "content": ">>> print(x)\n1\n",
+    }
 
 
 def test_projection_splits_appended_human_input():
