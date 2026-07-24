@@ -225,6 +225,39 @@ def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
     assert ">>> observe(value)\n'[Continuing...]'" in canonical
     assert "Observations:" not in canonical
 
+def test_transition_boundary_observation_is_used_without_changing_preview_blob():
+    saved = {}
+    transition = "observe('stage summary', transition=True)"
+    messages = _source_tagged_interaction([
+        {"role": "assistant", "content": "work\n" + ("x" * 2500)},
+        {"role": "user", "content": ">>> work\n" + ("y" * 2500)},
+        {
+            "role": "assistant",
+            "content": transition,
+            "_observations": ["stage summary"],
+            "_observation_transition": True,
+        },
+        {
+            "role": "user",
+            "content": f">>> {transition}\n'[Continuing...]'\n",
+        },
+        {"role": "assistant", "content": "emit('done', release=True)"},
+    ])
+
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+        save_preview_blob=saved.setdefault,
+    )
+
+    coalesced = next(message for message in projected if message.get("_coalesced"))
+    assert "Observations:\n- stage summary" in coalesced["content"]
+    canonical = next(iter(saved.values()))
+    assert "stage summary" not in canonical
+    assert transition not in canonical
+
 
 def test_pinned_and_normal_sections_keep_their_own_observations():
     messages = [

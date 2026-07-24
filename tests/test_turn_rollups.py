@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from code_agent.code_agent_coalesce import coalesce_repl_messages
+from code_agent.code_agent_coalesce import make_preview_replacement
 from code_agent.code_agent_coalesce import message_source_range
+from code_agent.code_agent_coalesce import replace_projected_span
+from code_agent.code_agent_coalesce import select_projected_span
+from code_agent.code_agent_coalesce import semantic_segments
 from code_agent.conversation import Conversation
 from code_agent.session_replay import replay_session_into_agent
 from code_agent.persisted_preview_state import PersistedPreviewState
@@ -17,6 +21,7 @@ from code_agent.turn_rollups import (
     completed_turns,
     eligible_rollup_line,
     eligible_rollup_units,
+    render_semantic_labels,
     render_turn_labels,
     rollup_units,
 )
@@ -163,6 +168,245 @@ def test_conversation_labels_active_turn_on_first_call_without_mutation():
     assert conversation._messages()[-1]["content"] == "# Turn 23\n\nactive"
     assert conversation.messages[-1]["content"] == "active"
     assert conversation._messages()[-1]["content"] == "# Turn 23\n\nactive"
+
+def test_transition_marker_is_provider_only_exactly_once_on_first_following_call():
+    conversation = Conversation(None, "system")
+    transition = {
+        "role": "assistant",
+        "content": "observe('stage done', transition=True)",
+        "_event_seq": 7,
+        "_observation_transition": True,
+    }
+    output = output_message(">>> observe('stage done', transition=True)\n'[Continuing...]'\n")
+    output["_event_seq"] = 8
+    output["_repl_output_for"] = 7
+    task = {"role": "user", "content": "task", "_event_seq": 1}
+    conversation.messages.extend([task, transition, output])
+    conversation.messages_projector = render_semantic_labels
+    original = copy.deepcopy(conversation.messages)
+
+    first = conversation._messages()
+    second = conversation._messages()
+
+    assert [message["content"] for message in first].count("# Checkpoint 7") == 1
+    assert first[-1]["content"] == "# Checkpoint 7"
+    assert second == first
+    assert conversation.messages == original
+
+
+def test_malformed_transition_metadata_does_not_create_marker_or_segment():
+    events = [
+        event(1, input_message("task")),
+        event(2, {"role": "assistant", "content": "work", "_observation_transition": "true"}),
+        event(3, output_message()),
+        event(4, release_message()),
+    ]
+
+    assert [turn.turn_id for turn in completed_turns(events)] == [1]
+    assert not any(
+        message.get("_provider_checkpoint")
+        for message in render_semantic_labels(projected_messages(events))
+    )
+
+
+def test_completed_segments_use_mixed_turn_checkpoint_identity_and_ranges():
+    events = [
+        event(1, input_message("task")),
+        event(2, {
+            "role": "assistant",
+            "content": "observe('one', transition=True)",
+            "_observation_transition": True,
+        }),
+        event(3, {
+            **output_message(
+                ">>> observe('one', transition=True)\n'[Continuing...]'\nfirst output"
+            ),
+            "_repl_output_for": 2,
+        }),
+        event(4, {
+            "role": "assistant",
+            "content": "observe('two', transition=True)",
+            "_observation_transition": True,
+        }),
+        event(5, {
+            **output_message(
+                ">>> observe('two', transition=True)\n'[Continuing...]'\nsecond output"
+            ),
+            "_repl_output_for": 4,
+        }),
+        event(6, release_message()),
+        event(7, output_message("release output")),
+    ]
+
+    assert completed_turns(events) == [
+        CompletedTurn(1, 1, 3, True, "turn"),
+        CompletedTurn(2, 4, 5, True, "checkpoint"),
+        CompletedTurn(4, 6, 7, False, "checkpoint"),
+    ]
+
+def test_persisted_child_preserves_later_canonical_checkpoint_marker():
+    events = [
+        event(1, input_message("task")),
+        event(2, {
+            "role": "assistant",
+            "content": "observe('one', transition=True)",
+            "_observation_transition": True,
+        }),
+        event(3, {
+            **output_message(
+                ">>> observe('one', transition=True)\n'[Continuing...]'\n"
+            ),
+            "_repl_output_for": 2,
+        }),
+        event(4, {
+            "role": "assistant",
+            "content": "observe('two', transition=True)",
+            "_observation_transition": True,
+        }),
+        event(5, {
+            **output_message(
+                ">>> observe('two', transition=True)\n'[Continuing...]'\n"
+            ),
+            "_repl_output_for": 4,
+        }),
+        event(6, release_message()),
+    ]
+    projection = projected_messages(events)
+    span = select_projected_span(
+        projection,
+        source_start_seq=1,
+        source_end_seq=3,
+    )
+    child = make_preview_replacement(
+        ["[PreviewRef: session://preview/child]\nchild\n[/PreviewRef]"],
+        projection[span.start_index:span.end_index],
+        source_start_seq=1,
+        source_end_seq=3,
+    )
+    child.update({
+        "_persisted_preview": True,
+        "_preview_event_seq": 20,
+    })
+    projection = replace_projected_span(projection, span, child)
+
+    rendered = render_semantic_labels(projection)
+
+    assert [
+        message["content"]
+        for message in rendered
+        if message.get("_provider_checkpoint")
+    ] == ["# Checkpoint 4"]
+    assert "# Checkpoint 2" not in [message.get("content") for message in rendered]
+
+
+def test_transition_output_mismatch_missing_and_ambiguity_are_non_authoritative():
+    base = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task", "_event_seq": 1},
+        {
+            "role": "assistant",
+            "content": "observe('stage', transition=True)",
+            "_event_seq": 2,
+            "_observation_transition": True,
+        },
+    ]
+    cases = [
+        {
+            **output_message("unrelated output"),
+            "_event_seq": 3,
+        },
+        {
+            **output_message(
+                ">>> observe('stage', transition=True)\n'[Continuing...]'\n"
+            ),
+            "_event_seq": 200,
+        },
+        output_message(
+            ">>> observe('stage', transition=True)\n'[Continuing...]'\n"
+        ),
+    ]
+
+    for output in cases:
+        messages = [*copy.deepcopy(base), output]
+        segments = semantic_segments(messages)
+        assert segments and segments[0].authoritative is False
+        assert not any(
+            message.get("_provider_checkpoint")
+            for message in render_semantic_labels(messages)
+        )
+
+    duplicated = [
+        *copy.deepcopy(base),
+        {
+            **output_message(
+                ">>> observe('stage', transition=True)\n'[Continuing...]'\n"
+            ),
+            "_event_seq": 3,
+        },
+        {"role": "assistant", "content": "duplicate", "_event_seq": 3},
+    ]
+    assert semantic_segments(duplicated)[0].authoritative is False
+
+
+def test_duplicate_and_colliding_transition_identity_is_non_authoritative():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task", "_event_seq": 2},
+        {
+            "role": "assistant",
+            "content": "observe('stage', transition=True)",
+            "_event_seq": 2,
+            "_observation_transition": True,
+        },
+        {
+            **output_message(
+                ">>> observe('stage', transition=True)\n'[Continuing...]'\n"
+            ),
+            "_event_seq": 3,
+            "_repl_output_for": 2,
+        },
+    ]
+
+    assert semantic_segments(messages)[0].authoritative is False
+    assert not any(
+        message.get("_provider_checkpoint")
+        for message in render_semantic_labels(messages)
+    )
+
+
+def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
+    conversation = Conversation(None, "system")
+    conversation.messages.extend([
+        {"role": "user", "content": "task", "_event_seq": 1},
+        {
+            "role": "assistant",
+            "content": "observe('stage', transition=True)",
+            "_event_seq": 2,
+            "_observation_transition": True,
+        },
+        {
+            **output_message(
+                ">>> observe('stage', transition=True)\n"
+                "'[Continuing...]'\n"
+                "[Attachment: notes.txt]\n"
+                "[PreviewRef: session://preview/child]\nsummary\n[/PreviewRef]"
+            ),
+            "_event_seq": 3,
+            "_attachments": {"notes.txt": "body"},
+            "_repl_output_for": 2,
+        },
+    ])
+    conversation.messages_projector = render_semantic_labels
+    conversation.ephemeral = "EPHEMERAL CONTEXT"
+    original = copy.deepcopy(conversation.messages)
+
+    rendered = conversation._messages()
+
+    assert rendered[-1]["content"] == "# Checkpoint 2"
+    assert rendered[-2]["content"].startswith("EPHEMERAL CONTEXT\n\n")
+    assert "body" in rendered[-2]["content"]
+    assert "[PreviewRef: session://preview/child]" in rendered[-2]["content"]
+    assert conversation.messages == original
 
 
 def test_completed_turn_ranges_use_release_output_or_release_assistant():
@@ -1321,6 +1565,62 @@ def test_replay_resume_rewind_and_fork_keep_canonical_turn_labels(tmp_path):
     assert store.get_events(session_id)[-1]["payload"]["message"]["content"] == "replacement"
     assert store.get_events(fork_id)[-1]["payload"]["message"]["content"] == "replacement"
 
+def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_path):
+    class ReplayAgent:
+        def __init__(self):
+            self.conversation = Conversation(None, "system")
+            self._expanded_preview_refs = {}
+
+        def _configure_conversation(self, conversation):
+            conversation.messages_projector = render_semantic_labels
+
+    store = SessionStore(str(tmp_path / "transition-sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    transition = {
+        "role": "assistant",
+        "content": "observe('stage', transition=True)",
+        "_observation_transition": True,
+    }
+    for item in [
+        event(1, input_message("task")),
+        event(2, transition),
+        event(3, {
+            **output_message(
+                ">>> observe('stage', transition=True)\n'[Continuing...]'\ntransition output"
+            ),
+            "_repl_output_for": 2,
+        }),
+        event(4, release_message()),
+    ]:
+        store.append_event(
+            session_id, item["seq"], item["event_type"], copy.deepcopy(item["payload"])
+        )
+
+    resumed = ReplayAgent()
+    replay_session_into_agent(resumed, session_id, store)
+    fork_id = store.fork_session(session_id)
+    forked = ReplayAgent()
+    replay_session_into_agent(forked, fork_id, store)
+
+    assert completed_turns(store.get_events(session_id)) == [
+        CompletedTurn(1, 1, 3, True, "turn"),
+        CompletedTurn(2, 4, 4, False, "checkpoint"),
+    ]
+    assert resumed.conversation._messages() == forked.conversation._messages()
+    assert sum(
+        message.get("content") == "# Checkpoint 2"
+        for message in resumed.conversation._messages()
+    ) == 1
+
+    store.append_event(session_id, 5, "rewind", {"target_seq": 1})
+    rewound = ReplayAgent()
+    replay_session_into_agent(rewound, session_id, store)
+    assert completed_turns(store.get_events(session_id)) == []
+    assert not any(
+        message.get("_provider_checkpoint")
+        for message in rewound.conversation._messages()
+    )
+
 
 def test_system_prompt_contains_stable_stage_three_guidance():
     from code_agent.agent import CodeAgentBase
@@ -1348,6 +1648,10 @@ def test_system_prompt_contains_stable_stage_three_guidance():
     ]
     for text in assertions:
         assert text in prompt
+
+    assert "# Checkpoint" in prompt
+    assert "transition=True" in prompt
+    assert "does not release control" in prompt
 
 
 def _rollup_test_agent(events, tmp_path):
@@ -1412,6 +1716,63 @@ def test_rollup_tool_has_exact_callable_schema():
         ("end_turn", int, True),
         ("summary", str, True),
     ]
+
+def test_observe_transition_schema_is_strict_bool_and_commits_atomically():
+    from code_agent.agent import CodeAgent
+
+    agent = CodeAgent.__new__(CodeAgent)
+    agent._pending_observations = []
+    agent._pending_observation_transition = False
+    persisted = []
+    agent._persist_message = persisted.append
+
+    signature = inspect.signature(CodeAgent.observe)
+    assert signature.parameters["content"].annotation is str
+    assert signature.parameters["content"].default == "Reflection on previous substantive work"
+    assert signature.parameters["transition"].annotation is bool
+    assert signature.parameters["transition"].default is False
+
+    for value in (1, 0, "true", None):
+        with pytest.raises(TypeError, match="must be a boolean"):
+            agent.observe("invalid", transition=value)
+    assert agent._pending_observations == []
+    assert agent._pending_observation_transition is False
+
+    agent.observe("stage complete", transition=True)
+    message = {"role": "assistant", "content": "work"}
+    agent._on_assistant_message_committed(message)
+
+    assert message == {
+        "role": "assistant",
+        "content": "work",
+        "_observations": ["stage complete"],
+        "_observation_transition": True,
+    }
+    assert persisted == [message]
+    assert agent._pending_observations == []
+    assert agent._pending_observation_transition is False
+
+
+def test_observe_transition_retry_and_abandonment_state_does_not_leak():
+    from code_agent.agent import CodeAgent
+
+    agent = CodeAgent.__new__(CodeAgent)
+    agent._pending_observations = []
+    agent._pending_observation_transition = False
+    agent._persist_message = lambda message: None
+
+    agent.observe("discarded attempt", transition=True)
+    agent._start_assistant_execution_attempt()
+    retry_message = {"role": "assistant", "content": "retry"}
+    agent._on_assistant_message_committed(retry_message)
+    assert "_observations" not in retry_message
+    assert "_observation_transition" not in retry_message
+
+    agent.observe("interrupted attempt", transition=True)
+    agent._start_assistant_execution_attempt()
+    later_message = {"role": "assistant", "content": "later"}
+    agent._on_assistant_message_committed(later_message)
+    assert "_observation_transition" not in later_message
 
 
 def test_rollup_maps_nonconsecutive_canonical_units_and_calls_persistence_once(monkeypatch):

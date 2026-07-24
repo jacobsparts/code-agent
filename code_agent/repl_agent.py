@@ -1200,7 +1200,7 @@ Call help(function_name) for parameter descriptions.
                 output_for_llm = self.process_repl_output(output_for_llm)
 
             # Store full output as _stdout when it differs from filtered content
-            kwargs = {}
+            kwargs = {"_repl_output": True}
             if output_for_llm != output:
                 kwargs['_stdout'] = output
 
@@ -1209,6 +1209,7 @@ Call help(function_name) for parameter descriptions.
                 self.usermsg(output_for_llm, **kwargs)
             else:
                 self._last_was_repl_output = False
+                kwargs.pop("_repl_output", None)
                 self.usermsg("# [no output]", **kwargs)
 
             if self.complete:

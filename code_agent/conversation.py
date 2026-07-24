@@ -15,8 +15,14 @@ class Conversation:
 
         rendered_preview_refs = []
 
+        messages_projector = getattr(self, "messages_projector", None)
+        projected_messages = (
+            messages_projector(self.messages)
+            if messages_projector is not None
+            else self.messages
+        )
         message_projector = getattr(self, "message_projector", None)
-        for msg in self.messages:
+        for msg in projected_messages:
             out = message_projector(msg) if message_projector is not None else dict(msg)
             attachments = out.pop('_attachments', None)
             if attachments:
@@ -43,7 +49,10 @@ class Conversation:
         ephemeral = "\n\n".join(ephemeral_parts)
         if ephemeral:
             for i in range(len(result) - 1, -1, -1):
-                if result[i].get("role") == "user":
+                if (
+                    result[i].get("role") == "user"
+                    and not result[i].get("_provider_checkpoint")
+                ):
                     out = dict(result[i])
                     content = out.get("content", "")
                     out["content"] = ephemeral + ("\n\n" + content if content else "")

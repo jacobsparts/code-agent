@@ -6,7 +6,9 @@ import pytest
 from code_agent.agent import CodeAgent
 from code_agent.conversation import Conversation
 from code_agent.repl_events import ReplEvent
+from code_agent.session_message_state import reduce_canonical_message_events
 from code_agent.session_store import SessionStore
+from code_agent.turn_rollups import render_semantic_labels
 
 
 class DummyClient:
@@ -210,7 +212,10 @@ def test_observe_appears_in_generated_tool_help():
     agent = make_agent()
     prompt = agent._build_system_prompt()
 
-    assert "observe(content: str) - Record a reflective observation about previous work." in prompt
+    assert (
+        "observe(content: str, transition: bool = False) - "
+        "Record a reflective observation about previous work."
+    ) in prompt
 
 
 def test_observe_relay_captures_runtime_expression_and_arbitrary_value():
@@ -255,6 +260,207 @@ def test_observations_before_runtime_error_remain_on_committed_message():
     assert pure_syntax_error is False
     assert "RuntimeError: later failure" in output
     assert message["_observations"] == ["kept"]
+
+def test_transition_before_runtime_error_remains_on_committed_message():
+    agent = make_agent()
+    agent.complete = False
+    agent._start_assistant_execution_attempt()
+    repl = agent._get_tool_repl()
+    try:
+        output, pure_syntax_error, _, _ = agent._execute_with_tool_handling(
+            repl,
+            "observe('kept transition', transition=True)\n"
+            "raise RuntimeError('later failure')",
+        )
+    finally:
+        repl.close()
+
+    message = {
+        "role": "assistant",
+        "content": (
+            "observe('kept transition', transition=True)\n"
+            "raise RuntimeError('later failure')"
+        ),
+    }
+    agent._on_assistant_message_committed(message)
+
+    assert pure_syntax_error is False
+    assert "RuntimeError: later failure" in output
+    assert message["_observations"] == ["kept transition"]
+    assert message["_observation_transition"] is True
+
+def test_live_ordinary_repl_output_gets_transition_association_without_stdout():
+    agent = make_agent()
+    agent._start_assistant_execution_attempt()
+    agent.observe("ordinary output transition", transition=True)
+    assistant = {
+        "role": "assistant",
+        "content": "observe('ordinary output transition', transition=True)",
+    }
+    agent._on_assistant_message_committed(assistant)
+    assistant["_event_seq"] = 2
+    agent._pending_repl_output_for = 2
+
+    agent.usermsg("ordinary output", _repl_output=True)
+
+    output = agent.conversation.messages[-1]
+    assert "_stdout" not in output
+    assert output["_render_segments"] == [
+        {"type": "stdout", "content": "ordinary output"}
+    ]
+    assert output["_repl_output_for"] == assistant["_event_seq"]
+
+
+def test_replay_reconstructs_ordinary_output_association_without_stdout():
+    events = [
+        {
+            "seq": 1,
+            "event_type": "message_added",
+            "payload": {
+                "message": {
+                    "role": "user",
+                    "content": "task",
+                    "_user_content": "task",
+                    "_render_segments": [{"type": "input", "content": "task"}],
+                }
+            },
+        },
+        {
+            "seq": 2,
+            "event_type": "message_added",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "observe('stage', transition=True)",
+                    "_observation_transition": True,
+                }
+            },
+        },
+        {
+            "seq": 3,
+            "event_type": "message_added",
+            "payload": {
+                "message": {
+                    "role": "user",
+                    "content": "ordinary output",
+                    "_render_segments": [
+                        {"type": "stdout", "content": "ordinary output"}
+                    ],
+                }
+            },
+        },
+    ]
+
+    messages, _ = reduce_canonical_message_events(events)
+
+    assert "_stdout" not in messages[-1]
+    assert messages[-1]["_repl_output_for"] == 2
+    assert [
+        message["content"]
+        for message in render_semantic_labels(messages)
+        if message.get("_provider_checkpoint")
+    ] == ["# Checkpoint 2"]
+    assert "_repl_output_for" not in events[2]["payload"]["message"]
+
+
+def test_replay_does_not_associate_non_output_user_or_synthetic_messages():
+    transition = {
+        "seq": 1,
+        "event_type": "message_added",
+        "payload": {
+            "message": {
+                "role": "assistant",
+                "content": "observe('stage', transition=True)",
+                "_observation_transition": True,
+            }
+        },
+    }
+    candidates = [
+        {
+            "role": "user",
+            "content": "ordinary input",
+            "_user_content": "ordinary input",
+            "_render_segments": [{"type": "input", "content": "ordinary input"}],
+        },
+        {
+            "role": "user",
+            "content": "[PreviewRef: session://preview/x]",
+            "_synthetic": True,
+            "_render_segments": [{"type": "stdout", "content": "preview"}],
+        },
+        {
+            "role": "user",
+            "content": "[Attachment: file.txt]",
+            "_attachment_refs": {"file.txt": "file.txt"},
+        },
+    ]
+
+    for candidate in candidates:
+        messages, _ = reduce_canonical_message_events([
+            transition,
+            {
+                "seq": 2,
+                "event_type": "message_added",
+                "payload": {"message": candidate},
+            },
+        ])
+        assert "_repl_output_for" not in messages[-1]
+
+
+def test_run_loop_ordinary_output_without_stdout_has_first_checkpoint_marker():
+    agent = make_agent()
+    calls = []
+    responses = iter([
+        {
+            "role": "assistant",
+            "content": "observe('stage', transition=True)",
+        },
+        {
+            "role": "assistant",
+            "content": "emit('done', release=True)",
+        },
+    ])
+
+    def text_call(messages):
+        calls.append(messages)
+        return next(responses)
+
+    def execute(repl, content):
+        if content.startswith("observe"):
+            agent.observe("stage", transition=True)
+            text = ">>> observe('stage', transition=True)\n'[Continuing...]'\n"
+            return text, False, [ReplEvent(kind="output", text=text)], content
+        agent.complete = True
+        agent._final_result = "done"
+        text = ">>> emit('done', release=True)\ndone\n"
+        return text, False, [ReplEvent(kind="output", text=text)], content
+
+    agent.llm_client.text_call = text_call
+    event_seq = iter(range(1, 20))
+    agent._persist_message = lambda message: message.setdefault(
+        "_event_seq", next(event_seq)
+    )
+    agent._ensure_setup = lambda: None
+    agent._get_tool_repl = lambda: object()
+    agent._execute_with_tool_handling = execute
+    agent.build_output_for_llm = lambda events: events[0].text
+    agent.process_output_for_llm = lambda output: output
+    agent._configure_conversation(agent.conversation)
+
+    assert agent.run_loop(max_turns=2) == "done"
+
+    ordinary_output = agent.conversation.messages[2]
+    assert "_stdout" not in ordinary_output
+    transition_seq = next(
+        message["_event_seq"]
+        for message in agent.conversation.messages
+        if message.get("_observation_transition") is True
+    )
+    assert ordinary_output["_repl_output_for"] == transition_seq
+    assert any(
+        message.get("content") == f"# Checkpoint {transition_seq}"
+        for message in calls[1]
+    )
 
 
 def test_new_execution_attempt_discards_uncommitted_observations():

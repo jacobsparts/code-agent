@@ -98,6 +98,8 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._display_capture = []
             self._pending_unviewed_files = set()
             self._pending_observations = []
+            self._pending_observation_transition = False
+            self._pending_repl_output_for = None
             self._auto_context_attachment_names = set()
             self._expanded_preview_refs = {}
             from code_agent.code_agent_coalesce import PersistedPreviewState
@@ -649,7 +651,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         for key, value in message.items():
             if key in {'images', 'audio'}:
                 msg[key] = encode_media(value)
-            elif key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary', '_observations'}:
+            elif key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary', '_observations', '_observation_transition'}:
                 msg[key] = copy.deepcopy(value)
 
         refs = message.get('_attachment_refs')
@@ -953,11 +955,12 @@ def _code_agent_send_rg_available():
         return attachments
 
     def _configure_conversation(self, conversation):
-        from code_agent.turn_rollups import render_turn_labels
+        from code_agent.turn_rollups import render_semantic_labels
 
         conversation.expanded_preview_refs = self._expanded_preview_refs
         conversation.preview_loader = self._preview_blob_content
-        conversation.message_projector = render_turn_labels
+        conversation.messages_projector = render_semantic_labels
+        conversation.message_projector = None
         conversation.ephemeral_provider = self._rollup_eligibility_ephemeral
 
     def _preview_blob_content(self, uri: str) -> str:
@@ -1182,13 +1185,22 @@ def _code_agent_send_rg_available():
 
     def _start_assistant_execution_attempt(self):
         self._pending_observations = []
+        self._pending_observation_transition = False
+        self._pending_repl_output_for = None
 
     def _on_assistant_message_committed(self, message: dict):
         observations = list(getattr(self, "_pending_observations", []))
+        transition = getattr(self, "_pending_observation_transition", False) is True
         if observations:
             message["_observations"] = observations
+        if transition:
+            message["_observation_transition"] = True
         self._pending_observations = []
+        self._pending_observation_transition = False
         self._persist_message(message)
+        self._pending_repl_output_for = (
+            message.get("_event_seq") if transition else None
+        )
 
     def build_output_for_llm(self, events: list[ReplEvent]) -> str:
         """Build LLM output, converting complete reads to attachments and large statement output to previews."""
@@ -1447,6 +1459,10 @@ def _code_agent_send_rg_available():
 
     def usermsg(self, content, **kwargs):
         """Override to attach pending images and read-attachments."""
+        output_for = getattr(self, "_pending_repl_output_for", None)
+        if output_for is not None and kwargs.get("_repl_output") is True:
+            kwargs["_repl_output_for"] = output_for
+        self._pending_repl_output_for = None
         if getattr(self, '_pending_explicit_attachment_refs', None):
             refs = kwargs.get('_attachment_refs', {})
             refs.update(self._pending_explicit_attachment_refs)
@@ -1670,6 +1686,15 @@ when a more recent result makes it newly relevant.
 
 Observations survive coalescing and become the visible summary in collapsed
 previews, replacing default code excerpts.
+
+Use observe(..., transition=True) only when the preceding work completes a
+distinct task or architectural stage with an independently useful outcome.
+Include outcomes, decisions, verification, and unresolved concerns. Do not mark
+routine exploration, commands, progress updates, minor discoveries, failed
+intermediate attempts, think() calls, or ordinary observations as transitions.
+A transition closes the current segment after the committing execution and its
+REPL output. It does not release control. A `# Checkpoint N` marker identifies
+the new active segment on the next model call.
 
 think() is a scratchpad for the current turn—transient reasoning, planning,
 and continuation. think() content is not promoted during coalescing.
@@ -3016,12 +3041,20 @@ class CodeAgent(MCPMixin, CodeAgentBase):
 
 
     @REPLAgent.tool
-    def observe(self, content: str = "Reflection on previous substantive work"):
+    def observe(
+        self,
+        content: str = "Reflection on previous substantive work",
+        transition: bool = False,
+    ):
         """Record a reflective observation about previous work."""
+        if type(transition) is not bool:
+            raise TypeError("Observation transition must be a boolean.")
         text = str(content)
         if not text.strip():
             raise ValueError("Observation content must not be empty.")
         self._pending_observations.append(text)
+        if transition:
+            self._pending_observation_transition = True
         return "[Continuing...]"
 
     @REPLAgent.tool(inject=True)

@@ -13,6 +13,8 @@ from code_agent.code_agent_coalesce import (
     normalize_repl_messages,
     render_preview_ref,
     select_projected_span,
+    semantic_boundaries,
+    semantic_segments,
 )
 from code_agent.persisted_preview_state import PersistedPreviewState
 from code_agent.session_message_state import reduce_canonical_message_events
@@ -24,6 +26,7 @@ class CompletedTurn:
     source_start_seq: int
     source_end_seq: int
     has_execution: bool
+    identity_kind: str = "turn"
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,36 @@ def _input_segments(message: dict) -> list[tuple[str, int]]:
     if isinstance(content, str) and content and type(seq) is int:
         return [(content, seq)]
     return []
+
+
+def render_semantic_labels(messages: list[dict]) -> list[dict]:
+    projected = [copy.deepcopy(message) for message in messages]
+    markers = {}
+    for boundary in semantic_boundaries(projected).values():
+        if (
+            boundary.authoritative
+            and boundary.is_transition
+            and type(boundary.transition_seq) is int
+        ):
+            marker_index = (
+                boundary.boundary_output_index
+                if boundary.boundary_output_index is not None
+                else boundary.boundary_index
+            )
+            markers[marker_index] = boundary.transition_seq
+
+    out = []
+    for index, message in enumerate(projected):
+        out.append(render_turn_labels(message))
+        checkpoint = markers.get(index)
+        if checkpoint is not None:
+            out.append({
+                "role": "user",
+                "content": f"# Checkpoint {checkpoint}",
+                "_synthetic": True,
+                "_provider_checkpoint": True,
+            })
+    return out
 
 
 def render_turn_labels(message: dict) -> dict:
@@ -129,65 +162,20 @@ def _canonical_input_seq(message: dict) -> int | None:
 
 def completed_turns(events: list[dict]) -> list[CompletedTurn]:
     messages, exec_start_seq = _canonical_messages(events)
-    completed = []
-    start_index = None
-    start_seq = None
-    previous_release_output = None
-    for index, message in enumerate(messages):
-        seq = message.get("_event_seq")
-        if index == previous_release_output:
-            continue
-        if message.get("_synthetic") and not message.get("_virtual_interaction_boundary"):
-            continue
-        input_seq = _canonical_input_seq(message)
-        if input_seq is not None:
-            start_index = index
-            start_seq = input_seq
-            continue
+    return [
+        CompletedTurn(
+            segment.segment_id,
+            segment.source_start_seq,
+            segment.source_end_seq,
+            segment.has_execution,
+            segment.identity_kind,
+        )
+        for segment in semantic_segments(messages)
         if (
-            start_index is not None
-            and message.get("role") == "assistant"
-            and is_release_assistant_message(message)
-        ):
-            release_output_index = None
-            if index + 1 < len(messages):
-                following = messages[index + 1]
-                if (
-                    following.get("role") == "user"
-                    and is_repl_output_message(following)
-                    and not _input_segments(following)
-                    and not (
-                        following.get("_synthetic")
-                        and not following.get("_coalesced")
-                    )
-                ):
-                    release_output_index = index + 1
-            end_message = (
-                messages[release_output_index]
-                if release_output_index is not None
-                else message
-            )
-            end_seq = end_message.get("_event_seq")
-            between = messages[start_index + 1:index]
-            has_execution = (
-                any(item.get("role") == "assistant" for item in between)
-                and any(
-                    item.get("role") == "user" and is_repl_output_message(item)
-                    for item in between
-                )
-            )
-            if (
-                type(start_seq) is int
-                and type(end_seq) is int
-                and exec_start_seq < start_seq <= end_seq
-            ):
-                completed.append(
-                    CompletedTurn(start_seq, start_seq, end_seq, has_execution)
-                )
-            start_index = None
-            start_seq = None
-            previous_release_output = release_output_index
-    return completed
+            segment.authoritative
+            and exec_start_seq < segment.source_start_seq <= segment.source_end_seq
+        )
+    ]
 
 
 def _outer_active_placements(active_placements: dict) -> list[tuple[int, int]]:
