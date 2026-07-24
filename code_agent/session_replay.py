@@ -4,8 +4,14 @@ import contextlib
 import copy
 import re
 import warnings
-from .persisted_preview_state import PersistedPreviewTransitions
+from dataclasses import dataclass
+from types import SimpleNamespace
+from .persisted_preview_state import PersistedPreviewState, PersistedPreviewTransitions
 from .repl_attachment_mixin import MemoryAttachment, decode_attachment_refs
+from .session_message_state import (
+    apply_canonical_message_transition,
+    coalesce_adjacent_user_messages,
+)
 
 
 @contextlib.contextmanager
@@ -57,41 +63,7 @@ def _load_attachment_map(refs: dict, missing: list[tuple[str, object]], store=No
 
 
 def _coalesce_user_messages(messages: list[dict]) -> list[dict]:
-    out = []
-    for msg in messages:
-        if msg.get("role") == "user" and out and out[-1].get("role") == "user":
-            prev = out[-1]
-            prev.setdefault("_render_segments", []).extend(msg.get("_render_segments") or [])
-            prev_content = prev.get("content", "")
-            new_content = msg.get("content", "")
-            sep = "" if not prev_content or prev_content.endswith("\n") else "\n"
-            merged = prev_content + sep + new_content
-            if not merged.endswith("\n"):
-                merged += "\n"
-            prev["content"] = merged
-            if msg.get("_stdout"):
-                prev_stdout = prev.get("_stdout", "")
-                sep_s = "" if not prev_stdout or prev_stdout.endswith("\n") else "\n"
-                stdout_merged = prev_stdout + sep_s + msg["_stdout"]
-                if not stdout_merged.endswith("\n"):
-                    stdout_merged += "\n"
-                prev["_stdout"] = stdout_merged
-            if msg.get("_user_content") is not None:
-                prev["_user_content"] = msg["_user_content"]
-            for k in ("images", "audio"):
-                if msg.get(k):
-                    prev[k] = (prev.get(k) or []) + msg[k]
-            if msg.get("_attachment_refs"):
-                refs = prev.get("_attachment_refs") or {}
-                refs.update(msg["_attachment_refs"])
-                prev["_attachment_refs"] = refs
-            if msg.get("_attachments"):
-                attachments = prev.get("_attachments") or {}
-                attachments.update(msg["_attachments"])
-                prev["_attachments"] = attachments
-        else:
-            out.append(msg)
-    return out
+    return coalesce_adjacent_user_messages(messages)
 
 
 def _decode_media(value):
@@ -102,7 +74,7 @@ def _decode_media(value):
     return value
 
 
-def replay_session_into_agent(agent, session_id: str, store):
+def _replay_session_into_target(agent, session_id: str, store):
     events = store.get_events(session_id)
     session = store.get_session(session_id) if hasattr(store, "get_session") else None
     base_dir = (session or {}).get("cwd")
@@ -113,7 +85,9 @@ def replay_session_into_agent(agent, session_id: str, store):
     snapshot_seqs = {
         event["payload"]["target_seq"]
         for event in events
-        if event["event_type"] == "rewind"
+        if event.get("event_type") == "rewind"
+        and isinstance(event.get("payload"), dict)
+        and type(event["payload"].get("target_seq")) is int
     }
     snapshot_seqs.add(0)
     messages = [copy.deepcopy(agent.conversation.messages[0])]
@@ -133,11 +107,17 @@ def replay_session_into_agent(agent, session_id: str, store):
 
     snapshot(0)
     for event in events:
-        seq = event["seq"]
-        payload = event["payload"]
-        event_type = event["event_type"]
-        if event_type == "message_added":
-            msg = copy.deepcopy(payload["message"])
+        seq = event.get("seq")
+        if type(seq) is not int:
+            continue
+        payload = event.get("payload")
+        event_type = event.get("event_type")
+        if event_type == "message_added" and isinstance(payload, dict):
+            raw_message = payload.get("message")
+            if not isinstance(raw_message, dict):
+                snapshot(seq)
+                continue
+            msg = copy.deepcopy(raw_message)
             for key in ("images", "audio"):
                 if msg.get(key):
                     msg[key] = _decode_media(msg[key])
@@ -150,34 +130,20 @@ def replay_session_into_agent(agent, session_id: str, store):
                 msg["_attachment_refs"] = refs
                 for item in local_missing:
                     missing_seen.add(item)
-            msg["_event_seq"] = seq
-            for seg in reversed(msg.get("_render_segments") or []):
-                if "_event_seq" not in seg:
-                    seg["_event_seq"] = seq
-                    break
-            messages.append(msg)
-        elif event_type == "attachment_invalidated":
-            name = payload["name"]
-            for msg in messages:
-                attachments = msg.get("_attachments")
-                if attachments and name in attachments:
-                    del attachments[name]
-                    if not attachments:
-                        del msg["_attachments"]
-                refs = msg.get("_attachment_refs")
-                if refs and name in refs:
-                    del refs[name]
-                    if not refs:
-                        del msg["_attachment_refs"]
-        elif event_type == "message_pinned":
-            target_seq = payload.get("message_event_seq")
-            for msg in reversed(messages):
-                if msg.get("_event_seq") == target_seq:
-                    msg["_pinned_coalesce"] = {
-                        "label": payload.get("label") or "Pinned previous turn"
-                    }
-                    break
-        elif event_type in {"preview_created", "preview_placed"}:
+            apply_canonical_message_transition(
+                messages,
+                event_type=event_type,
+                payload={"message": msg},
+                event_seq=seq,
+            )
+        elif event_type in {"attachment_invalidated", "message_pinned"}:
+            apply_canonical_message_transition(
+                messages,
+                event_type=event_type,
+                payload=payload,
+                event_seq=seq,
+            )
+        elif event_type in {"preview_created", "preview_placed"} and isinstance(payload, dict):
             def apply_persisted_placement(
                 _preview_event_seq,
                 definition,
@@ -192,6 +158,7 @@ def replay_session_into_agent(agent, session_id: str, store):
                 try:
                     messages = apply_preview_placement(
                         messages,
+                        preview_event_seq=_preview_event_seq,
                         preview_key=definition[0],
                         summary=definition[1],
                         source_start_seq=source_start_seq,
@@ -209,29 +176,30 @@ def replay_session_into_agent(agent, session_id: str, store):
                 apply_placement=apply_persisted_placement,
             )
             persisted_preview_state = persisted_transitions.state
-        elif event_type == "preview_expanded":
+        elif event_type == "preview_expanded" and isinstance(payload, dict):
             uri = payload.get("uri")
             if uri:
                 agent._expanded_preview_refs[uri] = {"numbered": bool(payload.get("numbered", False))}
-        elif event_type == "preview_collapsed":
+        elif event_type == "preview_collapsed" and isinstance(payload, dict):
             uri = payload.get("uri")
             if uri:
                 agent._expanded_preview_refs.pop(uri, None)
-        elif event_type == "rewind":
-            target_seq = payload["target_seq"]
-            restored = copy.deepcopy(snapshots.get(target_seq, snapshots[0]))
-            messages, _, expanded_preview_refs = restored
-            persisted_transitions.apply(
-                seq=seq,
-                event_type=event_type,
-                payload=payload,
-                has_preview_blob=lambda key: store.has_preview_blob(session_id, key),
-            )
-            persisted_preview_state = persisted_transitions.state
-            agent._expanded_preview_refs = expanded_preview_refs
-            if hasattr(agent, "_configure_conversation"):
-                agent._configure_conversation(agent.conversation)
-        elif event_type == "exec":
+        elif event_type == "rewind" and isinstance(payload, dict):
+            target_seq = payload.get("target_seq")
+            if type(target_seq) is int:
+                restored = copy.deepcopy(snapshots.get(target_seq, snapshots[0]))
+                messages, _, expanded_preview_refs = restored
+                persisted_transitions.apply(
+                    seq=seq,
+                    event_type=event_type,
+                    payload=payload,
+                    has_preview_blob=lambda key: store.has_preview_blob(session_id, key),
+                )
+                persisted_preview_state = persisted_transitions.state
+                agent._expanded_preview_refs = expanded_preview_refs
+                if hasattr(agent, "_configure_conversation"):
+                    agent._configure_conversation(agent.conversation)
+        elif event_type == "exec" and isinstance(payload, dict):
             messages, _, _ = copy.deepcopy(snapshots[0])
             persisted_transitions.apply(
                 seq=seq,
@@ -241,7 +209,7 @@ def replay_session_into_agent(agent, session_id: str, store):
             )
             persisted_preview_state = persisted_transitions.state
             agent._expanded_preview_refs.clear()
-        if event_type not in {
+        if isinstance(payload, dict) and event_type not in {
             "preview_created",
             "preview_placed",
             "rewind",
@@ -283,6 +251,10 @@ def replay_session_into_agent(agent, session_id: str, store):
             deduped.append(item)
             seen.add(key)
     return deduped
+
+
+def replay_session_into_agent(agent, session_id: str, store):
+    return _replay_session_into_target(agent, session_id, store)
 
 
 def _extract_released_assistant_text(msg: dict) -> str:

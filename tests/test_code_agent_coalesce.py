@@ -7,6 +7,7 @@ import code_agent.code_agent_coalesce as coalesce_module
 from code_agent.code_agent_coalesce import Preview
 from code_agent.code_agent_coalesce import PreviewBoundaryError
 from code_agent.code_agent_coalesce import coalesce_repl_messages
+from code_agent.code_agent_coalesce import deterministic_interaction_replacement
 from code_agent.code_agent_coalesce import message_source_range
 from code_agent.code_agent_coalesce import place_preview
 from code_agent.code_agent_coalesce import preview_key
@@ -31,6 +32,110 @@ def five_interactions():
     for i in range(5):
         messages.extend(interaction(i))
     return messages
+
+
+def _source_tagged_interaction(body):
+    messages = [
+        {
+            "role": "system",
+            "content": "system",
+        },
+        {
+            "role": "user",
+            "content": "Task",
+            "_user_content": "Task",
+            "_event_seq": 1,
+            "_render_segments": [
+                {"type": "input", "content": "Task", "_event_seq": 1}
+            ],
+        },
+    ]
+    for seq, message in enumerate(body, start=2):
+        message = dict(message, _event_seq=seq)
+        if message.get("role") == "user" and "_render_segments" not in message:
+            message["_render_segments"] = [
+                {"type": "stdout", "content": message["content"], "_event_seq": seq}
+            ]
+        messages.append(message)
+    return messages
+
+
+def test_shared_deterministic_derivation_matches_production_ordinary():
+    messages = _source_tagged_interaction([
+        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
+        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
+        {"role": "assistant", "content": "emit('done', release=True)"},
+    ])
+
+    derived, keys, materialized = deterministic_interaction_replacement(
+        messages,
+        source_start_seq=2,
+        source_end_seq=3,
+    )
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=1,
+    )
+
+    assert derived == next(message for message in projected if message.get("_coalesced"))
+    assert keys == list(materialized)
+    assert all("_preview_event_seq" not in message for message in projected)
+
+
+def test_shared_derivation_matches_pinned_attachments_observations_and_nested_refs():
+    nested_uri = "session://preview/nested"
+    nested = (
+        f"[PreviewRef: {nested_uri}]\n"
+        "nested summary\n"
+        "[/PreviewRef]"
+    )
+    messages = _source_tagged_interaction([
+        {
+            "role": "assistant",
+            "content": "normal work\n" + ("x" * 2500),
+            "_observations": ["Normal observation."],
+            "_attachments": {"a.py": "body"},
+            "_attachment_refs": {"b.py": "session://preview/blob"},
+        },
+        {
+            "role": "user",
+            "content": f">>> normal\n{nested}\n" + ("y" * 2500),
+        },
+        {
+            "role": "assistant",
+            "content": "pinned work",
+            "_pinned_coalesce": {"label": "Pinned"},
+            "_observations": ["Pinned observation."],
+        },
+        {"role": "user", "content": ">>> pinned\npinned\n"},
+        {"role": "assistant", "content": "emit('done', release=True)"},
+    ])
+    preserved = {nested_uri: nested}
+
+    derived, keys, materialized = deterministic_interaction_replacement(
+        messages,
+        source_start_seq=2,
+        source_end_seq=5,
+        preserve_preview_refs=preserved,
+    )
+    projected = coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=1,
+        preserve_preview_refs=preserved,
+    )
+
+    assert derived == next(message for message in projected if message.get("_coalesced"))
+    assert len(keys) == 2
+    assert set(keys) == set(materialized)
+    assert derived["_attachments"] == {"a.py": "body"}
+    assert derived["_attachment_refs"] == {"b.py": "session://preview/blob"}
+    assert nested in derived["content"]
+    assert "Normal observation." in derived["content"]
+    assert "Pinned observation." in derived["content"]
 
 
 def test_render_preview_ref_uses_observations_instead_of_excerpt():
@@ -1325,7 +1430,7 @@ def test_coalesce_skips_release_normalization_with_nonmonotonic_event_provenance
         },
     ]
 
-    normalized = coalesce_module._split_repl_messages_with_appended_user(messages)
+    normalized = coalesce_module.normalize_repl_messages(messages)
     assert [
         message_source_range(message)
         for message in normalized[2:8]
@@ -1358,6 +1463,77 @@ def test_coalesce_skips_release_normalization_with_nonmonotonic_event_provenance
         and "final output" in (message.get("content") or "")
         for message in projected
     )
+def test_structured_appended_input_with_trailing_newline_is_not_duplicated():
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": "plain output\nNext request\n",
+            "_stdout": "plain output\n",
+            "_user_content": "Next request\n",
+            "_event_seq": 12,
+            "_render_segments": [
+                {
+                    "type": "stdout",
+                    "content": "plain output\n",
+                    "_event_seq": 11,
+                },
+                {
+                    "type": "input",
+                    "content": "Next request\n",
+                    "_event_seq": 12,
+                },
+            ],
+        },
+    ]
+
+    normalized = coalesce_module.normalize_repl_messages(messages)
+
+    assert [message["content"] for message in normalized[1:]] == [
+        "plain output\n",
+        "Next request\n",
+    ]
+    assert all("_preview_event_seq" not in message for message in normalized)
+    assert normalized[1]["_render_segments"] == [
+        {
+            "type": "stdout",
+            "content": "plain output\n",
+            "_event_seq": 11,
+        }
+    ]
+    assert normalized[2]["_render_segments"] == [
+        {
+            "type": "input",
+            "content": "Next request\n",
+            "_event_seq": 12,
+        }
+    ]
+    assert message_source_range(normalized[1]) == (11, 11)
+    assert message_source_range(normalized[2]) == (12, 12)
+    assert sum(
+        message.get("content", "").count("Next request")
+        for message in normalized
+    ) == 1
+
+
+def test_structured_stdout_is_authoritative_without_repl_prompt_text():
+    stdout = {
+        "role": "user",
+        "content": "# [no output]",
+        "_render_segments": [{"type": "stdout", "content": "# [no output]"}],
+    }
+    plain = {
+        "role": "user",
+        "content": "plain output",
+        "_render_segments": [{"type": "stdout", "content": "plain output"}],
+    }
+
+    assert coalesce_module.is_repl_output_message(stdout)
+    assert coalesce_module.is_repl_output_message(plain)
+    assert coalesce_module.human_inputs(stdout) == []
+    assert coalesce_module.human_inputs(plain) == []
+
+
 def test_create_persisted_preview_and_recursive_parent(tmp_path):
     from code_agent.code_agent_coalesce import Preview, PersistedPreviewState, create_persisted_preview
     from code_agent.session_store import SessionStore
@@ -1385,6 +1561,8 @@ def test_create_persisted_preview_and_recursive_parent(tmp_path):
 
     assert (child_seq, parent_seq) == (3, 5)
     assert f"session://preview/{child_key}" in store.get_preview_blob(session_id, parent_key)
+    assert child_projection[1]["_preview_event_seq"] == child_seq
+    assert parent_projection[1]["_preview_event_seq"] == parent_seq
     assert f"session://preview/{parent_key}" in parent_projection[1]["content"]
     events = store.get_events(session_id)
     assert events[2]["payload"] == {"preview_key": child_key, "summary": "child summary"}
@@ -1460,6 +1638,7 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
     assert created_seq == 3
     assert agent._next_event_seq == 5
     assert agent._persisted_preview_state.active_placements == {(1, 1): 3}
+    assert agent.conversation.messages[1]["_preview_event_seq"] == 3
     assert f"session://preview/{key}" in agent.conversation.messages[1]["content"]
 
     before_messages = list(agent.conversation.messages)
@@ -1669,6 +1848,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     assert resumed._persisted_preview_state == live_state
     assert resumed._persisted_preview_state.exec_start_seq == 0
     assert resumed._persisted_preview_state.active_placements == {(1, 1): 5}
+    assert resumed.conversation.messages[1]["_preview_event_seq"] == 5
     assert f"session://preview/{key}" in resumed.conversation.messages[1]["content"]
 
     before = store.get_events(session_id)

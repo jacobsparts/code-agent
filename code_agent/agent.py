@@ -24,6 +24,7 @@ import termios
 import copy
 import re
 from typing import Optional
+from types import SimpleNamespace
 from pathlib import Path
 from queue import Empty
 from code_agent.repl_agent import REPLAgent
@@ -193,6 +194,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         return new_session_id
     code_agent_coalesce_min_savings_chars = _get_config_value("code_agent_coalesce_min_savings_chars", 1000)
     code_agent_coalesce_keep_last_execution_interactions = _get_config_value("code_agent_coalesce_keep_last_execution_interactions", 1)
+    code_agent_rollup_summary_max_chars = _get_config_value("code_agent_rollup_summary_max_chars", 4000)
 
     def _coalesce_context(
         self,
@@ -285,6 +287,81 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         self._next_event_seq += 1
         return seq
 
+    def _authoritative_persisted_projection(self):
+        from code_agent.code_agent_coalesce import coalesce_repl_messages, message_source_range
+        from code_agent.conversation import Conversation
+
+        if not self._session_id:
+            raise RuntimeError("persisted projection requires a live session")
+
+        system_message = copy.deepcopy(self.conversation.messages[0])
+        target = SimpleNamespace(
+            conversation=Conversation(None, system_message.get("content", "")),
+            _expanded_preview_refs={},
+        )
+        target.conversation.messages[0] = system_message
+        replay_session_into_agent(target, self._session_id, self._session_store)
+
+        projected = coalesce_repl_messages(
+            target.conversation.messages,
+            keep_last_execution_interactions=self.code_agent_coalesce_keep_last_execution_interactions,
+            min_savings_chars=self.code_agent_coalesce_min_savings_chars,
+        )
+
+        live_by_provenance = {}
+        for message in self.conversation.messages:
+            source_range = message_source_range(message)
+            refs = message.get("_attachment_refs")
+            if source_range is not None and isinstance(refs, dict):
+                live_by_provenance.setdefault(
+                    (source_range, repr(sorted(refs.items()))),
+                    [],
+                ).append(message)
+
+        for message in projected:
+            source_range = message_source_range(message)
+            refs = message.get("_attachment_refs")
+            if source_range is None or not isinstance(refs, dict):
+                continue
+            matches = live_by_provenance.get(
+                (source_range, repr(sorted(refs.items()))),
+                [],
+            )
+            if len(matches) != 1:
+                continue
+            attachments = matches[0].get("_attachments")
+            if isinstance(attachments, dict):
+                message["_attachments"] = copy.deepcopy(attachments)
+
+        return projected, copy.deepcopy(target._persisted_preview_state)
+
+    def _create_persisted_preview_from_projection(
+        self,
+        messages,
+        state,
+        preview,
+        *,
+        source_start_seq: int,
+        source_end_seq: int,
+        expected_next_seq: int,
+    ) -> tuple[str, int]:
+        from code_agent.code_agent_coalesce import create_persisted_preview
+
+        projected, key, preview_event_seq, placed_event_seq = create_persisted_preview(
+            messages,
+            preview,
+            source_start_seq=source_start_seq,
+            source_end_seq=source_end_seq,
+            store=self._session_store,
+            session_id=self._session_id,
+            expected_next_seq=expected_next_seq,
+            state=state,
+        )
+        self.conversation.messages = projected
+        self._persisted_preview_state = state
+        self._next_event_seq = placed_event_seq + 1
+        return key, preview_event_seq
+
     def create_persisted_preview(
         self,
         preview,
@@ -292,28 +369,131 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         source_start_seq: int,
         source_end_seq: int,
     ) -> tuple[str, int]:
-        from code_agent.code_agent_coalesce import create_persisted_preview
-
         self._ensure_live_session()
         self._flush_pending_session_events()
         state = getattr(self, "_persisted_preview_state", None)
         if state is None:
-            from code_agent.code_agent_coalesce import PersistedPreviewState
+            from code_agent.persisted_preview_state import PersistedPreviewState
             state = PersistedPreviewState.empty()
-        projected, key, preview_event_seq, placed_event_seq = create_persisted_preview(
+        return self._create_persisted_preview_from_projection(
             self.conversation.messages,
+            state,
             preview,
             source_start_seq=source_start_seq,
             source_end_seq=source_end_seq,
-            store=self._session_store,
-            session_id=self._session_id,
             expected_next_seq=self._next_event_seq,
-            state=state,
         )
-        self.conversation.messages = projected
-        self._persisted_preview_state = state
-        self._next_event_seq = placed_event_seq + 1
-        return key, preview_event_seq
+
+    @REPLAgent.tool
+    def rollup(self, start_turn: int, end_turn: int, summary: str):
+        """Replace an eligible interval of completed turns with a persisted preview summary."""
+        from code_agent.code_agent_coalesce import Preview
+        from code_agent.turn_rollups import (
+            eligible_rollup_units,
+            rollup_units,
+            validate_rollup_interval,
+        )
+
+        if type(start_turn) is not int or type(end_turn) is not int:
+            raise TypeError("rollup endpoints must be integers.")
+        if not isinstance(summary, str):
+            raise TypeError("rollup summary must be a string.")
+        if not summary.strip():
+            raise ValueError("rollup summary must not be blank.")
+        max_chars = int(self.code_agent_rollup_summary_max_chars)
+        if (
+            "session://preview/" in summary
+            or "[PreviewRef:" in summary
+            or "[/PreviewRef]" in summary
+            or "[ExpandedPreviewRef:" in summary
+            or "[/ExpandedPreviewRef]" in summary
+        ):
+            raise ValueError("rollup summary must not contain PreviewRef syntax or preview URIs.")
+        if len(summary) > max_chars:
+            raise ValueError(
+                f"rollup summary exceeds the {max_chars}-character maximum."
+            )
+
+        store = getattr(self, "_session_store", None)
+        session_id = getattr(self, "_session_id", None)
+        state = getattr(self, "_persisted_preview_state", None)
+        conversation = getattr(self, "_conversation", None)
+        if store is None or session_id is None or state is None or conversation is None:
+            raise RuntimeError("rollup is unavailable without a live persisted session.")
+
+        events = store.get_events(session_id)
+        authoritative_messages, authoritative_state = (
+            self._authoritative_persisted_projection()
+        )
+        units = rollup_units(events, authoritative_messages, authoritative_state)
+        eligible = eligible_rollup_units(
+            events,
+            authoritative_messages,
+            authoritative_state,
+        )
+        if not units:
+            raise ValueError("no canonical completed rollup units are available.")
+        if not eligible:
+            raise ValueError("no rollup units are currently eligible.")
+
+        start_unit = next(
+            (unit for unit in eligible if unit.start_turn == start_turn),
+            None,
+        )
+        end_unit = next(
+            (unit for unit in eligible if unit.end_turn == end_turn),
+            None,
+        )
+        if start_unit is None:
+            raise ValueError("start_turn is not an eligible unit boundary.")
+        if end_unit is None:
+            raise ValueError("end_turn is not an eligible unit boundary.")
+
+        start_index = units.index(start_unit)
+        end_index = units.index(end_unit)
+        if start_index > end_index:
+            raise ValueError("rollup endpoints are reversed.")
+
+        selected = units[start_index:end_index + 1]
+        eligible_set = set(eligible)
+        if any(unit not in eligible_set for unit in selected):
+            raise ValueError("every unit in the selected interval must be eligible.")
+        if sum(len(unit.turn_ids) for unit in selected) < 2:
+            raise ValueError("rollup must include at least two completed turns.")
+        if not validate_rollup_interval(
+            events,
+            authoritative_messages,
+            authoritative_state,
+            selected,
+        ):
+            raise ValueError("selected rollup interval does not exactly cover canonical units.")
+
+        source_start_seq = selected[0].source_start_seq
+        source_end_seq = selected[-1].source_end_seq
+        create_from_projection = getattr(
+            self,
+            "_create_persisted_preview_from_projection",
+            None,
+        )
+        if create_from_projection is None:
+            key, preview_event_seq = self.create_persisted_preview(
+                Preview(summary=summary),
+                source_start_seq=source_start_seq,
+                source_end_seq=source_end_seq,
+            )
+        else:
+            key, preview_event_seq = create_from_projection(
+                authoritative_messages,
+                authoritative_state,
+                Preview(summary=summary),
+                source_start_seq=source_start_seq,
+                source_end_seq=source_end_seq,
+                expected_next_seq=store.get_next_seq(session_id),
+            )
+        return (
+            f"Rolled up turns {start_turn}-{end_turn} into preview {key} "
+            f"(event {preview_event_seq})."
+        )
 
     def _record_display_event(self, kind: str, text: str, create_session: bool = False):
         if not text:
@@ -773,8 +953,12 @@ def _code_agent_send_rg_available():
         return attachments
 
     def _configure_conversation(self, conversation):
+        from code_agent.turn_rollups import render_turn_labels
+
         conversation.expanded_preview_refs = self._expanded_preview_refs
         conversation.preview_loader = self._preview_blob_content
+        conversation.message_projector = render_turn_labels
+        conversation.ephemeral_provider = self._rollup_eligibility_ephemeral
 
     def _preview_blob_content(self, uri: str) -> str:
         if getattr(self, '_session_store', None) is None or getattr(self, '_session_id', None) is None:
@@ -1182,6 +1366,21 @@ def _code_agent_send_rg_available():
 
     view_images._tool_files_param = "files"
 
+    def _rollup_eligibility_ephemeral(self) -> str:
+        from code_agent.turn_rollups import eligible_rollup_line, eligible_rollup_units
+
+        store = getattr(self, "_session_store", None)
+        session_id = getattr(self, "_session_id", None)
+        state = getattr(self, "_persisted_preview_state", None)
+        if store is None or session_id is None or state is None:
+            return ""
+        units = eligible_rollup_units(
+            store.get_events(session_id),
+            self.conversation.messages,
+            state,
+        )
+        return eligible_rollup_line(units)
+
     def _context_pressure_ephemeral(self) -> str:
         client = getattr(self, "llm_client", None)
         model_config = getattr(client, "model_config", {}) or {}
@@ -1267,11 +1466,11 @@ def _code_agent_send_rg_available():
             self._pending_images = []
         before_len = len(self.conversation.messages)
         result = super().usermsg(content, **kwargs)
+        if len(self.conversation.messages) > before_len:
+            self._persist_message(self.conversation.messages[-1])
         self.ephemeral = self._file_context_ephemeral(
             self._current_file_context_names(kwargs.get('_attachments'))
         )
-        if len(self.conversation.messages) > before_len:
-            self._persist_message(self.conversation.messages[-1])
         return result
 
     welcome_message = "[bold]Code Agent[/bold]\nPython REPL-based coding assistant"
@@ -1364,6 +1563,38 @@ NEVER:
 
 The user CAN interrupt you (Ctrl+C) and drop into the REPL themselves.
 But unless they do, YOU are in control until you call emit(..., release=True).
+
+
+>>> turn_identity_and_rollup_guidance()
+
+Model-facing user messages beginning with `# Turn N` use N as the stable
+canonical identifier for that user-initiated interaction. These labels are
+navigation metadata; do not repeat or edit them.
+
+When present, `Eligible rollup turns: ...` lists atomic completed historical
+units available to a future `rollup(start_turn, end_turn, summary)` call. A
+single number is a one-turn unit; `A-B` is one inseparable child-preview unit.
+Both endpoints are inclusive and must match listed unit boundaries, and every
+atomic unit in the selected transcript interval must be eligible. Recent,
+active, unlisted, and child-internal turn boundaries are protected and cannot
+be selected.
+
+Use rollup only when detailed historical content is no longer needed in active
+context. When context pressure is high, consider rolling up eligible historical
+units that are no longer needed in detail. Exact content remains available by
+expanding the resulting PreviewRef with view(session://preview/...).
+
+A rollup summary must preserve information with value beyond the immediate
+implementation details, including when present:
+- the user's intent, requested outcome, preferences, constraints, and working style
+- lessons learned, including failed or reverted approaches and why
+- observations or discoveries that could affect later work
+- important decisions and invariants
+- unresolved issues and future constraints
+- verification status
+- a concise description of work performed and the final result
+
+Distinguish historical context from active instructions.
 
 >>> database_connections()
 

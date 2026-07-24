@@ -1,7 +1,10 @@
 import ast
 import copy
 import hashlib
+import hmac
+import pickle
 import re
+import secrets
 from dataclasses import dataclass
 
 from code_agent.persisted_preview_state import PersistedPreviewState
@@ -9,6 +12,41 @@ from code_agent.session_replay import _parse_silently
 
 
 OMITTED_ECHO_MARKER = "[content omitted from echo]"
+_DETERMINISTIC_IDENTITY_FIELD = "_deterministic_preview_identity"
+_DETERMINISTIC_IDENTITY_KEY = secrets.token_bytes(32)
+
+
+def _deterministic_identity_payload(message: dict) -> bytes:
+    payload = copy.deepcopy(message)
+    payload.pop(_DETERMINISTIC_IDENTITY_FIELD, None)
+    return pickle.dumps(payload, protocol=5)
+
+
+def _sign_deterministic_replacement(message: dict) -> None:
+    message[_DETERMINISTIC_IDENTITY_FIELD] = hmac.digest(
+        _DETERMINISTIC_IDENTITY_KEY,
+        _deterministic_identity_payload(message),
+        "sha256",
+    )
+
+
+def has_valid_deterministic_identity(message: dict) -> bool:
+    identity = message.get(_DETERMINISTIC_IDENTITY_FIELD)
+    if not isinstance(identity, bytes):
+        return False
+    expected = hmac.digest(
+        _DETERMINISTIC_IDENTITY_KEY,
+        _deterministic_identity_payload(message),
+        "sha256",
+    )
+    return hmac.compare_digest(identity, expected)
+
+
+def deterministic_structural_identity(message: dict) -> dict:
+    identity = copy.deepcopy(message)
+    identity.pop(_DETERMINISTIC_IDENTITY_FIELD, None)
+    identity.pop("_attachments", None)
+    return identity
 
 
 def _content_preserves_context_refs(content: str) -> bool:
@@ -278,29 +316,35 @@ def message_stdout(msg: dict) -> str:
     return msg.get("_stdout") or content
 
 
+def _structured_render_segments(msg: dict) -> list[dict] | None:
+    if "_render_segments" not in msg:
+        return None
+    segments = msg.get("_render_segments")
+    if not isinstance(segments, list) or any(not isinstance(seg, dict) for seg in segments):
+        return None
+    return segments
+
+
 def is_repl_output_message(msg: dict) -> bool:
+    segments = _structured_render_segments(msg)
+    if segments is not None:
+        return any(seg.get("type") == "stdout" for seg in segments)
     content = msg.get("content") or ""
-    if content.lstrip().startswith(">>>") or OMITTED_ECHO_MARKER in content:
-        return True
-    for seg in msg.get("_render_segments") or []:
-        if seg.get("type") == "stdout":
-            seg_content = seg.get("content") or ""
-            if seg_content.lstrip().startswith(">>>") or OMITTED_ECHO_MARKER in seg_content:
-                return True
-    return False
+    return content.lstrip().startswith(">>>") or OMITTED_ECHO_MARKER in content
 
 
 def human_inputs(msg: dict) -> list[str]:
+    segments = _structured_render_segments(msg)
+    if segments is not None:
+        return [
+            str(seg.get("content"))
+            for seg in segments
+            if seg.get("type") == "input"
+            and seg.get("content") is not None
+            and str(seg.get("content"))
+        ]
     if msg.get("_user_content") is not None:
         return [str(msg.get("_user_content"))]
-    inputs = [
-        seg.get("content") or ""
-        for seg in msg.get("_render_segments") or []
-        if seg.get("type") == "input"
-    ]
-    inputs = [text for text in inputs if text]
-    if inputs:
-        return inputs
     if is_repl_output_message(msg):
         return []
     content = msg.get("content") or ""
@@ -371,19 +415,108 @@ def _real_user_message(msg: dict) -> bool:
     return msg.get("role") == "user" and bool(human_inputs(msg))
 
 
-def _stdout_message_from(template: dict, content: str) -> dict:
+def _message_from_segments(template: dict, segments: list[dict], *, user_input: bool) -> dict:
     msg = copy.deepcopy(template)
+    msg["_render_segments"] = copy.deepcopy(segments)
+    content = "".join(str(segment.get("content") or "") for segment in segments)
     msg["content"] = content
-    if msg.get("_stdout") is not None:
-        msg["_stdout"] = content
-    msg["_render_segments"] = [{"type": "stdout", "content": content}]
-    msg.pop("_user_content", None)
+    seqs = {
+        segment.get("_event_seq")
+        for segment in segments
+        if type(segment.get("_event_seq")) is int
+    }
+    if len(seqs) == 1:
+        msg["_event_seq"] = next(iter(seqs))
+        msg.pop("_source_start_seq", None)
+        msg.pop("_source_end_seq", None)
+    elif seqs:
+        msg.pop("_event_seq", None)
+        msg["_source_start_seq"] = min(seqs)
+        msg["_source_end_seq"] = max(seqs)
+    if user_input:
+        msg["_user_content"] = content
+        msg.pop("_stdout", None)
+    else:
+        msg.pop("_user_content", None)
+        if msg.get("_stdout") is not None:
+            msg["_stdout"] = content
     return msg
 
 
-def _split_repl_messages_with_appended_user(messages: list[dict]) -> list[dict]:
+def _stdout_message_from(template: dict, content: str, segment: dict | None = None) -> dict:
+    stdout_segment = copy.deepcopy(segment) if segment is not None else {
+        "type": "stdout",
+        "content": content,
+    }
+    stdout_segment["content"] = content
+    return _message_from_segments(template, [stdout_segment], user_input=False)
+
+
+def _split_structured_appended_user(msg: dict) -> tuple[list[dict], dict] | None:
+    segments = _structured_render_segments(msg)
+    if segments is None:
+        return None
+    input_indexes = [
+        index
+        for index, segment in enumerate(segments)
+        if segment.get("type") == "input"
+    ]
+    if len(input_indexes) != 1:
+        return None
+    input_index = input_indexes[0]
+    if any(
+        segment.get("type") == "input"
+        for segment in segments[:input_index]
+    ) or any(
+        segment.get("type") != "input"
+        and str(segment.get("content") or "")
+        for segment in segments[input_index + 1:]
+    ):
+        return None
+    stdout_segments = [
+        segment for segment in segments[:input_index]
+        if segment.get("type") == "stdout"
+    ]
+    if not stdout_segments:
+        return None
+    input_message = _message_from_segments(
+        msg,
+        [segments[input_index]],
+        user_input=True,
+    )
+    return stdout_segments, input_message
+
+
+def normalize_repl_messages(messages: list[dict]) -> list[dict]:
     out = []
     for msg in messages:
+        structured = (
+            _split_structured_appended_user(msg)
+            if msg.get("role") == "user"
+            else None
+        )
+        if structured is not None:
+            stdout_segments, input_message = structured
+            stdout_content = "".join(
+                str(segment.get("content") or "")
+                for segment in stdout_segments
+            )
+            prefix, release_text = split_release_repl_output(stdout_content)
+            if (
+                release_text is not None
+                and out
+                and out[-1].get("role") == "assistant"
+                and is_release_assistant_message(out[-1])
+            ):
+                release_msg = out.pop()
+                out.append(_stdout_message_from(msg, prefix, stdout_segments[0]))
+                out.append(release_msg)
+                out.append(_stdout_message_from(msg, release_text, stdout_segments[-1]))
+            else:
+                out.append(_message_from_segments(msg, stdout_segments, user_input=False))
+            out.append(input_message)
+            continue
+
         if msg.get("role") == "user" and is_repl_output_message(msg) and msg.get("_user_content") is not None:
             copied = copy.deepcopy(msg)
             text, appended = split_appended_user_content(copied, copied.get("content") or "")
@@ -405,7 +538,10 @@ def _split_repl_messages_with_appended_user(messages: list[dict]) -> list[dict]:
                 out.append(copied)
 
             if appended is not None:
-                out.append({"role": "user", "content": appended, "_user_content": appended})
+                appended_msg = {"role": "user", "content": appended, "_user_content": appended}
+                if type(copied.get("_event_seq")) is int:
+                    appended_msg["_event_seq"] = copied["_event_seq"]
+                out.append(appended_msg)
         else:
             out.append(copy.deepcopy(msg))
     return out
@@ -649,6 +785,7 @@ def _resolved_preview_placement(
     replacement_prefix: str | None = None,
     preserve_preview_refs=None,
     persisted: bool = False,
+    preview_event_seq: int | None = None,
 ) -> tuple[list[dict], str | None]:
     span = select_projected_span(
         messages,
@@ -666,6 +803,8 @@ def _resolved_preview_placement(
     )
     if persisted:
         replacement["_persisted_preview"] = True
+        if preview_event_seq is not None:
+            replacement["_preview_event_seq"] = preview_event_seq
     return replace_projected_span(messages, span, replacement), content
 
 
@@ -699,11 +838,14 @@ def _resolve_preview(
 def apply_preview_placement(
     messages: list[dict],
     *,
+    preview_event_seq: int,
     preview_key: str,
     summary: str,
     source_start_seq: int,
     source_end_seq: int,
 ) -> list[dict]:
+    if type(preview_event_seq) is not int:
+        raise PreviewPlacementError("preview event sequence must be an integer")
     if not isinstance(preview_key, str) or not preview_key:
         raise PreviewPlacementError("preview key must be a non-empty string")
     preview = Preview(summary=summary)
@@ -714,6 +856,7 @@ def apply_preview_placement(
         preview_key=preview_key,
         summary=preview.summary,
         persisted=True,
+        preview_event_seq=preview_event_seq,
     )
     return projected
 
@@ -759,6 +902,15 @@ def create_persisted_preview(
     )
     state.definitions[created_seq] = (key, preview.summary)
     state.install_placement(created_seq, source_start_seq, source_end_seq)
+    span = select_projected_span(
+        projected,
+        source_start_seq=source_start_seq,
+        source_end_seq=source_end_seq,
+    )
+    replacement = projected[span.start_index:span.end_index]
+    if len(replacement) != 1 or not replacement[0].get("_persisted_preview"):
+        raise PreviewPlacementError("persisted preview projection metadata is missing")
+    replacement[0]["_preview_event_seq"] = created_seq
     return projected, key, created_seq, placed_seq
 
 
@@ -914,6 +1066,96 @@ def _coalesced_ordered_sections(
 
 
 
+def deterministic_interaction_replacement(
+    messages: list[dict],
+    *,
+    source_start_seq: int | None = None,
+    source_end_seq: int | None = None,
+    interaction_index: int | None = None,
+    preserve_preview_refs=None,
+) -> tuple[dict, list[str], dict[str, str]] | None:
+    normalized = normalize_repl_messages(messages)
+    interactions = _completed_interactions(normalized)
+    if interaction_index is not None:
+        if not 0 <= interaction_index < len(interactions):
+            return None
+        candidates = [interactions[interaction_index]]
+    else:
+        if source_start_seq is None or source_end_seq is None:
+            raise PreviewPlacementError(
+                "provide an interaction index or complete canonical body range"
+            )
+        candidates = interactions
+    for item in candidates:
+        start = item["start"]
+        release = item["release"]
+        range_messages = normalized[start + 1:release]
+        if not range_messages or any(message.get("_coalesced") for message in range_messages):
+            continue
+        source_ranges = [message_source_range(message) for message in range_messages]
+        if all(source_range is not None for source_range in source_ranges):
+            if any(
+                current[0] <= previous[1]
+                for previous, current in zip(source_ranges, source_ranges[1:])
+            ):
+                continue
+            body_start = source_ranges[0][0]
+            body_end = source_ranges[-1][1]
+            if (
+                source_start_seq is not None
+                and (body_start != source_start_seq or body_end != source_end_seq)
+            ):
+                continue
+            placement_kwargs = {
+                "source_start_seq": body_start,
+                "source_end_seq": body_end,
+            }
+        elif all(source_range is None for source_range in source_ranges):
+            if source_start_seq is not None:
+                continue
+            placement_kwargs = {
+                "start_index": start + 1,
+                "end_index": release,
+            }
+        else:
+            continue
+
+        release_output = item.get("release_output")
+        release_msg = None if item.get("open") else normalized[release]
+        release_output_msg = (
+            normalized[release_output] if release_output is not None else None
+        )
+        section_contents = _coalesced_ordered_sections(
+            range_messages,
+            release_msg,
+            release_output_msg,
+        )
+        if not section_contents:
+            return None
+        previews = [
+            Preview(
+                summary=render_default_preview_summary(section_content, observations),
+                content=section_content,
+            )
+            for _, section_content, observations in section_contents
+        ]
+        materialized_contents = {}
+        try:
+            candidate, keys = place_preview(
+                normalized,
+                previews,
+                save_preview_blob=materialized_contents.setdefault,
+                preserve_preview_refs=preserve_preview_refs,
+                **placement_kwargs,
+            )
+        except PreviewPlacementError:
+            return None
+        replacement = candidate[start + 1]
+        _sign_deterministic_replacement(replacement)
+        return replacement, keys, materialized_contents
+    return None
+
+
 def coalesce_repl_messages(
     messages: list[dict],
     *,
@@ -934,7 +1176,7 @@ def coalesce_repl_messages(
     if keep_last_execution_interactions < 0:
         raise ValueError("keep_last_execution_interactions must be >= 0")
 
-    messages = _split_repl_messages_with_appended_user(messages)
+    messages = normalize_repl_messages(messages)
     interactions = _completed_interactions(messages)
 
 
@@ -963,61 +1205,27 @@ def coalesce_repl_messages(
             continue
         start = item["start"]
         release = item["release"]
-        release_output = item.get("release_output")
-        release_msg = None if item.get("open") else messages[release]
-        range_messages = messages[start + 1:release]
-        replacement_range = list(range_messages)
-        release_output_msg = messages[release_output] if release_output is not None else None
-
-        if any(m.get("_coalesced") for m in replacement_range):
+        range_messages = messages[start + 1:item["release"]]
+        if not range_messages:
             continue
-
-        section_contents = _coalesced_ordered_sections(range_messages, release_msg, release_output_msg)
-        if not section_contents:
+        derived = deterministic_interaction_replacement(
+            messages,
+            interaction_index=idx,
+            preserve_preview_refs=preserve_preview_refs,
+        )
+        if derived is None:
             continue
-
-        previews = [
-            Preview(
-                summary=render_default_preview_summary(section_content, observations),
-                content=section_content,
-            )
-            for _, section_content, observations in section_contents
-        ]
-        source_ranges = [
-            message_source_range(message)
-            for message in replacement_range
-        ]
-        if all(source_range is not None for source_range in source_ranges):
-            if any(
-                current[0] <= previous[1]
-                for previous, current in zip(source_ranges, source_ranges[1:])
-            ):
-                continue
-            placement_kwargs = {
-                "source_start_seq": source_ranges[0][0],
-                "source_end_seq": source_ranges[-1][1],
-            }
-        elif all(source_range is None for source_range in source_ranges):
-            placement_kwargs = {
-                "start_index": start + 1,
-                "end_index": release,
-            }
-        else:
-            continue
-
-        materialized_contents = {}
-        try:
-            candidate, keys = place_preview(
-                messages,
-                previews,
-                save_preview_blob=materialized_contents.setdefault,
-                preserve_preview_refs=preserve_preview_refs,
-                **placement_kwargs,
-            )
-        except PreviewPlacementError:
-            continue
-        projected_replacement = candidate[start + 1]
-        original_chars = sum(len(m.get("content") or "") for m in replacement_range)
+        projected_replacement, keys, materialized_contents = derived
+        section_contents = _coalesced_ordered_sections(
+            range_messages,
+            None if item.get("open") else messages[item["release"]],
+            (
+                messages[item["release_output"]]
+                if item.get("release_output") is not None
+                else None
+            ),
+        )
+        original_chars = sum(len(m.get("content") or "") for m in range_messages)
         replacement_chars = len(projected_replacement.get("content") or "")
         if original_chars - replacement_chars < min_savings_chars:
             continue

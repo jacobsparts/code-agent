@@ -15,8 +15,9 @@ class Conversation:
 
         rendered_preview_refs = []
 
+        message_projector = getattr(self, "message_projector", None)
         for msg in self.messages:
-            out = dict(msg)
+            out = message_projector(msg) if message_projector is not None else dict(msg)
             attachments = out.pop('_attachments', None)
             if attachments:
                 for name, content in attachments.items():
@@ -31,12 +32,21 @@ class Conversation:
             result.append(out)
         self.rendered_preview_refs = rendered_preview_refs
 
+        ephemeral_parts = []
         if self.ephemeral:
+            ephemeral_parts.append(self.ephemeral)
+        ephemeral_provider = getattr(self, "ephemeral_provider", None)
+        if ephemeral_provider is not None:
+            dynamic_ephemeral = ephemeral_provider()
+            if dynamic_ephemeral:
+                ephemeral_parts.append(dynamic_ephemeral)
+        ephemeral = "\n\n".join(ephemeral_parts)
+        if ephemeral:
             for i in range(len(result) - 1, -1, -1):
                 if result[i].get("role") == "user":
                     out = dict(result[i])
                     content = out.get("content", "")
-                    out["content"] = self.ephemeral + ("\n\n" + content if content else "")
+                    out["content"] = ephemeral + ("\n\n" + content if content else "")
                     result[i] = out
                     break
 
