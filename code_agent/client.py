@@ -70,7 +70,8 @@ class LLMClient:
     def __init__(self, model_name, native=None):
         self.model_name = model_name
         self.model_config = get_model_config(model_name)
-        self.timeout = self.model_config.get('timeout', 300)
+        timeout = self.model_config.get('timeout')
+        self.timeout = 3600 if timeout is None else timeout
         self.concurrency_lock = threading.BoundedSemaphore(self.model_config.get('concurrency',10))
         self.native = self.model_config.get('tools') if native is None else native
         self.tool_mode = self.model_config.get('tool_mode')
