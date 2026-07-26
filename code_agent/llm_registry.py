@@ -161,14 +161,15 @@ register_model(
     "cursor",
     "composer-2.5",
     model="composer-2.5",
-    aliases="cursor",
     tool_mode="repl_execute",
+    config={"fast": False},
 )
 register_model(
     "cursor",
     "grok-4.5",
     model="grok-4.5",
     tool_mode="repl_execute",
+    config={"fast": False, "reasoning_effort": "high"},
 )
 
 

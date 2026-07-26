@@ -1976,7 +1976,6 @@ If you don't know how to proceed:
                 if (
                     self.repl_display
                     and not getattr(self, '_in_user_repl', False)
-                    and self._statement_direct_call not in {"emit", "observe"}
                 ):
                     self.console.clear_line()
                     if not getattr(self, '_repl_printed_header', False):

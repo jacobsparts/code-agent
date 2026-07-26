@@ -2286,6 +2286,47 @@ def encode_conversation_state(
     return _message(*state_fields), prefetched
 
 
+def encode_model_metadata(
+    model: str,
+    *,
+    fast: bool = False,
+    reasoning_effort: str | None = None,
+) -> bytes:
+    """Encode modern AgentRunRequest model metadata (fields 9/14).
+
+    OpenAI-style configuration:
+    - fast: bool, default False. Omitted from metadata when False.
+    - reasoning_effort: optional string copied to metadata key "effort".
+      Omitted when None/empty. The client does not invent a default effort.
+    """
+    if not isinstance(fast, bool):
+        raise TypeError("fast must be bool")
+    fields: list[Field] = [_string(1, model)]
+    if fast:
+        fields.append(
+            _bytes(
+                3,
+                _message(
+                    _string(1, "fast"),
+                    _string(2, "true"),
+                ),
+            )
+        )
+    if reasoning_effort:
+        if not isinstance(reasoning_effort, str):
+            raise TypeError("reasoning_effort must be str or None")
+        fields.append(
+            _bytes(
+                3,
+                _message(
+                    _string(1, "effort"),
+                    _string(2, reasoning_effort),
+                ),
+            )
+        )
+    return _message(*fields)
+
+
 def build_run_request(
     prompt: str,
     model: str,
@@ -2298,6 +2339,8 @@ def build_run_request(
     run_config: RunConfig | None = None,
     workspace_uri: str | None = None,
     client_name: str | None = None,
+    fast: bool = False,
+    reasoning_effort: str | None = None,
 ) -> bytes:
     """Build the smallest useful AgentClientMessage.run_request."""
 
@@ -2365,13 +2408,10 @@ def build_run_request(
     )
     if run_config.conversation_state is not None:
         conversation_state = run_config.conversation_state
-    fast_setting = _message(
-        _string(1, "fast"),
-        _string(2, "false"),
-    )
-    model_metadata = _message(
-        _string(1, model),
-        _bytes(3, fast_setting),
+    model_metadata = encode_model_metadata(
+        model,
+        fast=fast,
+        reasoning_effort=reasoning_effort,
     )
     run_fields = [
         _bytes(1, conversation_state),
@@ -2624,7 +2664,7 @@ EXEC_SERVER_TOOL_FIELDS = {
     9: ("diagnostics_args", "agent.v1.DiagnosticsArgs"),
     10: ("request_context_args", "agent.v1.RequestContextArgs"),
     11: ("mcp_args", "agent.v1.McpArgs"),
-    14: ("shell_stream_args", "agent.v1.ShellStreamArgs"),
+    14: ("shell_stream_args", "agent.v1.ShellArgs"),
     16: ("background_shell_spawn_args", "agent.v1.BackgroundShellSpawnArgs"),
     17: ("list_mcp_resources_exec_args", "agent.v1.ListMcpResourcesExecArgs"),
     18: ("read_mcp_resource_exec_args", "agent.v1.ReadMcpResourceExecArgs"),
@@ -2643,27 +2683,213 @@ EXEC_SERVER_TOOL_FIELDS = {
     41: ("shell_allowlist_precheck_args", "agent.v1.ShellAllowlistPrecheckArgs"),
     42: ("mcp_allowlist_precheck_args", "agent.v1.McpAllowlistPrecheckArgs"),
     43: ("web_fetch_allowlist_precheck_args", "agent.v1.WebFetchAllowlistPrecheckArgs"),
-    44: ("git_diff_request", "agent.v1.GitDiffRequest"),
-    45: ("pi_read_args", "agent.v1.PiReadArgs"),
-    46: ("pi_bash_args", "agent.v1.PiBashArgs"),
-    47: ("pi_edit_args", "agent.v1.PiEditArgs"),
-    48: ("pi_write_args", "agent.v1.PiWriteArgs"),
-    49: ("pi_grep_args", "agent.v1.PiGrepArgs"),
-    50: ("pi_find_args", "agent.v1.PiFindArgs"),
-    51: ("pi_ls_args", "agent.v1.PiLsArgs"),
+    44: ("git_diff_request", "aiserver.v1.GetDiffRequest"),
+    45: ("pi_read_args", "agent.v1.PiReadExecArgs"),
+    46: ("pi_bash_args", "agent.v1.PiBashExecArgs"),
+    47: ("pi_edit_args", "agent.v1.PiEditExecArgs"),
+    48: ("pi_write_args", "agent.v1.PiWriteExecArgs"),
+    49: ("pi_grep_args", "agent.v1.PiGrepExecArgs"),
+    50: ("pi_find_args", "agent.v1.PiFindExecArgs"),
+    51: ("pi_ls_args", "agent.v1.PiLsExecArgs"),
     53: ("conversation_search_args", "agent.v1.ConversationSearchArgs"),
 }
 
 
-def _generic_arguments(payload: bytes) -> dict:
+NATIVE_ARGUMENT_SCHEMAS = {
+    "shell_args": {
+        1: ("command", "string"), 2: ("working_directory", "string"),
+        3: ("timeout", "int32"), 4: ("tool_call_id", "string"),
+        5: ("simple_commands", "string"), 6: ("has_input_redirect", "bool"),
+        7: ("has_output_redirect", "bool"), 8: ("parsing_result", "message"),
+        9: ("requested_sandbox_policy", "message"),
+        10: ("file_output_threshold_bytes", "uint64"),
+        11: ("is_background", "bool"), 12: ("skip_approval", "bool"),
+        13: ("timeout_behavior", "enum"), 14: ("hard_timeout", "int32"),
+        15: ("description", "string"), 16: ("classifier_result", "message"),
+        17: ("close_stdin", "bool"), 18: ("output_notification", "message"),
+        19: ("smart_mode_approval", "message"),
+        20: ("hook_approval_requirement", "message"),
+        21: ("conversation_id", "string"),
+    },
+    "shell_stream_args": "shell_args",
+    "write_args": {
+        1: ("path", "string"), 2: ("file_text", "string"),
+        3: ("tool_call_id", "string"),
+        4: ("return_file_content_after_write", "bool"),
+        5: ("file_bytes", "bytes"), 6: ("encoding_hint", "string"),
+    },
+    "delete_args": {1: ("path", "string"), 2: ("tool_call_id", "string")},
+    "grep_args": {
+        1: ("pattern", "string"), 2: ("path", "string"),
+        3: ("glob", "string"), 4: ("output_mode", "string"),
+        5: ("context_before", "int32"), 6: ("context_after", "int32"),
+        7: ("context", "int32"), 8: ("case_insensitive", "bool"),
+        9: ("type", "string"), 10: ("head_limit", "int32"),
+        11: ("multiline", "bool"), 12: ("sort", "string"),
+        13: ("sort_ascending", "bool"), 14: ("tool_call_id", "string"),
+        15: ("sandbox_policy", "message"), 16: ("offset", "int32"),
+    },
+    "read_args": {
+        1: ("path", "string"), 2: ("tool_call_id", "string"),
+        4: ("offset", "int32"), 5: ("limit", "uint32"),
+        6: ("encoding_hint", "string"),
+    },
+    "redacted_read_args": "read_args",
+    "ls_args": {
+        1: ("path", "string"), 2: ("ignore", "string"),
+        3: ("tool_call_id", "string"), 4: ("sandbox_policy", "message"),
+        5: ("timeout_ms", "uint32"),
+    },
+    "diagnostics_args": {
+        1: ("path", "string"), 2: ("tool_call_id", "string"),
+    },
+    "request_context_args": {
+        2: ("notes_session_id", "string"), 3: ("workspace_id", "string"),
+        4: ("read_only_pinned_tree_sha", "string"),
+        5: ("read_only_plugin_cache_root", "string"),
+        7: ("use_cached", "bool"),
+    },
+    "mcp_args": {
+        1: ("name", "string"), 3: ("tool_call_id", "string"),
+        4: ("provider_identifier", "string"), 5: ("tool_name", "string"),
+        6: ("smart_mode_approval", "message"),
+        7: ("smart_mode_approval_only", "bool"),
+        8: ("skip_approval", "bool"), 9: ("server_identifier", "string"),
+    },
+    "background_shell_spawn_args": {
+        1: ("command", "string"), 2: ("working_directory", "string"),
+        3: ("tool_call_id", "string"), 4: ("parsing_result", "message"),
+        5: ("sandbox_policy", "message"),
+        6: ("enable_write_shell_stdin_tool", "bool"),
+        7: ("description", "string"), 8: ("classifier_result", "message"),
+        9: ("output_notification", "message"),
+        10: ("smart_mode_approval", "message"),
+        11: ("hook_approval_requirement", "message"),
+        12: ("skip_approval", "bool"), 13: ("conversation_id", "string"),
+    },
+    "list_mcp_resources_exec_args": {1: ("server", "string")},
+    "read_mcp_resource_exec_args": {
+        1: ("server", "string"), 2: ("uri", "string"),
+        3: ("download_path", "string"), 4: ("tool_call_id", "string"),
+        5: ("smart_mode_approval", "message"),
+    },
+    "fetch_args": {1: ("url", "string"), 2: ("tool_call_id", "string")},
+    "record_screen_args": {
+        1: ("mode", "enum"), 2: ("tool_call_id", "string"),
+        3: ("save_as_filename", "string"),
+    },
+    "computer_use_args": {
+        1: ("tool_call_id", "string"), 2: ("actions", "message"),
+    },
+    "write_shell_stdin_args": {
+        1: ("shell_id", "uint32"), 2: ("chars", "string"),
+    },
+    "execute_hook_args": {1: ("request", "message")},
+    "subagent_args": {
+        1: ("tool_call_id", "string"), 2: ("subagent_type", "string"),
+        3: ("model_id", "string"), 4: ("prompt", "string"),
+        5: ("readonly", "bool"), 6: ("resume_agent_id", "string"),
+        7: ("run_in_background", "bool"),
+        8: ("continuation_config", "message"),
+        9: ("parent_conversation_id", "string"),
+        10: ("api_key_credentials", "message"),
+        11: ("azure_credentials", "message"),
+        12: ("bedrock_credentials", "message"), 13: ("interrupt", "bool"),
+        14: ("mode", "enum"), 15: ("fork_agent_id", "string"),
+        16: ("root_parent_conversation_id", "string"),
+        17: ("selected_context", "message"),
+        18: ("direct_meta_parent_child_subagent", "bool"),
+        19: ("environment", "enum"), 20: ("cloud_base_branch", "string"),
+    },
+    "force_background_shell_args": {1: ("tool_call_id", "string")},
+    "force_background_subagent_args": {1: ("tool_call_id", "string")},
+    "mcp_state_exec_args": {
+        1: ("server_identifiers", "string"), 2: ("kick_only", "bool"),
+    },
+    "subagent_await_args": {
+        1: ("agent_id", "string"), 2: ("timeout_ms", "uint32"),
+    },
+    "smart_mode_classifier_args": {
+        1: ("tool_call_id", "string"),
+        2: ("parent_conversation_id", "string"), 3: ("target", "message"),
+        4: ("conversation_context", "message"),
+    },
+    "canvas_diagnostics_args": {
+        1: ("path", "string"), 2: ("tool_call_id", "string"),
+    },
+    "shell_allowlist_precheck_args": {
+        1: ("command", "string"), 2: ("working_directory", "string"),
+        3: ("parsing_result", "message"),
+        4: ("classifier_result", "message"), 5: ("tool_call_id", "string"),
+    },
+    "mcp_allowlist_precheck_args": {
+        1: ("provider_identifier", "string"), 2: ("tool_name", "string"),
+        3: ("tool_call_id", "string"),
+    },
+    "web_fetch_allowlist_precheck_args": {
+        1: ("url", "string"), 2: ("tool_call_id", "string"),
+    },
+    "git_diff_request": {
+        1: ("cwd", "string"), 2: ("ref", "string"),
+        3: ("base_ref", "string"), 4: ("merge_base", "bool"),
+        5: ("target_paths", "string"),
+        6: ("unified_context_lines", "int32"),
+        7: ("max_untracked_files", "int32"), 8: ("output_format", "enum"),
+        9: ("submodule_recurse_depth", "int32"),
+        10: ("include_space_changes", "bool"),
+        11: ("committed_only", "bool"), 12: ("compute_patch_id", "bool"),
+        13: ("return_head_sha", "bool"), 14: ("max_response_bytes", "int32"),
+    },
+    "pi_read_args": {
+        1: ("path", "string"), 2: ("offset", "int32"),
+        3: ("limit", "int32"),
+    },
+    "pi_bash_args": {1: ("command", "string"), 2: ("timeout", "double")},
+    "pi_edit_args": {1: ("path", "string"), 2: ("edits", "message")},
+    "pi_write_args": {1: ("path", "string"), 2: ("content", "string")},
+    "pi_grep_args": {
+        1: ("pattern", "string"), 2: ("path", "string"),
+        3: ("glob", "string"), 4: ("ignore_case", "bool"),
+        5: ("literal", "bool"), 6: ("context", "int32"),
+        7: ("limit", "int32"),
+    },
+    "pi_find_args": {
+        1: ("pattern", "string"), 2: ("path", "string"),
+        3: ("limit", "int32"),
+    },
+    "pi_ls_args": {1: ("path", "string"), 2: ("limit", "int32")},
+    "conversation_search_args": {
+        1: ("query", "string"), 2: ("tool_call_id", "string"),
+        3: ("limit", "int32"),
+    },
+}
+
+
+def _native_argument_schema(oneof_name: str) -> dict:
+    schema = NATIVE_ARGUMENT_SCHEMAS.get(oneof_name, {})
+    if isinstance(schema, str):
+        return NATIVE_ARGUMENT_SCHEMAS[schema]
+    return schema
+
+
+def _generic_arguments(payload: bytes, oneof_name: str = "") -> dict:
     raw = RawMessage.decode(payload)
+    schema = _native_argument_schema(oneof_name)
     arguments = {}
     for field in raw.fields:
-        key = str(field.number)
-        if field.wire_type == 0:
+        name, value_type = schema.get(
+            field.number, (str(field.number), None)
+        )
+        if value_type in ("message", "bytes"):
+            value = field.value
+        elif value_type == "double" and field.wire_type == 1:
+            value = struct.unpack("<d", struct.pack("<Q", field.value))[0]
+        elif value_type == "bool":
+            value = bool(field.value)
+        elif field.wire_type == 0:
             value = int(field.value)
-        elif field.wire_type == 1:
-            value = field.value.hex()
+        elif field.wire_type in (1, 5):
+            value = field.value
         elif field.wire_type == 2:
             try:
                 value = field.value.decode()
@@ -2671,14 +2897,14 @@ def _generic_arguments(payload: bytes) -> dict:
                 value = field.value
         else:
             value = field.value
-        if key in arguments:
-            current = arguments[key]
+        if name in arguments:
+            current = arguments[name]
             if not isinstance(current, list):
                 current = [current]
             current.append(value)
-            arguments[key] = current
+            arguments[name] = current
         else:
-            arguments[key] = value
+            arguments[name] = value
     return arguments
 
 
@@ -2729,7 +2955,7 @@ def decode_tool_call(payload: bytes) -> ToolCall | UnknownToolCall | None:
         return ToolCall(
             id=exec_id,
             name=oneof_name.removesuffix("_args"),
-            arguments=_generic_arguments(field.value),
+            arguments=_generic_arguments(field.value, oneof_name),
             tool_name=oneof_name.removesuffix("_args"),
             native=True,
             server_message_id=server_message_id,
@@ -2890,6 +3116,8 @@ class CursorClient:
         tools=(),
         user_config: UserMessageConfig | None = None,
         run_config: RunConfig | None = None,
+        fast: bool = False,
+        reasoning_effort: str | None = None,
     ):
         if not token:
             raise ValueError("token is required")
@@ -2903,6 +3131,8 @@ class CursorClient:
         self.run_config = run_config or RunConfig(
             client_supports_send_to_user=True
         )
+        self.fast = fast
+        self.reasoning_effort = reasoning_effort
 
     @property
     def headers(self) -> dict[str, str]:
@@ -2925,10 +3155,16 @@ class CursorClient:
         history=(),
         user_config: UserMessageConfig | None = None,
         run_config: RunConfig | None = None,
+        fast: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> RunResult:
         request_id = str(uuid.uuid4())
         model = self.model if model is None else model
         tools = self.tools if tools is None else tuple(tools)
+        if fast is None:
+            fast = self.fast
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
         input_payload = build_run_request(
             prompt,
             model,
@@ -2936,6 +3172,8 @@ class CursorClient:
             history=history,
             user_config=user_config or self.user_config,
             run_config=run_config or self.run_config,
+            fast=fast,
+            reasoning_effort=reasoning_effort,
         )
         prefetched_blobs = extract_prefetched_blobs(input_payload)
         downlink_body = ConnectFrame.from_decoded(
@@ -3098,6 +3336,8 @@ def run(
     client_version: str = DEFAULT_CLIENT_VERSION,
     user_config: UserMessageConfig | None = None,
     run_config: RunConfig | None = None,
+    fast: bool = False,
+    reasoning_effort: str | None = None,
 ) -> RunResult:
     """Perform one independent stateless Cursor Agent request."""
     deadline = (
@@ -3137,6 +3377,8 @@ def run(
         tools=normalized_tools,
         user_config=user_config,
         run_config=run_config,
+        fast=fast,
+        reasoning_effort=reasoning_effort,
     ).run(prompt, history=normalized_history)
 
 
@@ -3264,25 +3506,22 @@ def _native_call_content(call: ToolCall):
     return call.arguments
 
 
+def _native_call_params(call: ToolCall) -> dict:
+    schema = _native_argument_schema(call.oneof_name)
+    return {
+        schema.get(int(key), (str(key), None))[0]
+        if str(key).isdigit() else str(key): value
+        for key, value in call.arguments.items()
+    }
+
+
 def _native_repl_code(call: ToolCall) -> str:
     name = _native_call_name(call)
     content = _native_call_content(call)
     content_literal = json.dumps(str(content), ensure_ascii=False)
     if name == "ExecServerMessage":
-        return f"emit({content_literal})"
-    if name == "Shell":
-        return f"bash({content_literal})"
-    params = json.dumps(
-        call.arguments,
-        separators=(",", ":"),
-        sort_keys=True,
-        default=lambda value: (
-            {"bytes_hex": value.hex()}
-            if isinstance(value, bytes)
-            else repr(value)
-        ),
-    )
-    return f"# unsupported tool call: {name}({params})"
+        return f"think({content_literal})"
+    return f"# unsupported tool call: {name}({_native_call_params(call)!r})"
 
 
 def _openai_tool_call(call: ToolCall) -> dict:
@@ -3310,6 +3549,12 @@ def chat_completions(api_key: str, body: dict) -> dict:
         raise ValueError("streaming chat completions are not supported")
     prompt, history = _openai_messages(body.get("messages"))
     model = body.get("model") or DEFAULT_MODEL
+    fast = body.get("fast", False)
+    if not isinstance(fast, bool):
+        raise TypeError("fast must be bool")
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+        raise TypeError("reasoning_effort must be str or None")
     result = run(
         prompt,
         api_key=api_key,
@@ -3317,6 +3562,8 @@ def chat_completions(api_key: str, body: dict) -> dict:
         tools=_openai_tools(body.get("tools")),
         history=history,
         timeout=body.get("timeout", DEFAULT_TIMEOUT),
+        fast=fast,
+        reasoning_effort=reasoning_effort,
     )
     tool_calls = [
         _openai_tool_call(call)

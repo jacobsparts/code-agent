@@ -157,6 +157,50 @@ def test_cursor_client_adapter(monkeypatch):
     assert result["_stop_reason"] == "tool_calls"
 
 
+def test_unsupported_native_tool_renders_flattened_known_parameters():
+    call = cursor.ToolCall(
+        id="tool-1",
+        name="shell_stream",
+        arguments={
+            "1": "date",
+            "10": 40000,
+            "3": 30000,
+            "15": "Get current system date",
+            "8": b"opaque",
+        },
+        native=True,
+        oneof_name="shell_stream_args",
+    )
+
+    assert cursor._native_repl_code(call) == (
+        "# unsupported tool call: ShellStream("
+        "{'command': 'date', 'file_output_threshold_bytes': 40000, "
+        "'timeout': 30000, 'description': 'Get current system date', "
+        "'parsing_result': b'opaque'})"
+    )
+
+
+
+def test_shell_stream_wire_arguments_use_recovered_schema():
+    arguments = cursor.protobuf_message(
+        cursor.Field.bytes(1, b"date"),
+        cursor.Field.bytes(2, b"/tmp"),
+        cursor.Field.varint(3, 30000),
+        cursor.Field.varint(11, 1),
+        cursor.Field.bytes(15, b"Get current system date"),
+        cursor.Field.varint(17, 1),
+    )
+
+    assert cursor._generic_arguments(arguments, "shell_stream_args") == {
+        "command": "date",
+        "working_directory": "/tmp",
+        "timeout": 30000,
+        "is_background": True,
+        "description": "Get current system date",
+        "close_stdin": True,
+    }
+
+
 def test_cursor_client_requires_repl_execute(monkeypatch):
     config = {
         "provider": "cursor",
@@ -170,3 +214,134 @@ def test_cursor_client_requires_repl_execute(monkeypatch):
     client = LLMClient("cursor")
     with pytest.raises(TypeError, match="requires tool_mode"):
         client._call_cursor([], None)
+
+
+def _decode_model_metadata(payload: bytes):
+    client = cursor.RawMessage.decode(payload)
+    run = cursor.RawMessage.decode(client.first_bytes(1))
+    meta = cursor.RawMessage.decode(run.first_bytes(14))
+    model = (meta.first_bytes(1) or b"").decode()
+    entries = {}
+    for field in meta.matching(3, 2):
+        entry = cursor.RawMessage.decode(field.value)
+        key = (entry.first_bytes(1) or b"").decode()
+        value = (entry.first_bytes(2) or b"").decode()
+        entries[key] = value
+    return model, entries
+
+
+def test_encode_model_metadata_defaults_omit_fast_and_effort():
+    raw = cursor.RawMessage.decode(cursor.encode_model_metadata("grok-4.5"))
+    assert (raw.first_bytes(1) or b"").decode() == "grok-4.5"
+    assert raw.matching(3, 2) == ()
+
+
+def test_encode_model_metadata_fast_and_effort():
+    raw = cursor.RawMessage.decode(
+        cursor.encode_model_metadata(
+            "grok-4.5",
+            fast=True,
+            reasoning_effort="medium",
+        )
+    )
+    assert (raw.first_bytes(1) or b"").decode() == "grok-4.5"
+    entries = {}
+    for field in raw.matching(3, 2):
+        entry = cursor.RawMessage.decode(field.value)
+        entries[(entry.first_bytes(1) or b"").decode()] = (
+            entry.first_bytes(2) or b""
+        ).decode()
+    assert entries == {"fast": "true", "effort": "medium"}
+
+
+def test_build_run_request_model_metadata_defaults():
+    payload = cursor.build_run_request("hi", "grok-4.5")
+    assert _decode_model_metadata(payload) == ("grok-4.5", {})
+
+
+def test_build_run_request_model_metadata_fast_and_effort():
+    payload = cursor.build_run_request(
+        "hi",
+        "grok-4.5",
+        fast=True,
+        reasoning_effort="high",
+    )
+    assert _decode_model_metadata(payload) == (
+        "grok-4.5",
+        {"fast": "true", "effort": "high"},
+    )
+
+
+def test_chat_completions_passes_fast_and_reasoning_effort(monkeypatch):
+    captured = {}
+
+    def fake_run(prompt, **kwargs):
+        captured.update(kwargs)
+        captured["prompt"] = prompt
+        return cursor.RunResult(
+            frames=[],
+            text="ok",
+            tool_calls=[],
+            turn_ended=True,
+            checkpoint_updates=[],
+            eos_metadata=None,
+            eos_error=None,
+        )
+
+    monkeypatch.setattr(cursor, "run", fake_run)
+    response = cursor.chat_completions("key", {
+        "model": "grok-4.5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "fast": True,
+        "reasoning_effort": "medium",
+    })
+    assert captured["model"] == "grok-4.5"
+    assert captured["fast"] is True
+    assert captured["reasoning_effort"] == "medium"
+    assert response["choices"][0]["message"]["content"] == "ok"
+
+
+def test_chat_completions_rejects_non_bool_fast():
+    with pytest.raises(TypeError, match="fast must be bool"):
+        cursor.chat_completions("key", {
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "fast": "true",
+        })
+
+
+def test_cursor_client_adapter_passes_config(monkeypatch):
+    config = {
+        "provider": "cursor",
+        "model": "grok-4.5",
+        "api_key": "key",
+        "api_type": "cursor",
+        "tool_mode": "repl_execute",
+        "tpm": 17,
+        "tools": True,
+        "concurrency": 1,
+        "config": {
+            "fast": True,
+            "reasoning_effort": "medium",
+        },
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    monkeypatch.setattr("code_agent.client.throttle", lambda key, tpm: None)
+    captured = {}
+
+    def chat(api_key, body):
+        captured.update(api_key=api_key, body=body)
+        return {
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+            }]
+        }
+
+    monkeypatch.setattr(cursor, "chat_completions", chat)
+    client = LLMClient("cursor/grok-4.5")
+    result = client._call([{"role": "user", "content": "hello"}])
+    assert captured["body"]["model"] == "grok-4.5"
+    assert captured["body"]["fast"] is True
+    assert captured["body"]["reasoning_effort"] == "medium"
+    assert result["content"] == "done"
