@@ -25,12 +25,16 @@ def test_cursor_registry(tmp_path):
 import json
 from code_agent.llm_registry import get_model_config, resolve_model_name
 config = get_model_config("cursor")
+grok = get_model_config("cursor/grok-4.5")
 print(json.dumps({
     "resolved": resolve_model_name("cursor"),
     "api_type": config["api_type"],
     "tool_mode": config["tool_mode"],
     "host": config["host"],
     "path": config["path"],
+    "grok_model": grok["model"],
+    "grok_api_type": grok["api_type"],
+    "grok_tool_mode": grok["tool_mode"],
 }))
 """
     result = subprocess.run(
@@ -47,6 +51,9 @@ print(json.dumps({
         "tool_mode": "repl_execute",
         "host": None,
         "path": None,
+        "grok_model": "grok-4.5",
+        "grok_api_type": "cursor",
+        "grok_tool_mode": "repl_execute",
     }
 
 

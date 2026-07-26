@@ -164,6 +164,12 @@ register_model(
     aliases="cursor",
     tool_mode="repl_execute",
 )
+register_model(
+    "cursor",
+    "grok-4.5",
+    model="grok-4.5",
+    tool_mode="repl_execute",
+)
 
 
 # --- Anthropic ---
