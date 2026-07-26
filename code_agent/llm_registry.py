@@ -147,6 +147,25 @@ for conf, efforts in (
             register_model("openai", f"{conf['model']}{suffix}-flex", **kwargs)
 
 
+# --- Cursor ---
+register_provider(
+    "cursor",
+    host=None,
+    path=None,
+    tpm=60,
+    concurrency=5,
+    tools=True,
+    api_type="cursor",
+)
+register_model(
+    "cursor",
+    "composer-2.5",
+    model="composer-2.5",
+    aliases="cursor",
+    tool_mode="repl_execute",
+)
+
+
 # --- Anthropic ---
 register_provider("anthropic",
     host="api.anthropic.com",

@@ -14,6 +14,7 @@ from collections import defaultdict
 from .utils import throttle, UsageTracker
 from .llm_registry import get_model_config
 from .conversation import Conversation
+from . import cursor
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, normalize_openai_repl_response, project_openai_repl_messages
 
@@ -251,6 +252,31 @@ class LLMClient:
                 return message
             finally:
                 conn.close()
+
+    def _call_cursor(self, messages, tools):
+        if self.tool_mode != "repl_execute":
+            raise TypeError("Cursor transport requires tool_mode='repl_execute'")
+        req = {
+            "model": self.model_config["model"],
+            "messages": messages,
+            "tools": [REPL_EXECUTE_TOOL],
+            **self.model_config.get("config", {}),
+        }
+        throttle(
+            self.model_config["provider"],
+            self.model_config.get("tpm", 5),
+        )
+        response_json = cursor.chat_completions(
+            self.model_config["api_key"],
+            req,
+        )
+        message, stop_reason, usage = _parse_completions_response(response_json)
+        message = normalize_openai_repl_response(message)
+        if usage:
+            self.usage_tracker.log(self.model_name, usage)
+            self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+        message["_stop_reason"] = stop_reason
+        return message
 
     def _call_messages(self, messages, tools):
         """
@@ -498,6 +524,8 @@ class LLMClient:
             return self._call_completions(messages, tools)
         elif self.model_config['api_type'] == "messages":
             return self._call_messages(messages, tools)
+        elif self.model_config['api_type'] == "cursor":
+            return self._call_cursor(messages, tools)
         elif self.model_config['api_type'] == "gemini":
             return self._call_gemini(messages, tools)
         else:
