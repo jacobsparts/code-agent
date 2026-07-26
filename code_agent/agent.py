@@ -2526,6 +2526,7 @@ Return only the replacement user prompt text.
         max_turns: int | None = None,
         resume: str | bool = False,
         initial_prompt: str | None = None,
+        non_interactive: bool = False,
     ):
         """Run CLI loop with Python block delimiters."""
         from code_agent.cli.mixin import SQLiteHistory, InputSession
@@ -2652,6 +2653,8 @@ Return only the replacement user prompt text.
                     for line in lines[1:]:
                         print(line)
                 else:
+                    if non_interactive:
+                        break
                     try:
                         user_input = session.prompt(
                             prompt_str,
@@ -4189,6 +4192,11 @@ Examples:
         help="Submit an initial prompt automatically on startup.",
     )
     parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Exit after processing the initial prompt. Requires --prompt.",
+    )
+    parser.add_argument(
         "--no-repl-display",
         action="store_true",
         help="Suppress intermediary REPL display output while the agent is working.",
@@ -4223,6 +4231,9 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.non_interactive and args.prompt is None:
+        parser.error("--non-interactive requires --prompt")
 
     if args.debug:
         log_path = Path(args.debug).expanduser()
@@ -4280,7 +4291,11 @@ Examples:
             repl_transport = remote_transport
     try:
         with ConfiguredAgent() as agent:
-            agent.cli_run(resume=args.resume, initial_prompt=args.prompt)
+            agent.cli_run(
+                resume=args.resume,
+                initial_prompt=args.prompt,
+                non_interactive=args.non_interactive,
+            )
     except ModelNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
