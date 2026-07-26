@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import termios
+import time
 import copy
 import re
 from typing import Optional
@@ -83,6 +84,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
     model = model_choices[0]
     worker_host = "local"
     worker_target = None
+    session_heartbeat_interval = 300
 
 
     def _ensure_setup(self):
@@ -166,6 +168,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         if not ok:
             print(f"{DIM}{self._lock_status_text(lock)}{RESET}")
             return False
+        self._last_session_heartbeat = time.monotonic()
         return True
 
     def _heartbeat_session_lock(self) -> bool:
@@ -173,7 +176,14 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         owner = getattr(self, "_session_lock_owner", None)
         if not session_id or not owner:
             return True
-        return self._session_store.heartbeat_session_lock(session_id, owner)
+        now = time.monotonic()
+        last = getattr(self, "_last_session_heartbeat", None)
+        if last is not None and now - last < self.session_heartbeat_interval:
+            return True
+        ok = self._session_store.heartbeat_session_lock(session_id, owner)
+        if ok:
+            self._last_session_heartbeat = now
+        return ok
 
     def _release_session_lock(self, session_id: str | None = None):
         owner = getattr(self, "_session_lock_owner", None)

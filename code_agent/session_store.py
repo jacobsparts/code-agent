@@ -116,6 +116,7 @@ class SessionStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_session_preview_blobs_key ON session_preview_blobs(key)")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
+            conn.execute("PRAGMA journal_mode = WAL")
 
     def create_session(self, cwd: str, model: str | None = None, host: str = "local") -> str:
         session_id = str(uuid.uuid4())
