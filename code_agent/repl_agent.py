@@ -540,6 +540,10 @@ class ToolREPL(SubREPL):
     def _check_worker_alive(self) -> None:
         """Check if worker is alive, drain queues and raise if dead."""
         if self._transport is None or not self._transport.is_alive():
+            transport = self._transport
+            if transport is not None:
+                transport.join(timeout=0)
+
             # Drain all queues to prevent blocking
             for q in (self._tool_response_queue, self._tool_request_queue, self._output_queue):
                 if q is not None:
@@ -1413,7 +1417,7 @@ Call help(function_name) for parameter descriptions.
                                 continue
                             publish_worker(msg_type, msg_data)
                         except Empty:
-                            pass
+                            repl._check_worker_alive()
                 except KeyboardInterrupt:
                     interrupted_output = repl.interrupt()
                     if interrupted_output:
