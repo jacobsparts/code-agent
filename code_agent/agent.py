@@ -391,8 +391,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         """Replace an eligible interval of completed turns with a persisted preview summary."""
         from code_agent.code_agent_coalesce import Preview
         from code_agent.turn_rollups import (
-            eligible_rollup_units,
-            rollup_units,
+            derive_rollup_eligibility,
             validate_rollup_interval,
         )
 
@@ -427,12 +426,14 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         authoritative_messages, authoritative_state = (
             self._authoritative_persisted_projection()
         )
-        units = rollup_units(events, authoritative_messages, authoritative_state)
-        eligible = eligible_rollup_units(
+        eligibility = derive_rollup_eligibility(
             events,
             authoritative_messages,
             authoritative_state,
         )
+        units = list(eligibility.all_units)
+        eligible_groups = [list(group) for group in eligibility.groups]
+        eligible = list(eligibility.units)
         if not units:
             raise ValueError("no canonical completed rollup units are available.")
         if not eligible:
@@ -460,6 +461,15 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         eligible_set = set(eligible)
         if any(unit not in eligible_set for unit in selected):
             raise ValueError("every unit in the selected interval must be eligible.")
+        if not any(
+            selected == group[start:start + len(selected)]
+            for group in eligible_groups
+            for start in range(len(group) - len(selected) + 1)
+        ):
+            raise ValueError(
+                "selected eligible endpoints cross an uncovered canonical/projected gap; "
+                "choose units from one advertised bracketed group."
+            )
         if sum(len(unit.turn_ids) for unit in selected) < 2:
             raise ValueError("rollup must include at least two completed turns.")
         if not validate_rollup_interval(
@@ -1379,19 +1389,19 @@ def _code_agent_send_rg_available():
     view_images._tool_files_param = "files"
 
     def _rollup_eligibility_ephemeral(self) -> str:
-        from code_agent.turn_rollups import eligible_rollup_line, eligible_rollup_units
+        from code_agent.turn_rollups import derive_rollup_eligibility, eligible_rollup_line
 
         store = getattr(self, "_session_store", None)
         session_id = getattr(self, "_session_id", None)
         state = getattr(self, "_persisted_preview_state", None)
         if store is None or session_id is None or state is None:
             return ""
-        units = eligible_rollup_units(
+        eligibility = derive_rollup_eligibility(
             store.get_events(session_id),
             self.conversation.messages,
             state,
         )
-        return eligible_rollup_line(units)
+        return eligible_rollup_line([list(group) for group in eligibility.groups])
 
     def _context_pressure_ephemeral(self) -> str:
         client = getattr(self, "llm_client", None)
@@ -1587,13 +1597,14 @@ Model-facing user messages beginning with `# Turn N` use N as the stable
 canonical identifier for that user-initiated interaction. These labels are
 navigation metadata; do not repeat or edit them.
 
-When present, `Eligible rollup turns: ...` lists atomic completed historical
-units available to a future `rollup(start_turn, end_turn, summary)` call. A
-single number is a one-turn unit; `A-B` is one inseparable child-preview unit.
-Both endpoints are inclusive and must match listed unit boundaries, and every
-atomic unit in the selected transcript interval must be eligible. Recent,
-active, unlisted, and child-internal turn boundaries are protected and cannot
-be selected.
+When present, `Eligible rollup turns: [...] | [...]` lists bracketed groups of
+atomic completed historical units available to a future
+`rollup(start_turn, end_turn, summary)` call. A single number is a one-turn
+unit; `A-B` is one inseparable child-preview unit. Combine units only within
+one bracketed group. Both endpoints are inclusive and must match listed unit
+boundaries, and every atomic unit in the selected transcript interval must be
+eligible. Recent, active, unlisted, and child-internal turn boundaries are
+protected and cannot be selected.
 
 Use rollup only when detailed historical content is no longer needed in active
 context. When context pressure is high, consider rolling up eligible historical

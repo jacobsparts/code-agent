@@ -144,6 +144,13 @@ def reduce_canonical_message_events(
     messages = []
     exec_start_seq = 0
     pending_transition_seq = None
+    rewind_targets = {
+        payload.get("target_seq")
+        for event in events
+        if event.get("event_type") == "rewind"
+        and isinstance((payload := event.get("payload")), dict)
+        and type(payload.get("target_seq")) is int
+    }
     snapshots = {0: ([], 0, None)}
     for event in events:
         seq = event.get("seq")
@@ -186,9 +193,10 @@ def reduce_canonical_message_events(
             messages = []
             exec_start_seq = seq
             pending_transition_seq = None
-        snapshots[seq] = (
-            copy.deepcopy(messages),
-            exec_start_seq,
-            pending_transition_seq,
-        )
+        if seq in rewind_targets:
+            snapshots[seq] = (
+                copy.deepcopy(messages),
+                exec_start_seq,
+                pending_transition_seq,
+            )
     return coalesce_adjacent_user_messages(messages), exec_start_seq

@@ -1348,15 +1348,19 @@ def test_production_skips_invalid_duplicate_source_candidate_safely():
     assert projected == messages
 
 
-def test_production_normal_pinned_normal_uses_one_ordered_shared_placement(monkeypatch):
-    calls = []
-    original = coalesce_module.place_preview
+def test_production_normal_pinned_normal_reuses_one_semantic_partition(monkeypatch):
+    completed_calls = []
+    original_completed = coalesce_module._completed_interactions
 
-    def recording_place_preview(messages, previews, **kwargs):
-        calls.append((list(previews), kwargs))
-        return original(messages, previews, **kwargs)
+    def recording_completed(messages):
+        completed_calls.append(messages)
+        return original_completed(messages)
 
-    monkeypatch.setattr(coalesce_module, "place_preview", recording_place_preview)
+    monkeypatch.setattr(
+        coalesce_module,
+        "_completed_interactions",
+        recording_completed,
+    )
     messages = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "request", "_event_seq": 1},
@@ -1386,21 +1390,17 @@ def test_production_normal_pinned_normal_uses_one_ordered_shared_placement(monke
         min_savings_chars=0,
     )
 
-    assert len(calls) == 1
-    previews, kwargs = calls[0]
-    assert len(previews) == 3
-    assert [preview.content for preview in previews] == [
+    assert len(completed_calls) == 1
+    coalesced = next(message for message in projected if message.get("_coalesced"))
+    refs = re.findall(r"session://preview/[0-9a-f]{16}", coalesced["content"])
+    expected_contents = [
         coalesce_module._preview_content(messages[2:4], None, None),
         coalesce_module._preview_content(messages[4:6], None, None),
         coalesce_module._preview_content(messages[6:8], None, None),
     ]
-    assert kwargs["source_start_seq"] == 2
-    assert kwargs["source_end_seq"] == 7
-    coalesced = next(message for message in projected if message.get("_coalesced"))
-    refs = re.findall(r"session://preview/[0-9a-f]{16}", coalesced["content"])
     assert refs == [
-        f"session://preview/{preview_key(preview.content)}"
-        for preview in previews
+        f"session://preview/{preview_key(content)}"
+        for content in expected_contents
     ]
 
 

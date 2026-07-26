@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 from code_agent.code_agent_coalesce import (
     PreviewPlacementError,
-    deterministic_interaction_replacement,
-    deterministic_structural_identity,
     has_valid_deterministic_identity,
     is_release_assistant_message,
     is_repl_output_message,
@@ -36,6 +34,13 @@ class RollupUnit:
     source_start_seq: int
     source_end_seq: int
     turn_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RollupEligibility:
+    all_units: tuple[RollupUnit, ...]
+    units: tuple[RollupUnit, ...]
+    groups: tuple[tuple[RollupUnit, ...], ...]
 
 
 def _input_segments(message: dict) -> list[tuple[str, int]]:
@@ -256,13 +261,59 @@ def _validate_projected_turn_coverage(
         for message in outer_messages
     ):
         return False
-    expected = tuple(message["_event_seq"] for message in outer_messages)
+    expected = tuple(sorted({message["_event_seq"] for message in outer_messages}))
     if not expected or expected[0] != source_start or expected[-1] != source_end:
         return False
 
     selected = projected_messages[span.start_index:span.end_index]
+    singleton_indexes = {}
+    for index, message in enumerate(selected):
+        source_range = message_source_range(message)
+        if source_range is not None and source_range[0] == source_range[1]:
+            singleton_indexes.setdefault(source_range[0], []).append(index)
+
+    deferred_singletons = set()
+    ignored_singletons = set()
+    for seq, indexes in singleton_indexes.items():
+        if len(indexes) == 1:
+            continue
+        nodes = [selected[index] for index in indexes]
+        structural = [
+            (
+                node.get("role"),
+                node.get("content"),
+                repr(node.get("_render_segments")),
+            )
+            for node in nodes
+        ]
+        if len(set(structural)) != len(structural):
+            return False
+        if not all(
+            node.get("role") == "user"
+            and is_repl_output_message(node)
+            and not _input_segments(node)
+            for node in nodes
+        ):
+            return False
+        contiguous = indexes == list(range(indexes[0], indexes[-1] + 1))
+        split_around_assistant = (
+            len(indexes) == 2
+            and indexes[1] == indexes[0] + 2
+            and selected[indexes[0] + 1].get("role") == "assistant"
+            and message_source_range(selected[indexes[0] + 1]) is not None
+            and message_source_range(selected[indexes[0] + 1])[1] < seq
+        )
+        if contiguous:
+            ignored_singletons.update(indexes[1:])
+        elif split_around_assistant:
+            deferred_singletons.add(indexes[0])
+        else:
+            return False
+
     cursor = 0
-    for message in selected:
+    for index, message in enumerate(selected):
+        if index in deferred_singletons or index in ignored_singletons:
+            continue
         source_range = message_source_range(message)
         if source_range is None:
             return False
@@ -306,37 +357,10 @@ def _validate_projected_turn_coverage(
         else:
             if active_placement is not None:
                 return False
-            canonical_projection = [
-                {"role": "system", "content": ""},
-                *copy.deepcopy(canonical_messages),
-            ]
-            canonical_blocks = {}
-            for canonical_message in canonical_messages:
-                for match in re.finditer(
-                    r"\[PreviewRef: (?P<uri>session://preview/[^\]\n]+)\]\n"
-                    r".*?"
-                    r"\[/PreviewRef\]",
-                    canonical_message.get("content") or "",
-                    re.DOTALL,
-                ):
-                    canonical_blocks[match.group("uri")] = match.group(0)
-            preserve_preview_refs = {
-                uri: block
-                for uri, block in canonical_blocks.items()
-                if block in (message.get("content") or "")
-            }
             if not has_valid_deterministic_identity(message):
                 return False
-            derived = deterministic_interaction_replacement(
-                canonical_projection,
-                source_start_seq=node_start,
-                source_end_seq=node_end,
-                preserve_preview_refs=preserve_preview_refs,
-            )
-            if (
-                derived is None
-                or deterministic_structural_identity(message)
-                != deterministic_structural_identity(derived[0])
+            if node_expected != tuple(
+                seq for seq in expected if node_start <= seq <= node_end
             ):
                 return False
         cursor = end_cursor
@@ -344,15 +368,12 @@ def _validate_projected_turn_coverage(
     return cursor == len(expected)
 
 
-def rollup_units(
-    events: list[dict],
+def _rollup_units_from_snapshot(
+    turns: list[CompletedTurn],
+    messages: list[dict],
     projected_messages: list[dict],
     persisted_state: PersistedPreviewState,
 ) -> list[RollupUnit]:
-    if not isinstance(persisted_state, PersistedPreviewState):
-        raise TypeError("complete persisted preview state is required")
-    turns = completed_turns(events)
-    messages, _ = _canonical_messages(events)
     units = []
     consumed = set()
 
@@ -398,8 +419,39 @@ def rollup_units(
     return sorted(units, key=lambda unit: order[unit.start_turn])
 
 
-def validate_rollup_interval(
+def rollup_units(
     events: list[dict],
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+) -> list[RollupUnit]:
+    if not isinstance(persisted_state, PersistedPreviewState):
+        raise TypeError("complete persisted preview state is required")
+    messages, exec_start_seq = _canonical_messages(events)
+    turns = [
+        CompletedTurn(
+            segment.segment_id,
+            segment.source_start_seq,
+            segment.source_end_seq,
+            segment.has_execution,
+            segment.identity_kind,
+        )
+        for segment in semantic_segments(messages)
+        if (
+            segment.authoritative
+            and exec_start_seq < segment.source_start_seq <= segment.source_end_seq
+        )
+    ]
+    return _rollup_units_from_snapshot(
+        turns,
+        messages,
+        projected_messages,
+        persisted_state,
+    )
+
+
+def _validate_rollup_interval_snapshot(
+    turns: list[CompletedTurn],
+    canonical_messages: list[dict],
     projected_messages: list[dict],
     persisted_state: PersistedPreviewState,
     units: list[RollupUnit],
@@ -407,8 +459,6 @@ def validate_rollup_interval(
     """Validate that units form an exact complete canonical/projected source interval."""
     if not units:
         return False
-    turns = completed_turns(events)
-    canonical_messages, _ = _canonical_messages(events)
     source_start = units[0].source_start_seq
     source_end = units[-1].source_end_seq
     covered = _range_turns(turns, source_start, source_end)
@@ -466,30 +516,145 @@ def validate_rollup_interval(
     )
 
 
+def validate_rollup_interval(
+    events: list[dict],
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+    units: list[RollupUnit],
+) -> bool:
+    """Validate that units form an exact complete canonical/projected source interval."""
+    turns = completed_turns(events)
+    canonical_messages, _ = _canonical_messages(events)
+    return _validate_rollup_interval_snapshot(
+        turns,
+        canonical_messages,
+        projected_messages,
+        persisted_state,
+        units,
+    )
+
+
+def derive_rollup_eligibility(
+    events: list[dict],
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+) -> RollupEligibility:
+    if not isinstance(persisted_state, PersistedPreviewState):
+        raise TypeError("complete persisted preview state is required")
+    canonical_messages, exec_start_seq = _canonical_messages(events)
+    turns = [
+        CompletedTurn(
+            segment.segment_id,
+            segment.source_start_seq,
+            segment.source_end_seq,
+            segment.has_execution,
+            segment.identity_kind,
+        )
+        for segment in semantic_segments(canonical_messages)
+        if (
+            segment.authoritative
+            and exec_start_seq < segment.source_start_seq <= segment.source_end_seq
+        )
+    ]
+    protected = {turn.turn_id for turn in turns[-3:]}
+    execution_turns = [turn for turn in turns if turn.has_execution]
+    if execution_turns:
+        protected.add(execution_turns[-1].turn_id)
+    all_units = _rollup_units_from_snapshot(
+        turns,
+        canonical_messages,
+        projected_messages,
+        persisted_state,
+    )
+    units = [
+        unit
+        for unit in all_units
+        if not any(turn_id in protected for turn_id in unit.turn_ids)
+    ]
+
+    turn_order = {turn.turn_id: index for index, turn in enumerate(turns)}
+    unit_spans = {}
+    for unit in units:
+        try:
+            unit_spans[unit] = select_projected_span(
+                projected_messages,
+                source_start_seq=unit.source_start_seq,
+                source_end_seq=unit.source_end_seq,
+            )
+        except PreviewPlacementError:
+            continue
+
+    def shares_exact_boundary(left, right):
+        left_span = unit_spans.get(left)
+        right_span = unit_spans.get(right)
+        if left_span is None or right_span is None:
+            return False
+        return (
+            turn_order[left.end_turn] + 1 == turn_order[right.start_turn]
+            and left_span.end_index == right_span.start_index
+        )
+
+    groups = []
+    current = []
+    for unit in units:
+        if current and not shares_exact_boundary(current[-1], unit):
+            if sum(len(item.turn_ids) for item in current) >= 2:
+                groups.append(current)
+            current = []
+        current.append(unit)
+    if current and sum(len(item.turn_ids) for item in current) >= 2:
+        groups.append(current)
+    return RollupEligibility(
+        all_units=tuple(all_units),
+        units=tuple(unit for group in groups for unit in group),
+        groups=tuple(tuple(group) for group in groups),
+    )
+
+
+def eligible_rollup_groups(
+    events: list[dict],
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+) -> list[list[RollupUnit]]:
+    return [
+        list(group)
+        for group in derive_rollup_eligibility(
+            events,
+            projected_messages,
+            persisted_state,
+        ).groups
+    ]
+
+
 def eligible_rollup_units(
     events: list[dict],
     projected_messages: list[dict],
     persisted_state: PersistedPreviewState,
 ) -> list[RollupUnit]:
-    turns = completed_turns(events)
-    protected = {turn.turn_id for turn in turns[-3:]}
-    execution_turns = [turn for turn in turns if turn.has_execution]
-    if execution_turns:
-        protected.add(execution_turns[-1].turn_id)
-    return [
-        unit
-        for unit in rollup_units(events, projected_messages, persisted_state)
-        if not any(turn_id in protected for turn_id in unit.turn_ids)
-    ]
+    return list(
+        derive_rollup_eligibility(
+            events,
+            projected_messages,
+            persisted_state,
+        ).units
+    )
 
 
-def eligible_rollup_line(units: list[RollupUnit]) -> str:
-    if sum(len(unit.turn_ids) for unit in units) < 2:
+def eligible_rollup_line(groups: list[list[RollupUnit]]) -> str:
+    if not groups:
         return ""
-    entries = [
-        str(unit.start_turn)
-        if unit.start_turn == unit.end_turn
-        else f"{unit.start_turn}-{unit.end_turn}"
-        for unit in units
-    ]
-    return "Eligible rollup turns: " + ", ".join(entries)
+
+    def render_group(group):
+        entries = [
+            str(unit.start_turn)
+            if unit.start_turn == unit.end_turn
+            else f"{unit.start_turn}-{unit.end_turn}"
+            for unit in group
+        ]
+        return "[" + ", ".join(entries) + "]"
+
+    return (
+        "Eligible rollup turns: "
+        + " | ".join(render_group(group) for group in groups)
+        + " (combine units only within one bracketed group)"
+    )

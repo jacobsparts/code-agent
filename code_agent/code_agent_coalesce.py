@@ -210,21 +210,31 @@ def select_projected_span(
                 f"projected node [{node_start}, {node_end}]"
             )
 
-    if len(start_matches) > 1:
-        raise PreviewBoundaryError(
-            f"ambiguous projected start boundary for requested range {requested}"
-        )
-    if len(end_matches) > 1:
-        raise PreviewBoundaryError(
-            f"ambiguous projected end boundary for requested range {requested}"
-        )
     if not start_matches or not end_matches:
         raise PreviewBoundaryError(
             f"missing projected boundary for requested range {requested}"
         )
+    repeated_start_slice = all(
+        message_source_range(messages[index])
+        == (source_start_seq, source_start_seq)
+        for index in start_matches
+    )
+    repeated_end_slice = all(
+        message_source_range(messages[index])
+        == (source_end_seq, source_end_seq)
+        for index in end_matches
+    )
+    if len(start_matches) > 1 and not repeated_start_slice:
+        raise PreviewBoundaryError(
+            f"ambiguous projected start boundary for requested range {requested}"
+        )
+    if len(end_matches) > 1 and not repeated_end_slice:
+        raise PreviewBoundaryError(
+            f"ambiguous projected end boundary for requested range {requested}"
+        )
 
     start_index = start_matches[0]
-    end_index = end_matches[0] + 1
+    end_index = end_matches[-1] + 1
     if start_index >= end_index:
         raise PreviewBoundaryError(
             f"source-aware projected nodes are not ordered for requested range {requested}"
@@ -245,12 +255,45 @@ def select_projected_span(
         )
 
     previous = None
-    for _, node_start, node_end in overlapping:
+    for offset, (index, node_start, node_end) in enumerate(overlapping):
         if previous is not None and node_start <= previous[1]:
-            raise PreviewPlacementError(
-                f"non-contiguous projected span: node [{node_start}, {node_end}] "
-                f"overlaps or precedes [{previous[0]}, {previous[1]}]"
+            repeated_event_slice = (
+                node_start == node_end == previous[0] == previous[1]
             )
+            next_item = (
+                overlapping[offset + 1]
+                if offset + 1 < len(overlapping)
+                else None
+            )
+            same_event_indexes = [
+                item_index
+                for item_index, item_start, item_end in overlapping
+                if (item_start, item_end) == previous
+            ]
+            all_event_indexes = [
+                item_index
+                for item_index, message in enumerate(messages)
+                if message_source_range(message) == previous
+            ]
+            output_sandwich = (
+                previous[0] == previous[1]
+                and next_item is not None
+                and next_item[1:] == previous
+                and same_event_indexes == [index - 1, next_item[0]]
+                and all_event_indexes == same_event_indexes
+                and messages[index - 1].get("role") == "user"
+                and is_repl_output_message(messages[index - 1])
+                and not _real_user_message(messages[index - 1])
+                and messages[index].get("role") == "assistant"
+                and messages[next_item[0]].get("role") == "user"
+                and is_repl_output_message(messages[next_item[0]])
+                and not _real_user_message(messages[next_item[0]])
+            )
+            if not (repeated_event_slice or output_sandwich):
+                raise PreviewPlacementError(
+                    f"non-contiguous projected span: node [{node_start}, {node_end}] "
+                    f"overlaps or precedes [{previous[0]}, {previous[1]}]"
+                )
         previous = (node_start, node_end)
 
     if overlapping[0][1] != source_start_seq or overlapping[-1][2] != source_end_seq:
@@ -474,69 +517,73 @@ def _stdout_message_from(template: dict, content: str, segment: dict | None = No
     return _message_from_segments(template, [stdout_segment], user_input=False)
 
 
-def _split_structured_appended_user(msg: dict) -> tuple[list[dict], dict] | None:
+def _split_structured_user_nodes(msg: dict) -> list[dict] | None:
     segments = _structured_render_segments(msg)
-    if segments is None:
+    if segments is None or len(segments) <= 1:
         return None
-    input_indexes = [
-        index
-        for index, segment in enumerate(segments)
-        if segment.get("type") == "input"
+
+    source_aware = [
+        type(segment.get("_event_seq")) is int
+        for segment in segments
     ]
-    if len(input_indexes) != 1:
+    if any(source_aware) and not all(source_aware):
         return None
-    input_index = input_indexes[0]
-    if any(
-        segment.get("type") == "input"
-        for segment in segments[:input_index]
-    ) or any(
-        segment.get("type") != "input"
-        and str(segment.get("content") or "")
-        for segment in segments[input_index + 1:]
-    ):
-        return None
-    stdout_segments = [
-        segment for segment in segments[:input_index]
-        if segment.get("type") == "stdout"
+    seqs = [
+        segment.get("_event_seq")
+        for segment in segments
+        if type(segment.get("_event_seq")) is int
     ]
-    if not stdout_segments:
+    if seqs and any(current <= previous for previous, current in zip(seqs, seqs[1:])):
         return None
-    input_message = _message_from_segments(
-        msg,
-        [segments[input_index]],
-        user_input=True,
-    )
-    return stdout_segments, input_message
+
+    input_seqs = []
+    nodes = []
+    for segment in segments:
+        segment_type = segment.get("type")
+        if segment_type not in {"stdout", "input"}:
+            return None
+        content = str(segment.get("content") or "")
+        if not content:
+            return None
+        seq = segment.get("_event_seq")
+        if segment_type == "input":
+            if type(seq) is int:
+                if seq in input_seqs:
+                    return None
+                input_seqs.append(seq)
+            nodes.append(_message_from_segments(msg, [segment], user_input=True))
+        else:
+            nodes.append(_message_from_segments(msg, [segment], user_input=False))
+    return nodes
 
 
 def normalize_repl_messages(messages: list[dict]) -> list[dict]:
     out = []
     for msg in messages:
         structured = (
-            _split_structured_appended_user(msg)
+            _split_structured_user_nodes(msg)
             if msg.get("role") == "user"
             else None
         )
         if structured is not None:
-            stdout_segments, input_message = structured
-            stdout_content = "".join(
-                str(segment.get("content") or "")
-                for segment in stdout_segments
-            )
-            prefix, release_text = split_release_repl_output(stdout_content)
-            if (
-                release_text is not None
-                and out
-                and out[-1].get("role") == "assistant"
-                and is_release_assistant_message(out[-1])
-            ):
-                release_msg = out.pop()
-                out.append(_stdout_message_from(msg, prefix, stdout_segments[0]))
-                out.append(release_msg)
-                out.append(_stdout_message_from(msg, release_text, stdout_segments[-1]))
-            else:
-                out.append(_message_from_segments(msg, stdout_segments, user_input=False))
-            out.append(input_message)
+            for node in structured:
+                if node.get("role") == "user" and is_repl_output_message(node):
+                    prefix, release_text = split_release_repl_output(
+                        message_stdout(node)
+                    )
+                    if (
+                        release_text is not None
+                        and out
+                        and out[-1].get("role") == "assistant"
+                        and is_release_assistant_message(out[-1])
+                    ):
+                        release_msg = out.pop()
+                        segment = node["_render_segments"][0]
+                        out.append(_stdout_message_from(node, prefix, segment))
+                        out.append(release_msg)
+                        out.append(_stdout_message_from(node, release_text, segment))
+                        continue
+                out.append(node)
             continue
 
         if msg.get("role") == "user" and is_repl_output_message(msg) and msg.get("_user_content") is not None:
@@ -620,11 +667,41 @@ def _associated_repl_output(
 
 def semantic_boundaries(messages: list[dict]) -> dict[int, SemanticBoundary]:
     boundaries = {}
-    event_counts = {}
-    for message in messages:
+    event_indexes = {}
+    for index, message in enumerate(messages):
         seq = message.get("_event_seq")
         if type(seq) is int:
-            event_counts[seq] = event_counts.get(seq, 0) + 1
+            event_indexes.setdefault(seq, []).append(index)
+
+    def unique_canonical_assistant(index):
+        seq = messages[index].get("_event_seq")
+        return seq is None or (
+            type(seq) is int and event_indexes.get(seq) == [index]
+        )
+
+    def complete_output_group(first_index, assistant_index):
+        if first_index is None:
+            return None, True
+        seq = messages[first_index].get("_event_seq")
+        if seq is None:
+            return first_index, True
+        if type(seq) is not int:
+            return first_index, False
+        indexes = event_indexes.get(seq, [])
+        valid_nodes = bool(indexes) and all(
+            messages[item].get("role") == "user"
+            and is_repl_output_message(messages[item])
+            and not _real_user_message(messages[item])
+            for item in indexes
+        )
+        contiguous = indexes == list(range(indexes[0], indexes[-1] + 1))
+        split_around_assistant = (
+            len(indexes) == 2
+            and indexes == [assistant_index - 1, assistant_index + 1]
+            and first_index == assistant_index + 1
+        )
+        valid = valid_nodes and (contiguous or split_around_assistant)
+        return indexes[-1] if indexes else first_index, valid
 
     for index, message in enumerate(messages):
         if message.get("role") != "assistant":
@@ -640,6 +717,8 @@ def semantic_boundaries(messages: list[dict]) -> dict[int, SemanticBoundary]:
             continue
         if is_transition:
             output_index, output_valid = _associated_repl_output(messages, index)
+            output_index, group_valid = complete_output_group(output_index, index)
+            output_valid = output_valid and group_valid
         else:
             output_index = None
             output_valid = True
@@ -654,17 +733,8 @@ def semantic_boundaries(messages: list[dict]) -> dict[int, SemanticBoundary]:
                         and not following.get("_coalesced")
                     )
                 ):
-                    output_index = index + 1
-        boundary_seq = message.get("_event_seq")
-        authoritative = (
-            output_valid
-            and type(boundary_seq) is int
-            and event_counts.get(boundary_seq) == 1
-            and (
-                output_index is None
-                or event_counts.get(messages[output_index].get("_event_seq")) == 1
-            )
-        )
+                    output_index, output_valid = complete_output_group(index + 1, index)
+        authoritative = output_valid and unique_canonical_assistant(index)
         boundaries[index] = SemanticBoundary(
             boundary_index=index,
             boundary_output_index=output_index,
@@ -683,18 +753,138 @@ def semantic_segments(messages: list[dict]) -> list[SemanticSegment]:
     anchor = None
     segment_start = None
     skip_output = None
-
     boundaries = semantic_boundaries(messages)
-    identity_counts = {}
-    for message in messages:
-        seq = message.get("_event_seq")
-        if type(seq) is int and (
-            _real_user_message(message)
-            or _literal_observation_transition(message)
-        ):
-            identity_counts[seq] = identity_counts.get(seq, 0) + 1
-
     first_index = 1 if messages and messages[0].get("role") == "system" else 0
+
+    def input_identity(message, index):
+        input_segments = [
+            segment
+            for segment in message.get("_render_segments") or []
+            if isinstance(segment, dict) and segment.get("type") == "input"
+        ]
+        seq = message.get("_event_seq")
+        valid = (
+            len(input_segments) in (0, 1)
+            and type(seq) is int
+            and (not input_segments or input_segments[0].get("_event_seq") == seq)
+        )
+        return (seq if valid else index), valid
+
+    def range_is_authoritative(start_index, end_index):
+        previous = None
+        seen_nodes = set()
+        selected = messages[start_index:end_index + 1]
+        for offset, message in enumerate(selected):
+            if (
+                message.get("_synthetic")
+                and not message.get("_coalesced")
+                and not message.get("_virtual_interaction_boundary")
+            ):
+                continue
+            source_range = message_source_range(message)
+            if source_range is None:
+                return False
+            start, end = source_range
+            if type(start) is not int or type(end) is not int or start > end:
+                return False
+            if previous is not None and start < previous[0]:
+                next_range = (
+                    message_source_range(selected[offset + 1])
+                    if offset + 1 < len(selected)
+                    else None
+                )
+                split_output_sandwich = (
+                    previous[0] == previous[1]
+                    and next_range == previous
+                    and message.get("role") == "assistant"
+                    and start == end
+                )
+                if not split_output_sandwich:
+                    return False
+            structural = (
+                start,
+                end,
+                message.get("role"),
+                message.get("content"),
+                repr(message.get("_render_segments")),
+            )
+            if structural in seen_nodes:
+                return False
+            seen_nodes.add(structural)
+            if previous is not None and start <= previous[1]:
+                next_range = (
+                    message_source_range(selected[offset + 1])
+                    if offset + 1 < len(selected)
+                    else None
+                )
+                repeated_slice = start == end == previous[0] == previous[1]
+                split_output_sandwich = (
+                    previous[0] == previous[1]
+                    and next_range == previous
+                    and message.get("role") == "assistant"
+                    and start == end
+                )
+                if not (repeated_slice or split_output_sandwich):
+                    return False
+            previous = source_range
+        return previous is not None
+
+    def append_segment(
+        boundary_index,
+        boundary_output_index,
+        *,
+        transition=False,
+        boundary_authoritative=True,
+    ):
+        end_index = (
+            boundary_output_index
+            if boundary_output_index is not None
+            else boundary_index
+        )
+        start_range = (
+            message_source_range(messages[segment_start])
+            if segment_start is not None and segment_start < len(messages)
+            else None
+        )
+        end_range = message_source_range(messages[end_index])
+        has_no_provenance = all(
+            message_source_range(message) is None
+            for message in messages[segment_start:end_index + 1]
+            if not (
+                message.get("_synthetic")
+                and not message.get("_coalesced")
+                and not message.get("_virtual_interaction_boundary")
+            )
+        )
+        source_valid = (
+            authoritative
+            and boundary_authoritative
+            and (
+                has_no_provenance
+                or (
+                    start_range is not None
+                    and end_range is not None
+                    and start_range[0] <= end_range[1]
+                    and range_is_authoritative(segment_start, end_index)
+                )
+            )
+        )
+        segments.append(SemanticSegment(
+            segment_id=identity if identity is not None else segment_start,
+            identity_kind=identity_kind,
+            anchor_index=anchor,
+            boundary_index=boundary_index,
+            boundary_output_index=boundary_output_index,
+            source_start_seq=start_range[0] if source_valid else segment_start,
+            source_end_seq=end_range[1] if source_valid else end_index,
+            has_execution=(
+                transition
+                or _interaction_has_execution(messages, anchor, boundary_index)
+            ),
+            authoritative=source_valid,
+        ))
+        return end_index
+
     for index, message in enumerate(messages[first_index:], start=first_index):
         if index == skip_output:
             continue
@@ -705,72 +895,39 @@ def semantic_segments(messages: list[dict]) -> list[SemanticSegment]:
         ):
             continue
 
-        starts_interaction = _real_user_message(message)
-        if starts_interaction:
-            if identity is not None:
-                identity = identity_kind = anchor = segment_start = None
-                authoritative = False
-                continue
-            input_segments = [
-                segment
-                for segment in message.get("_render_segments") or []
-                if isinstance(segment, dict) and segment.get("type") == "input"
-            ]
-            seq = message.get("_event_seq")
-            authoritative = (
-                len(input_segments) in (0, 1)
-                and type(seq) is int
-                and (
-                    not input_segments
-                    or input_segments[0].get("_event_seq") == seq
-                )
-            )
-            identity = seq if authoritative else index
+        if _real_user_message(message):
+            if identity is not None and segment_start is not None:
+                end_index = index - 1
+                while end_index >= segment_start and (
+                    messages[end_index].get("_synthetic")
+                    and not messages[end_index].get("_coalesced")
+                    and not messages[end_index].get("_virtual_interaction_boundary")
+                ):
+                    end_index -= 1
+                if end_index >= segment_start:
+                    append_segment(end_index, None)
+            identity, authoritative = input_identity(message, index)
             identity_kind = "turn"
             anchor = index
             segment_start = index
+            skip_output = None
             continue
 
         if identity is None or index not in boundaries:
             continue
 
         boundary = boundaries[index]
-        is_transition = boundary.is_transition
-        transition_seq = boundary.transition_seq
-        boundary_output = boundary.boundary_output_index
-        end_index = boundary_output if boundary_output is not None else index
-        start_range = message_source_range(messages[segment_start])
-        end_range = message_source_range(messages[end_index])
-        source_valid = (
-            authoritative
-            and boundary.authoritative
-            and identity_counts.get(identity) == 1
-            and start_range is not None
-            and end_range is not None
-            and type(start_range[0]) is int
-            and type(end_range[1]) is int
-            and start_range[0] <= end_range[1]
+        end_index = append_segment(
+            index,
+            boundary.boundary_output_index,
+            transition=boundary.is_transition,
+            boundary_authoritative=boundary.authoritative,
         )
-        segments.append(SemanticSegment(
-            segment_id=identity,
-            identity_kind=identity_kind,
-            anchor_index=anchor,
-            boundary_index=index,
-            boundary_output_index=boundary_output,
-            source_start_seq=start_range[0] if source_valid else index,
-            source_end_seq=end_range[1] if source_valid else end_index,
-            has_execution=(
-                is_transition
-                or _interaction_has_execution(messages, anchor, index)
-            ),
-            authoritative=source_valid,
-        ))
-
-        skip_output = boundary_output
-        if is_transition:
-            identity = transition_seq
+        skip_output = boundary.boundary_output_index
+        if boundary.is_transition:
+            identity = boundary.transition_seq
             identity_kind = "checkpoint"
-            authoritative = True
+            authoritative = boundary.authoritative
             anchor = end_index
             segment_start = end_index + 1
         else:
@@ -1266,6 +1423,36 @@ def _coalesced_ordered_sections(
     return sections
 
 
+def _interaction_body_end(messages: list[dict], item: SemanticSegment) -> int:
+    end = item.boundary_index
+    output_index = item.boundary_output_index
+    if output_index is None:
+        return end
+    output_range = message_source_range(messages[output_index])
+    if output_range is None or output_range[0] != output_range[1]:
+        return end
+    output_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message_source_range(message) == output_range
+    ]
+    if output_indexes != [end - 1, output_index]:
+        return end
+    if not all(
+        messages[index].get("role") == "user"
+        and is_repl_output_message(messages[index])
+        and not _real_user_message(messages[index])
+        for index in output_indexes
+    ):
+        return end
+    assistant_range = message_source_range(messages[end])
+    if (
+        assistant_range is None
+        or assistant_range[0] != assistant_range[1]
+        or assistant_range[0] >= output_range[0]
+    ):
+        return end
+    return end - 1
 
 
 def deterministic_interaction_replacement(
@@ -1275,9 +1462,19 @@ def deterministic_interaction_replacement(
     source_end_seq: int | None = None,
     interaction_index: int | None = None,
     preserve_preview_refs=None,
+    _normalized: list[dict] | None = None,
+    _interactions: list[SemanticSegment] | None = None,
 ) -> tuple[dict, list[str], dict[str, str]] | None:
-    normalized = normalize_repl_messages(messages)
-    interactions = _completed_interactions(normalized)
+    normalized = (
+        normalize_repl_messages(messages)
+        if _normalized is None
+        else _normalized
+    )
+    interactions = (
+        _completed_interactions(normalized)
+        if _interactions is None
+        else _interactions
+    )
     if interaction_index is not None:
         if not 0 <= interaction_index < len(interactions):
             return None
@@ -1289,9 +1486,29 @@ def deterministic_interaction_replacement(
             )
         candidates = interactions
     for item in candidates:
+        candidate_ranges = [
+            message_source_range(message)
+            for message in normalized[
+                item.anchor_index:
+                (item.boundary_output_index or item.boundary_index) + 1
+            ]
+        ]
+        if (
+            not item.authoritative
+            and all(source_range is not None for source_range in candidate_ranges)
+            and any(
+                current[0] < previous[0]
+                for previous, current in zip(
+                    candidate_ranges,
+                    candidate_ranges[1:],
+                )
+            )
+        ):
+            continue
         start = item.anchor_index
         release = item.boundary_index
-        range_messages = normalized[start + 1:release]
+        body_end = _interaction_body_end(normalized, item)
+        range_messages = normalized[start + 1:body_end]
         if not range_messages or any(message.get("_coalesced") for message in range_messages):
             continue
         source_ranges = [message_source_range(message) for message in range_messages]
@@ -1346,20 +1563,23 @@ def deterministic_interaction_replacement(
             )
             for _, section_content, observations in section_contents
         ]
-        materialized_contents = {}
-        try:
-            candidate, keys = place_preview(
-                normalized,
-                previews,
-                save_preview_blob=materialized_contents.setdefault,
-                preserve_preview_refs=preserve_preview_refs,
-                **placement_kwargs,
-            )
-        except PreviewPlacementError:
-            return None
-        replacement = candidate[start + 1]
+        materialized = [
+            materialize_preview(preview, preview.content)
+            for preview in previews
+        ]
+        replacement = make_preview_replacement(
+            [rendered for _, _, rendered in materialized],
+            range_messages,
+            preserve_preview_refs=preserve_preview_refs,
+            source_start_seq=placement_kwargs.get("source_start_seq"),
+            source_end_seq=placement_kwargs.get("source_end_seq"),
+        )
         _sign_deterministic_replacement(replacement)
-        return replacement, keys, materialized_contents
+        return (
+            replacement,
+            [key for key, _, _ in materialized],
+            {key: content for key, content, _ in materialized},
+        )
     return None
 
 
@@ -1412,13 +1632,16 @@ def coalesce_repl_messages(
             continue
         start = item.anchor_index
         release = item.boundary_index
-        range_messages = messages[start + 1:item.boundary_index]
+        body_end = _interaction_body_end(messages, item)
+        range_messages = messages[start + 1:body_end]
         if not range_messages:
             continue
         derived = deterministic_interaction_replacement(
             messages,
             interaction_index=idx,
             preserve_preview_refs=preserve_preview_refs,
+            _normalized=messages,
+            _interactions=interactions,
         )
         if derived is None:
             continue
@@ -1451,7 +1674,7 @@ def coalesce_repl_messages(
                 auto_expand_preview_refs.append(f"session://preview/{key}")
 
         replacements[start] = projected_replacement
-        skip_indexes.update(range(start + 1, release))
+        skip_indexes.update(range(start + 1, body_end))
 
     projected = [copy.deepcopy(messages[0])]
     for i, msg in enumerate(messages[1:], start=1):

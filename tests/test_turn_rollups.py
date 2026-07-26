@@ -8,6 +8,7 @@ import pytest
 from code_agent.code_agent_coalesce import coalesce_repl_messages
 from code_agent.code_agent_coalesce import make_preview_replacement
 from code_agent.code_agent_coalesce import message_source_range
+from code_agent.code_agent_coalesce import normalize_repl_messages
 from code_agent.code_agent_coalesce import replace_projected_span
 from code_agent.code_agent_coalesce import select_projected_span
 from code_agent.code_agent_coalesce import semantic_segments
@@ -19,6 +20,8 @@ from code_agent.turn_rollups import (
     CompletedTurn,
     RollupUnit,
     completed_turns,
+    derive_rollup_eligibility,
+    eligible_rollup_groups,
     eligible_rollup_line,
     eligible_rollup_units,
     render_semantic_labels,
@@ -487,8 +490,15 @@ def test_deterministic_coalescing_preserves_older_eligible_units():
         (ids[3],),
         (ids[4],),
     ]
-    assert eligible_rollup_line(eligible) == (
-        "Eligible rollup turns: " + ", ".join(str(turn_id) for turn_id in ids[:5])
+    groups = eligible_rollup_groups(
+        events,
+        projection,
+        PersistedPreviewState.empty(),
+    )
+    assert eligible_rollup_line(groups) == (
+        "Eligible rollup turns: ["
+        + ", ".join(str(turn_id) for turn_id in ids[:5])
+        + "] (combine units only within one bracketed group)"
     )
 
 
@@ -519,8 +529,13 @@ def test_active_child_is_atomic_and_eligibility_line_is_single_ordered_line():
     units = rollup_units(events, projection, state)
     assert units[1].turn_ids == (ids[1], ids[2])
     eligible = eligible_rollup_units(events, projection, state)
-    assert eligible_rollup_line(eligible) == (
-        f"Eligible rollup turns: {ids[0]}, {ids[1]}-{ids[2]}, {ids[3]}, {ids[4]}"
+    assert [unit.turn_ids for unit in eligible] == [
+        (ids[0],), (ids[1], ids[2]), (ids[3],), (ids[4],)
+    ]
+    groups = eligible_rollup_groups(events, projection, state)
+    assert eligible_rollup_line(groups) == (
+        f"Eligible rollup turns: [{ids[0]}, {ids[1]}-{ids[2]}, {ids[3]}, {ids[4]}] "
+        "(combine units only within one bracketed group)"
     )
     assert eligible_rollup_line([]) == ""
 
@@ -528,13 +543,174 @@ def test_active_child_is_atomic_and_eligibility_line_is_single_ordered_line():
 def test_eligibility_line_hides_a_single_completed_turn():
     unit = RollupUnit(6, 6, 6, 7, (6,))
 
-    assert eligible_rollup_line([unit]) == ""
+    assert eligible_rollup_line([]) == ""
 
 
 def test_eligibility_line_keeps_one_atomic_multi_turn_unit():
     unit = RollupUnit(6, 14, 6, 15, (6, 10, 14))
 
-    assert eligible_rollup_line([unit]) == "Eligible rollup turns: 6-14"
+    assert eligible_rollup_line([[unit]]) == (
+        "Eligible rollup turns: [6-14] "
+        "(combine units only within one bracketed group)"
+    )
+
+
+
+def test_sparse_individually_covered_units_without_valid_pairs_are_not_advertised(
+    monkeypatch,
+):
+    import code_agent.turn_rollups as turn_rollups
+
+    units = [
+        RollupUnit(141, 141, 141, 142, (141,)),
+        RollupUnit(313, 313, 313, 314, (313,)),
+        RollupUnit(317, 317, 317, 318, (317,)),
+        RollupUnit(321, 321, 321, 322, (321,)),
+        RollupUnit(325, 325, 325, 326, (325,)),
+    ]
+    turns = [
+        CompletedTurn(unit.start_turn, unit.source_start_seq, unit.source_end_seq, False)
+        for unit in units
+    ] + [
+        CompletedTurn(turn_id, turn_id, turn_id + 1, False)
+        for turn_id in (400, 404, 408)
+    ]
+    monkeypatch.setattr(
+        turn_rollups,
+        "_canonical_messages",
+        lambda events: ([{"role": "user", "_event_seq": unit.start_turn} for unit in units], 0),
+    )
+    monkeypatch.setattr(turn_rollups, "semantic_segments", lambda messages: [
+        SimpleNamespace(
+            segment_id=turn.turn_id,
+            source_start_seq=turn.source_start_seq,
+            source_end_seq=turn.source_end_seq,
+            has_execution=False,
+            identity_kind="turn",
+            authoritative=True,
+        )
+        for turn in turns
+    ])
+    monkeypatch.setattr(turn_rollups, "_rollup_units_from_snapshot", lambda *args: units)
+    spans = {
+        141: SimpleNamespace(start_index=0, end_index=1),
+        313: SimpleNamespace(start_index=2, end_index=3),
+        317: SimpleNamespace(start_index=4, end_index=5),
+        321: SimpleNamespace(start_index=6, end_index=7),
+        325: SimpleNamespace(start_index=7, end_index=8),
+    }
+    monkeypatch.setattr(
+        turn_rollups,
+        "select_projected_span",
+        lambda projected, source_start_seq, source_end_seq: spans[source_start_seq],
+    )
+
+    groups = eligible_rollup_groups([], [], PersistedPreviewState.empty())
+    assert groups == [[units[3], units[4]]]
+    assert eligible_rollup_units([], [], PersistedPreviewState.empty()) == [
+        units[3],
+        units[4],
+    ]
+    assert eligible_rollup_line(groups) == (
+        "Eligible rollup turns: [321, 325] "
+        "(combine units only within one bracketed group)"
+    )
+
+
+
+@pytest.mark.parametrize(
+    ("count", "execution_ids", "coalesce"),
+    [
+        (8, set(), False),
+        (10, {1, 9, 17}, False),
+        (12, {1, 9, 17, 25}, True),
+    ],
+)
+def test_group_derivation_matches_authoritative_adjacent_validation(
+    count,
+    execution_ids,
+    coalesce,
+):
+    from code_agent.turn_rollups import validate_rollup_interval
+
+    events, _ = completed_events(count, execution_ids=execution_ids)
+    projection = projected_messages(events)
+    if coalesce:
+        projection = coalesce_repl_messages(
+            projection,
+            keep_last_interactions=3,
+            keep_last_execution_interactions=1,
+            min_savings_chars=0,
+        )
+    state = PersistedPreviewState.empty()
+    eligibility = derive_rollup_eligibility(events, projection, state)
+    turns = completed_turns(events)
+    protected = {turn.turn_id for turn in turns[-3:]}
+    execution_turns = [turn for turn in turns if turn.has_execution]
+    if execution_turns:
+        protected.add(execution_turns[-1].turn_id)
+    candidates = [
+        unit
+        for unit in eligibility.all_units
+        if not any(turn_id in protected for turn_id in unit.turn_ids)
+    ]
+
+    expected = []
+    current = []
+    for unit in candidates:
+        if current and not validate_rollup_interval(
+            events,
+            projection,
+            state,
+            [current[-1], unit],
+        ):
+            if sum(len(item.turn_ids) for item in current) >= 2:
+                expected.append(current)
+            current = []
+        current.append(unit)
+    if current and sum(len(item.turn_ids) for item in current) >= 2:
+        expected.append(current)
+
+    assert [list(group) for group in eligibility.groups] == expected
+
+
+def test_group_derivation_builds_one_snapshot_without_candidate_revalidation(
+    monkeypatch,
+):
+    import code_agent.turn_rollups as turn_rollups
+
+    events, _ = completed_events(20)
+    projection = projected_messages(events)
+    canonical_calls = 0
+    validation_calls = 0
+    original_canonical = turn_rollups._canonical_messages
+
+    def counted_canonical(snapshot_events):
+        nonlocal canonical_calls
+        canonical_calls += 1
+        return original_canonical(snapshot_events)
+
+    def counted_validation(*args):
+        nonlocal validation_calls
+        validation_calls += 1
+        return True
+
+    monkeypatch.setattr(turn_rollups, "_canonical_messages", counted_canonical)
+    monkeypatch.setattr(
+        turn_rollups,
+        "_validate_rollup_interval_snapshot",
+        counted_validation,
+    )
+
+    eligibility = derive_rollup_eligibility(
+        events,
+        projection,
+        PersistedPreviewState.empty(),
+    )
+
+    assert eligibility.groups
+    assert canonical_calls == 1
+    assert validation_calls == 0
 
 
 def test_structured_stdout_is_not_a_turn_and_counts_as_execution():
@@ -1791,7 +1967,7 @@ def test_rollup_maps_nonconsecutive_canonical_units_and_calls_persistence_once(m
         calls.append((preview, kwargs)) or ("preview-key", 99)
     )
     monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(turn_rollups, "eligible_rollup_units", lambda *args: units)
+    monkeypatch.setattr(turn_rollups, "derive_rollup_eligibility", lambda *args: turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),)))
     monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
 
     result = CodeAgentBase.rollup(agent, 2, 11, "summary")
@@ -1816,7 +1992,13 @@ def test_rollup_requires_eligible_outer_boundaries_and_every_selected_unit(monke
     agent.create_persisted_preview = lambda *args, **kwargs: pytest.fail("must not persist")
     monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
     monkeypatch.setattr(
-        turn_rollups, "eligible_rollup_units", lambda *args: [units[0], units[2]]
+        turn_rollups,
+        "derive_rollup_eligibility",
+        lambda *args: turn_rollups.RollupEligibility(
+            tuple(units),
+            (units[0], units[2]),
+            ((units[0],), (units[2],)),
+        ),
     )
     monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
 
@@ -1826,6 +2008,39 @@ def test_rollup_requires_eligible_outer_boundaries_and_every_selected_unit(monke
         CodeAgentBase.rollup(agent, 2, 20, "summary")
     with pytest.raises(ValueError, match="start_turn is not an eligible unit boundary"):
         CodeAgentBase.rollup(agent, 7, 20, "summary")
+
+
+
+def test_rollup_reports_uncovered_gap_between_individually_eligible_groups(
+    monkeypatch,
+):
+    from code_agent.agent import CodeAgentBase
+    import code_agent.turn_rollups as turn_rollups
+
+    units = [
+        turn_rollups.RollupUnit(141, 141, 10, 12, (141,)),
+        turn_rollups.RollupUnit(313, 313, 20, 22, (313,)),
+        turn_rollups.RollupUnit(317, 317, 30, 32, (317,)),
+        turn_rollups.RollupUnit(321, 321, 40, 42, (321,)),
+    ]
+    agent = _mock_rollup_agent(units)
+    agent.create_persisted_preview = lambda *args, **kwargs: pytest.fail(
+        "must not persist"
+    )
+    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
+    monkeypatch.setattr(
+        turn_rollups,
+        "derive_rollup_eligibility",
+        lambda *args: turn_rollups.RollupEligibility(
+            tuple(units),
+            tuple(units),
+            (tuple(units[:2]), tuple(units[2:])),
+        ),
+    )
+    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
+
+    with pytest.raises(ValueError, match="uncovered canonical/projected gap"):
+        CodeAgentBase.rollup(agent, 141, 321, "summary")
 
 
 def test_rollup_rejects_reversed_and_single_turn_intervals(monkeypatch):
@@ -1839,7 +2054,7 @@ def test_rollup_rejects_reversed_and_single_turn_intervals(monkeypatch):
     agent = _mock_rollup_agent(units)
     agent.create_persisted_preview = lambda *args, **kwargs: pytest.fail("must not persist")
     monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(turn_rollups, "eligible_rollup_units", lambda *args: units)
+    monkeypatch.setattr(turn_rollups, "derive_rollup_eligibility", lambda *args: turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),)))
     monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
 
     with pytest.raises(ValueError, match="reversed"):
@@ -1882,7 +2097,7 @@ def test_rollup_summary_accepts_boundary_length(monkeypatch):
     agent = _mock_rollup_agent(units, max_chars=5)
     agent.create_persisted_preview = lambda *args, **kwargs: ("key", 8)
     monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(turn_rollups, "eligible_rollup_units", lambda *args: units)
+    monkeypatch.setattr(turn_rollups, "derive_rollup_eligibility", lambda *args: turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),)))
     monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
     assert "preview key" in CodeAgentBase.rollup(agent, 2, 7, "12345")
 
@@ -1905,14 +2120,18 @@ def test_rollup_rebuilds_stale_eligibility_on_every_call(monkeypatch):
     monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
     monkeypatch.setattr(
         turn_rollups,
-        "eligible_rollup_units",
+        "derive_rollup_eligibility",
         lambda *args: eligibility_calls.append(True)
-        or (units if len(eligibility_calls) == 1 else [units[0]]),
+        or (
+            turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),))
+            if len(eligibility_calls) == 1
+            else turn_rollups.RollupEligibility(tuple(units), (), ())
+        ),
     )
     monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
 
     CodeAgentBase.rollup(agent, 2, 7, "first")
-    with pytest.raises(ValueError, match="end_turn is not an eligible unit boundary"):
+    with pytest.raises(ValueError, match="no rollup units are currently eligible"):
         CodeAgentBase.rollup(agent, 2, 7, "second")
     assert event_reads == ["session", "session"]
     assert len(eligibility_calls) == 2
@@ -2009,3 +2228,365 @@ def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_p
         message.get("_event_seq") != 999
         for message in agent.conversation.messages
     )
+
+
+def test_production_shape_turn_212_release_output_slices_form_one_authoritative_turn():
+    events = [
+        event(141, input_message("preceding turn")),
+        event(209, release_message("preceding done")),
+        event(210, output_message(
+            ">>> emit('preceding done', release=True)\npreceding done\n"
+        )),
+        event(212, input_message("ordinary work")),
+    ]
+    for seq in (213, 215, 217):
+        events.append(event(seq, {"role": "assistant", "content": f"print({seq})"}))
+        events.append(event(seq + 1, output_message(f">>> print({seq})\n{seq}\n")))
+    events.extend([
+        event(310, {
+            "role": "assistant",
+            "content": (
+                "observe('stage complete', transition=True)\n"
+                "emit('done', release=True)"
+            ),
+            "_observation_transition": True,
+            "_final_result": "done",
+        }),
+        event(311, {
+            "role": "user",
+            "content": (
+                ">>> observe('stage complete', transition=True)\n"
+                "'[Continuing...]'\n"
+                ">>> emit('done', release=True)\n"
+                "done\n"
+            ),
+            "_stdout": "combined output",
+            "_render_segments": [{
+                "type": "stdout",
+                "content": (
+                    ">>> observe('stage complete', transition=True)\n"
+                    "'[Continuing...]'\n"
+                    ">>> emit('done', release=True)\n"
+                    "done\n"
+                ),
+            }],
+        }),
+        event(313, input_message("next turn")),
+    ])
+
+    turns = completed_turns(events)
+
+    assert turns == [
+        CompletedTurn(141, 141, 210, False),
+        CompletedTurn(212, 212, 311, True),
+    ]
+    projection = coalesce_repl_messages(
+        projected_messages(events),
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+    )
+    units = rollup_units(events, projection, PersistedPreviewState.empty())
+    assert [unit for unit in units if unit.turn_ids == (212,)] == [
+        RollupUnit(212, 212, 212, 311, (212,))
+    ]
+    adjacent_events = [*events, event(314, release_message("next done"))]
+    adjacent_projection = coalesce_repl_messages(
+        projected_messages(adjacent_events),
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+    )
+    adjacent_units = rollup_units(
+        adjacent_events,
+        adjacent_projection,
+        PersistedPreviewState.empty(),
+    )
+    bridge = [
+        unit for unit in adjacent_units
+        if unit.start_turn in {141, 212, 313}
+    ]
+    assert bridge == [
+        RollupUnit(141, 141, 141, 210, (141,)),
+        RollupUnit(212, 212, 212, 311, (212,)),
+        RollupUnit(313, 313, 313, 314, (313,)),
+    ]
+    assert __import__(
+        "code_agent.turn_rollups",
+        fromlist=["validate_rollup_interval"],
+    ).validate_rollup_interval(
+        adjacent_events,
+        adjacent_projection,
+        PersistedPreviewState.empty(),
+        bridge,
+    )
+    normalized = __import__(
+        "code_agent.code_agent_coalesce",
+        fromlist=["normalize_repl_messages"],
+    ).normalize_repl_messages(
+        __import__(
+            "code_agent.session_message_state",
+            fromlist=["reduce_canonical_message_events"],
+        ).reduce_canonical_message_events(events)[0]
+    )
+    event_311_nodes = [
+        message for message in normalized if message.get("_event_seq") == 311
+    ]
+    assert len(event_311_nodes) == 2
+    assert [message.get("_event_seq") for message in normalized[-4:]] == [
+        311, 310, 311, 313
+    ]
+
+
+    span = select_projected_span(
+        normalized,
+        source_start_seq=212,
+        source_end_seq=311,
+    )
+    assert normalized[span.start_index].get("_event_seq") == 212
+    assert normalized[span.end_index - 1].get("_event_seq") == 311
+    assert normalized[span.end_index].get("_event_seq") == 313
+
+    duplicated = normalized[:span.end_index]
+    duplicated.insert(span.end_index - 1, copy.deepcopy(normalized[span.end_index - 1]))
+    with pytest.raises(Exception, match="non-contiguous|ambiguous"):
+        select_projected_span(
+            duplicated,
+            source_start_seq=212,
+            source_end_seq=311,
+        )
+
+    mixed = copy.deepcopy(normalized)
+    mixed[span.end_index - 3]["role"] = "assistant"
+    with pytest.raises(Exception, match="non-contiguous"):
+        select_projected_span(
+            mixed,
+            source_start_seq=212,
+            source_end_seq=311,
+        )
+
+
+@pytest.mark.parametrize("ending", ["interruption", "max turns", "runtime error"])
+def test_next_real_input_fallback_closes_unreleased_history_but_eof_keeps_active(ending):
+    prefix = [
+        event(1, input_message("first")),
+        event(2, {"role": "assistant", "content": "print('one')"}),
+        event(3, output_message(">>> print('one')\none\n")),
+        event(4, {"role": "assistant", "content": f"# {ending}\nprint('two')"}),
+        event(5, output_message(">>> print('two')\ntwo\n")),
+    ]
+
+    assert completed_turns(prefix) == []
+    assert completed_turns([*prefix, event(9, input_message("next"))]) == [
+        CompletedTurn(1, 1, 5, True)
+    ]
+
+
+def test_transition_release_same_execution_has_one_release_closure_and_no_checkpoint():
+    events = [
+        event(1, input_message("task")),
+        event(2, {
+            "role": "assistant",
+            "content": "observe('done', transition=True)\nemit('released', release=True)",
+            "_observation_transition": True,
+            "_final_result": "released",
+        }),
+        event(3, output_message(
+            ">>> observe('done', transition=True)\n"
+            "'[Continuing...]'\n"
+            ">>> emit('released', release=True)\nreleased\n"
+        )),
+    ]
+
+    assert completed_turns(events) == [CompletedTurn(1, 1, 3, False)]
+    assert not any(
+        message.get("_provider_checkpoint")
+        for message in render_semantic_labels(projected_messages(events))
+    )
+
+
+def test_ordered_same_event_slices_are_valid_but_duplicate_or_mixed_provenance_is_not():
+    events = [
+        event(1, input_message("task")),
+        event(2, release_message()),
+        event(3, output_message("prefix\n>>> emit('done', release=True)\ndone\n")),
+        event(4, input_message("next")),
+    ]
+    canonical = __import__(
+        "code_agent.session_message_state",
+        fromlist=["reduce_canonical_message_events"],
+    ).reduce_canonical_message_events(events)[0]
+    normalized = __import__(
+        "code_agent.code_agent_coalesce",
+        fromlist=["normalize_repl_messages"],
+    ).normalize_repl_messages(canonical)
+    assert len([message for message in normalized if message.get("_event_seq") == 3]) == 2
+    assert semantic_segments(normalized)[0].authoritative is True
+
+    duplicated = normalized[:]
+    duplicated.insert(-1, copy.deepcopy(normalized[-2]))
+    assert semantic_segments(duplicated)[0].authoritative is False
+
+    mixed = copy.deepcopy(normalized)
+    mixed[-2]["role"] = "assistant"
+    assert semantic_segments(mixed)[0].authoritative is False
+
+
+def test_completed_partition_is_coverage_complete_before_active_segment():
+    events = [
+        event(1, input_message("fallback")),
+        event(2, {"role": "assistant", "content": "work"}),
+        event(3, output_message()),
+        event(4, input_message("transition turn")),
+        event(5, {
+            "role": "assistant",
+            "content": "observe('stage', transition=True)",
+            "_observation_transition": True,
+        }),
+        event(6, {**output_message("transition output"), "_repl_output_for": 5}),
+        event(7, release_message()),
+        event(8, output_message("release output")),
+        event(9, input_message("active")),
+    ]
+    turns = completed_turns(events)
+
+    assert [(turn.source_start_seq, turn.source_end_seq) for turn in turns] == [
+        (1, 3),
+        (4, 6),
+        (7, 8),
+    ]
+    attributable = {
+        item["seq"]
+        for item in events
+        if item["event_type"] == "message_added" and item["seq"] < 9
+    }
+    covered = {
+        seq
+        for turn in turns
+        for seq in range(turn.source_start_seq, turn.source_end_seq + 1)
+        if seq in attributable
+    }
+    assert covered == attributable
+
+def test_adjacent_release_output_and_multiple_real_inputs_preserve_turn_identities():
+    from code_agent.session_message_state import reduce_canonical_message_events
+
+    events = [
+        event(1414, input_message("released turn")),
+        event(1415, release_message("released")),
+        event(1416, output_message(
+            ">>> emit('released', release=True)\nreleased\n"
+        )),
+        event(1418, input_message("input A")),
+        event(1420, input_message("input B")),
+        event(1422, {"role": "assistant", "content": "print('work')"}),
+        event(1423, output_message(">>> print('work')\nwork\n")),
+    ]
+    canonical, _ = reduce_canonical_message_events(events)
+    merged = next(
+        message
+        for message in canonical
+        if any(
+            segment.get("_event_seq") == 1418
+            for segment in message.get("_render_segments") or []
+        )
+    )
+    assert [
+        (segment.get("type"), segment.get("_event_seq"))
+        for segment in merged["_render_segments"]
+    ] == [
+        ("stdout", 1416),
+        ("input", 1418),
+        ("input", 1420),
+    ]
+
+    normalized = normalize_repl_messages(canonical)
+    assert [
+        (
+            message.get("_event_seq"),
+            message.get("_render_segments", [{}])[0].get("type"),
+        )
+        for message in normalized
+        if message.get("_event_seq") in {1416, 1418, 1420}
+    ] == [
+        (1416, "stdout"),
+        (1418, "input"),
+        (1420, "input"),
+    ]
+    assert completed_turns(events) == [
+        CompletedTurn(1414, 1414, 1416, False),
+        CompletedTurn(1418, 1418, 1418, False),
+    ]
+    assert not any(turn.turn_id == 1416 for turn in completed_turns(events))
+
+    closed_events = [
+        *events,
+        event(1452, release_message("done")),
+        event(1453, output_message(
+            ">>> emit('done', release=True)\ndone\n"
+        )),
+    ]
+    assert completed_turns(closed_events) == [
+        CompletedTurn(1414, 1414, 1416, False),
+        CompletedTurn(1418, 1418, 1418, False),
+        CompletedTurn(1420, 1420, 1453, True),
+    ]
+    projection = coalesce_repl_messages(
+        projected_messages(closed_events),
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=0,
+    )
+    assert rollup_units(
+        closed_events,
+        projection,
+        PersistedPreviewState.empty(),
+    ) == [
+        RollupUnit(1414, 1414, 1414, 1416, (1414,)),
+        RollupUnit(1418, 1418, 1418, 1418, (1418,)),
+        RollupUnit(1420, 1420, 1420, 1453, (1420,)),
+    ]
+
+
+def test_structured_multi_input_normalization_rejects_ambiguous_provenance():
+    base = {
+        "role": "user",
+        "content": "output\nA\nB",
+        "_render_segments": [
+            {"type": "stdout", "content": "output\n", "_event_seq": 1},
+            {"type": "input", "content": "A", "_event_seq": 2},
+            {"type": "input", "content": "B", "_event_seq": 3},
+        ],
+    }
+    assert [message.get("_event_seq") for message in normalize_repl_messages([base])] == [
+        1, 2, 3
+    ]
+
+    duplicate = copy.deepcopy(base)
+    duplicate["_render_segments"][2]["_event_seq"] = 2
+    duplicate_nodes = normalize_repl_messages([duplicate])
+    assert len(duplicate_nodes) == 1
+    assert semantic_segments(duplicate_nodes) == []
+
+    mixed = copy.deepcopy(base)
+    mixed["_render_segments"][2].pop("_event_seq")
+    mixed_nodes = normalize_repl_messages([mixed])
+    assert len(mixed_nodes) == 1
+    assert semantic_segments(mixed_nodes) == []
+
+    descending = copy.deepcopy(base)
+    descending["_render_segments"] = [
+        {"type": "input", "content": "B", "_event_seq": 2},
+        {"type": "input", "content": "A", "_event_seq": 1},
+    ]
+    descending_nodes = normalize_repl_messages([descending])
+    assert len(descending_nodes) == 1
+    assert semantic_segments(descending_nodes) == []
+    assert rollup_units(
+        [
+            event(2, input_message("B")),
+            event(1, input_message("A")),
+        ],
+        descending_nodes,
+        PersistedPreviewState.empty(),
+    ) == []
