@@ -44,14 +44,26 @@ def test_text_and_multiple_calls_are_joined_safely():
     ]
 
 
-def test_raw_python_and_text_fallbacks():
+def test_raw_python_without_tool_call_is_accepted():
     assert normalize_openai_repl_response({
         "role": "assistant", "content": "x = 1"
     })["content"] == "x = 1"
+
+
+def test_plain_text_without_tool_call_is_rejected():
     text = 'A "quoted" answer\nwith Unicode: café'
-    assert normalize_openai_repl_response({
-        "role": "assistant", "content": text
-    })["content"] == f"emit({text!r}, release=True)"
+    with pytest.raises(ReplExecuteResponseError, match="must be valid Python"):
+        normalize_openai_repl_response({
+            "role": "assistant", "content": text
+        })
+
+
+@pytest.mark.parametrize("content", [None, ""])
+def test_empty_response_without_tool_call_is_rejected(content):
+    with pytest.raises(ReplExecuteResponseError, match="must include a repl_execute tool call"):
+        normalize_openai_repl_response({
+            "role": "assistant", "content": content
+        })
 
 
 @pytest.mark.parametrize("tool_call", [

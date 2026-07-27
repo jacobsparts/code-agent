@@ -48,10 +48,15 @@ def normalize_openai_repl_response(message):
     if not tool_calls:
         text = content or ""
         if not text:
-            return {"role": "assistant", "content": ""}
+            raise ReplExecuteResponseError(
+                "Response must include a repl_execute tool call with valid Python."
+            )
         if _python_source(text):
             return {"role": "assistant", "content": text}
-        return {"role": "assistant", "content": f"emit({text!r}, release=True)"}
+        raise ReplExecuteResponseError(
+            "Response without a repl_execute tool call must be valid Python. "
+            "Use repl_execute with emit(...) for prose responses."
+        )
 
     parts = []
     calls = []
@@ -203,11 +208,13 @@ def project_openai_repl_messages(messages):
 def repl_protocol_prompt(tool_mode):
     if tool_mode != "repl_execute":
         return ""
-    return """Use the repl_execute tool for Python execution.
+    return """Every response must include a repl_execute tool call.
 The code argument is executed in a persistent Python REPL; variables, imports, connections, and tool state persist.
 Code Agent functions such as emit, read, view, bash, and edit are Python functions available inside submitted code, not separate native tools.
-Use ordinary assistant text only for communication accompanying an execution or when no execution is needed.
-Use emit(..., release=True) in executed Python when completing through the REPL.
+Use valid Python in the repl_execute code argument.
+Accompanying assistant prose is allowed, but use emit(...) in executed Python for prose communication whenever possible.
+Use emit(..., release=True) only when work is complete or user input is required; otherwise continue working without releasing control.
+Do not return a response without a repl_execute tool call.
 Do not wrap Python in markdown fences or invent native tools other than repl_execute."""
 
 
@@ -216,7 +223,9 @@ def repl_retry_hint(tool_mode, error=None):
         return ""
     detail = f"\nError: {error}" if error else ""
     return (
-        "Submit corrected valid Python using the repl_execute tool. "
+        "Every response must include a repl_execute tool call containing valid Python. "
+        "Use emit(...) in executed Python for prose communication, and use "
+        "emit(..., release=True) only when work is complete or user input is required. "
         "Do not use any other native tool and do not wrap the code in markdown."
         + detail
     )
