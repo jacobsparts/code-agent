@@ -577,6 +577,43 @@ def test_observations_survive_message_persistence_and_replay(tmp_path):
     assert [event["event_type"] for event in events] == ["message_added"]
 
 
+def test_replay_reconstructs_observation_counters_across_rewind_exec_and_fork(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+
+    store = SessionStore(str(tmp_path / "counter-sessions.db"))
+    session_id = store.create_session("/repo", "model")
+    messages = [
+        {"role": "assistant", "content": "one"},
+        {"role": "assistant", "content": "observe", "_observations": ["note"]},
+        {"role": "assistant", "content": "three"},
+    ]
+    for seq, message in enumerate(messages, 1):
+        store.append_event(session_id, seq, "message_added", {"message": message})
+
+    def replay(target_id):
+        agent = make_agent()
+        agent._session_store = store
+        replay_session_into_agent(agent, target_id, store)
+        return agent
+
+    resumed = replay(session_id)
+    assert (resumed._assistant_turns_since_observation, resumed._assistant_turns_since_transition) == (1, 3)
+
+    forked = replay(store.fork_session(session_id))
+    assert (forked._assistant_turns_since_observation, forked._assistant_turns_since_transition) == (1, 3)
+    forked._update_observation_counters_from_message({"role": "assistant", "content": "fork"})
+    assert resumed._assistant_turns_since_observation == 1
+    assert forked._assistant_turns_since_observation == 2
+
+    store.append_event(session_id, 4, "rewind", {"target_seq": 1})
+    rewound = replay(session_id)
+    assert (rewound._assistant_turns_since_observation, rewound._assistant_turns_since_transition) == (1, 1)
+
+    store.append_event(session_id, 5, "exec", {})
+    reset = replay(session_id)
+    assert (reset._assistant_turns_since_observation, reset._assistant_turns_since_transition) == (0, 0)
+
+
 def test_preview_uri_attachments_are_listed_by_default():
     agent = make_agent()
     agent.conversation.usermsg(
@@ -593,9 +630,9 @@ def test_preview_uri_attachments_appear_in_context_notice():
     agent = make_agent()
     notice = agent._file_context_ephemeral(["session://preview/abc"])
 
-    assert "Context currently expanded:" in notice
-    assert "session://preview/abc" in notice
-    assert "unview(path_or_uri)" in notice
+    assert "Current attached context:" in notice
+    assert "expanded preview: session://preview/abc" in notice
+    assert "unview(path_or_uri)" not in notice
 
 
 def test_context_pressure_notice_when_near_limit():
@@ -604,10 +641,14 @@ def test_context_pressure_notice_when_near_limit():
     agent.llm_client.usage_tracker.input_tokens_per_byte = {agent.llm_client.model_name: 1.0}
     agent.conversation.usermsg("x" * 200)
 
-    notice = agent._file_context_ephemeral([])
+    # Inventory alone does not embed guidance; management notices do.
+    inventory = agent._file_context_ephemeral([])
+    assert "Estimated input:" in inventory
+    assert "unview(path_or_uri)" not in inventory
 
-    assert "Context window is near capacity." in notice
-    assert "unview(path_or_uri)" in notice
+    notices = agent._context_management_ephemeral()
+    assert re.search(r"Context usage is \d+%[.,]", notices)
+    assert "Warn the user that the context window is nearly exhausted" in notices
 
 
 def test_context_pressure_notice_combines_with_expanded_context():
@@ -616,11 +657,200 @@ def test_context_pressure_notice_combines_with_expanded_context():
     agent.llm_client.usage_tracker.input_tokens_per_byte = {agent.llm_client.model_name: 1.0}
     agent.conversation.usermsg("x" * 200)
 
-    notice = agent._file_context_ephemeral(["session://preview/abc"])
+    inventory = agent._file_context_ephemeral(["session://preview/abc"])
+    assert "Current attached context:" in inventory
+    assert "expanded preview: session://preview/abc" in inventory
+    assert "Estimated input:" in inventory
 
-    assert "Context currently expanded:" in notice
-    assert "session://preview/abc" in notice
-    assert "Context window is near capacity." in notice
+    # With detachable context and high usage, guidance recommends unview.
+    agent.conversation.usermsg(
+        "[Attachment: session://preview/abc]",
+        _attachments={"session://preview/abc": "preview body"},
+        _attachment_refs={"session://preview/abc": "session://preview/abc"},
+    )
+    notices = agent._context_management_ephemeral()
+    assert re.search(r"Context usage is \d+%\.", notices)
+    assert "You are expected to clean up context now." in notices
+    assert "unview(...)" in notices
+    assert "Warn the user that the context window is nearly exhausted" not in notices
+
+
+def test_dynamic_context_inventory_is_current_and_precedes_guidance():
+    agent = make_agent()
+    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.usage_tracker.input_tokens_per_byte = {
+        agent.llm_client.model_name: 1.0
+    }
+    agent.conversation.usermsg(
+        "x" * 200 + "\n[PreviewRef: session://preview/abc]\nsummary\n[/PreviewRef]",
+        _attachments={"notes.py": "body"},
+        images=[b"\x89PNGdata"],
+    )
+    agent._expanded_preview_refs = {"session://preview/abc": {"numbered": False}}
+    agent._preview_blob_content = lambda uri: "preview body"
+    agent._derive_rollup_eligibility = lambda: None
+
+    notice = agent._context_management_ephemeral()
+
+    assert "- file: notes.py (4 bytes)" in notice
+    assert "- image: image 1 (8 bytes)" in notice
+    assert "- expanded preview: session://preview/abc (12 bytes)" in notice
+    assert "Attached context size: 24 bytes." in notice
+    assert notice.index("Current attached context:") < notice.index("Context usage is")
+    assert "unview" not in notice.split("Context usage is", 1)[0]
+
+    agent.detach("notes.py")
+    current = agent._context_management_ephemeral()
+    assert "notes.py" not in current
+
+
+def test_observation_counters_thresholds_precedence_and_resets():
+    agent = make_agent()
+    agent._reset_observation_counters()
+
+    for _ in range(4):
+        agent._update_observation_counters_from_message(
+            {"role": "assistant", "content": "work"}
+        )
+    assert agent._observation_reminder_ephemeral() is None
+
+    agent._update_observation_counters_from_message(
+        {"role": "assistant", "content": "work"}
+    )
+    assert "last 5 assistant turns" in agent._observation_reminder_ephemeral()
+
+    agent._assistant_turns_since_transition = 15
+    assert "No observation" in agent._observation_reminder_ephemeral()
+
+    agent._update_observation_counters_from_message({
+        "role": "assistant",
+        "content": "observe",
+        "_observations": ["kept"],
+    })
+    assert "No transition observation" in agent._observation_reminder_ephemeral()
+
+    agent._update_observation_counters_from_message({
+        "role": "assistant",
+        "content": "transition",
+        "_observations": ["stage"],
+        "_observation_transition": True,
+    })
+    assert agent._observation_reminder_ephemeral() is None
+    assert agent._assistant_turns_since_observation == 0
+    assert agent._assistant_turns_since_transition == 0
+
+
+def test_malformed_observation_metadata_and_synthetic_boundaries_do_not_reset_or_count():
+    agent = make_agent()
+    agent._assistant_turns_since_observation = 7
+    agent._assistant_turns_since_transition = 16
+
+    agent._update_observation_counters_from_message({
+        "role": "assistant",
+        "content": "malformed",
+        "_observations": [],
+        "_observation_transition": True,
+    })
+    assert (agent._assistant_turns_since_observation, agent._assistant_turns_since_transition) == (8, 17)
+
+    agent._update_observation_counters_from_message({
+        "role": "assistant",
+        "content": "emit(None, release=True)",
+        "_synthetic": True,
+        "_virtual_interaction_boundary": True,
+    })
+    assert (agent._assistant_turns_since_observation, agent._assistant_turns_since_transition) == (8, 17)
+
+
+def test_context_constraint_resolution_validation_and_max_input_exclusion():
+    agent = make_agent()
+    config = agent.llm_client.model_config
+
+    config.update(context_constraint=120, context_window=200, max_input_tokens=50)
+    assert agent._resolved_context_constraint() == 120
+
+    for invalid in (True, 0, -1, "120"):
+        config["context_constraint"] = invalid
+        assert agent._resolved_context_constraint() == 200
+
+    config["context_window"] = None
+    assert agent._resolved_context_constraint() is None
+
+
+def test_context_guidance_tiers_and_available_actions():
+    agent = make_agent()
+    eligibility = type("Eligibility", (), {"units": (object(),)})()
+
+    assert agent._context_management_notices_ephemeral(
+        accounting={"constraint": 100, "usage_percent": 29},
+        rollup_eligibility=eligibility,
+        detachable_names=[],
+    ) == []
+
+    soft = agent._context_management_notices_ephemeral(
+        accounting={"constraint": 100, "usage_percent": 30},
+        rollup_eligibility=eligibility,
+        detachable_names=[],
+    )
+    assert "Eligible rollups exist" in soft[-1]
+
+    no_rollup = agent._context_management_notices_ephemeral(
+        accounting={"constraint": 100, "usage_percent": 30},
+        rollup_eligibility=None,
+        detachable_names=[],
+    )
+    assert no_rollup == []
+
+    cases = [
+        (eligibility, [], "Roll up eligible old context", "unview"),
+        (None, ["file.py"], "unview(...)", "Warn the user"),
+        (eligibility, ["file.py"], "Roll up eligible old context and detach", "Warn the user"),
+        (None, [], "Warn the user", "You are expected"),
+    ]
+    for available, names, included, excluded in cases:
+        notice = agent._context_management_notices_ephemeral(
+            accounting={"constraint": 100, "usage_percent": 80},
+            rollup_eligibility=available,
+            detachable_names=names,
+        )[-1]
+        assert included in notice
+        assert excluded not in notice
+
+
+def test_context_accounting_estimation_failure_is_nonfatal():
+    agent = make_agent()
+    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client._estimate_input_tokens = lambda value: (_ for _ in ()).throw(
+        RuntimeError("estimate failed")
+    )
+
+    accounting = agent._context_accounting()
+
+    assert accounting == {
+        "estimated_tokens": None,
+        "constraint": 100,
+        "usage_percent": None,
+    }
+    assert agent._context_management_notices_ephemeral(
+        accounting=accounting,
+        rollup_eligibility=None,
+        detachable_names=[],
+    ) == []
+
+
+def test_context_notices_are_ephemeral_and_do_not_mutate_messages():
+    agent = make_agent()
+    agent._configure_conversation(agent.conversation)
+    agent.conversation.usermsg("request")
+    original = json.loads(json.dumps(agent.conversation.messages))
+    agent._assistant_turns_since_observation = 5
+
+    first = agent.conversation._messages()
+    second = agent.conversation._messages()
+
+    assert "No observation has been recorded" in first[-1]["content"]
+    assert first == second
+    assert agent.conversation.messages == original
 
 
 def test_system_prompt_mentions_pin_and_context_pressure():
@@ -633,7 +863,7 @@ def test_system_prompt_mentions_pin_and_context_pressure():
     assert "think() is a scratchpad for the current turn" in prompt
     assert "pin() preserves the exact previous turn's code and output" in prompt
     assert "cannot pin the current\nturn or other historical turns" in prompt
-    assert "Context window is near capacity" in prompt
+    assert "If context-management guidance indicates high usage" in prompt
 
 
 

@@ -1643,16 +1643,23 @@ def test_ephemeral_provider_adds_exactly_one_line_and_preserves_existing_context
     conversation = Conversation(None, "system")
     conversation.messages.append({"role": "user", "content": "request"})
     conversation.ephemeral = (
-        "Context currently expanded:\n- file.py\n\n"
-        "Context window is near capacity.\n"
-        "Use unview(path_or_uri) to remove files or expanded previews that are no longer needed."
+        "Current attached context:\n"
+        "- file: file.py\n"
+        "Estimated input: 38,400 tokens of a 120,000-token context constraint."
     )
-    conversation.ephemeral_provider = lambda: "Eligible rollup turns: 1, 4-9"
+    conversation.ephemeral_provider = lambda: (
+        "Eligible rollup turns: 1, 4-9\n\n"
+        "Context usage is 82%. "
+        "You are expected to clean up context now. "
+        "Detach attachments or expanded previews that are no longer needed with unview(...)."
+    )
 
     content = conversation._messages()[-1]["content"]
     assert content.count("Eligible rollup turns:") == 1
-    assert "Context currently expanded:" in content
-    assert "Context window is near capacity." in content
+    assert "Current attached context:" in content
+    assert "Context usage is 82%." in content
+    assert content.index("Current attached context:") < content.index("Eligible rollup turns:")
+    assert content.index("Eligible rollup turns:") < content.index("Context usage is 82%")
     assert content.endswith("request")
 
 
@@ -1689,8 +1696,42 @@ def test_code_agent_usermsg_persists_before_context_projection():
 
     agent.usermsg("active", _user_content="active")
 
-    assert seen == ["# Turn 31\n\nactive"]
+    assert seen == []
+    assert agent.ephemeral == ""
     assert agent.conversation.messages[-1]["content"] == "active"
+
+
+def test_registry_normalizes_context_accounting_limits(monkeypatch):
+    from code_agent.llm_registry import EndpointRegistry
+
+    monkeypatch.setenv("TEST_API_KEY", "key")
+    registry = EndpointRegistry()
+    registry.register_provider("test", host="example.test", path="/v1")
+
+    registry.register_model(
+        "test",
+        "valid",
+        context_constraint=120,
+        context_window=200,
+        max_input_tokens=50,
+    )
+    valid = registry.get_model_config("test/valid")
+    assert valid["context_constraint"] == 120
+    assert valid["context_window"] == 200
+    assert valid["max_input_tokens"] == 50
+
+    for index, value in enumerate((True, 0, -1, "120")):
+        registry.register_model(
+            "test",
+            f"invalid-{index}",
+            context_constraint=value,
+            context_window=value,
+            max_input_tokens=value,
+        )
+        invalid = registry.get_model_config(f"test/invalid-{index}")
+        assert invalid["context_constraint"] is None
+        assert invalid["context_window"] is None
+        assert invalid["max_input_tokens"] is None
 
 
 def test_shared_message_reducer_rewind_and_exec_equivalence():

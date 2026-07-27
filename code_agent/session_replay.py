@@ -243,6 +243,8 @@ def _replay_session_into_target(agent, session_id: str, store):
             del msg["_attachments"]
     agent.conversation.messages = messages
     agent._persisted_preview_state = persisted_preview_state
+    if hasattr(agent, "_reconstruct_observation_counters"):
+        agent._reconstruct_observation_counters(messages)
     deduped = []
     seen = set()
     for item in final_missing:

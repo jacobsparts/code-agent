@@ -31,6 +31,7 @@ class ModelConfig:
     path: str = None
     config: dict = field(default_factory=dict)
     context_window: int = None
+    context_constraint: int = None
     max_input_tokens: int = None
     input_cost: float = None
     output_cost: float = None
@@ -73,6 +74,11 @@ class EndpointRegistry:
         if not (prov_obj := self._providers.get(provider)):
             raise ValueError(f"unknown provider: {provider}")
         kwargs.setdefault('model', alias)
+        for key in ("context_window", "context_constraint", "max_input_tokens"):
+            if key in kwargs:
+                value = kwargs[key]
+                if type(value) is not int or value <= 0:
+                    kwargs[key] = None
         full_name = f"{provider}/{alias}"
         self._models[full_name] = ModelConfig(provider=prov_obj, **kwargs)
         if aliases:

@@ -102,6 +102,8 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._pending_observations = []
             self._pending_observation_transition = False
             self._pending_repl_output_for = None
+            self._assistant_turns_since_observation = 0
+            self._assistant_turns_since_transition = 0
             self._auto_context_attachment_names = set()
             self._expanded_preview_refs = {}
             from code_agent.code_agent_coalesce import PersistedPreviewState
@@ -981,7 +983,7 @@ def _code_agent_send_rg_available():
         conversation.preview_loader = self._preview_blob_content
         conversation.messages_projector = render_semantic_labels
         conversation.message_projector = None
-        conversation.ephemeral_provider = self._rollup_eligibility_ephemeral
+        conversation.ephemeral_provider = self._context_management_ephemeral
 
     def _preview_blob_content(self, uri: str) -> str:
         if getattr(self, '_session_store', None) is None or getattr(self, '_session_id', None) is None:
@@ -1221,6 +1223,7 @@ def _code_agent_send_rg_available():
         self._pending_repl_output_for = (
             message.get("_event_seq") if transition else None
         )
+        self._update_observation_counters_from_message(message)
 
     def build_output_for_llm(self, events: list[ReplEvent]) -> str:
         """Build LLM output, converting complete reads to attachments and large statement output to previews."""
@@ -1398,67 +1401,293 @@ def _code_agent_send_rg_available():
 
     view_images._tool_files_param = "files"
 
-    def _rollup_eligibility_ephemeral(self) -> str:
-        from code_agent.turn_rollups import derive_rollup_eligibility, eligible_rollup_line
+    @staticmethod
+    def _valid_positive_int(value) -> int | None:
+        if type(value) is bool or type(value) is not int:
+            return None
+        if value <= 0:
+            return None
+        return value
 
-        store = getattr(self, "_session_store", None)
-        session_id = getattr(self, "_session_id", None)
-        state = getattr(self, "_persisted_preview_state", None)
-        if store is None or session_id is None or state is None:
-            return ""
-        eligibility = derive_rollup_eligibility(
-            store.get_events(session_id),
-            self.conversation.messages,
-            state,
-        )
-        return eligible_rollup_line([list(group) for group in eligibility.groups])
-
-    def _context_pressure_ephemeral(self) -> str:
+    def _resolved_context_constraint(self) -> int | None:
         client = getattr(self, "llm_client", None)
         model_config = getattr(client, "model_config", {}) or {}
-        limits = [
-            value for value in (
-                model_config.get("context_window"),
-                model_config.get("max_input_tokens"),
-            )
-            if value
-        ]
-        if not limits:
-            return ""
-        limit = min(limits)
+        for key in ("context_constraint", "context_window"):
+            resolved = self._valid_positive_int(model_config.get(key))
+            if resolved is not None:
+                return resolved
+        return None
+
+    def _message_has_valid_observation(self, message: dict) -> bool:
+        values = message.get("_observations")
+        if not isinstance(values, list):
+            return False
+        return any(isinstance(value, str) and value.strip() for value in values)
+
+    def _message_has_valid_transition(self, message: dict) -> bool:
+        return (
+            self._message_has_valid_observation(message)
+            and message.get("_observation_transition") is True
+        )
+
+    def _update_observation_counters_from_message(self, message: dict) -> None:
+        if message.get("role") != "assistant" or message.get("_synthetic"):
+            return
+        has_observation = self._message_has_valid_observation(message)
+        has_transition = self._message_has_valid_transition(message)
+        since_observation = getattr(self, "_assistant_turns_since_observation", 0)
+        since_transition = getattr(self, "_assistant_turns_since_transition", 0)
+        if has_transition:
+            since_observation = 0
+            since_transition = 0
+        elif has_observation:
+            since_observation = 0
+            since_transition += 1
+        else:
+            since_observation += 1
+            since_transition += 1
+        self._assistant_turns_since_observation = since_observation
+        self._assistant_turns_since_transition = since_transition
+
+    def _reset_observation_counters(self) -> None:
+        self._assistant_turns_since_observation = 0
+        self._assistant_turns_since_transition = 0
+
+    def _reconstruct_observation_counters(self, messages=None) -> None:
+        self._reset_observation_counters()
+        for message in messages if messages is not None else getattr(self.conversation, "messages", []):
+            self._update_observation_counters_from_message(message)
+
+    def _context_accounting(self):
+        client = getattr(self, "llm_client", None)
+        constraint = self._resolved_context_constraint()
+        if client is None:
+            return None
         old_ephemeral = self.ephemeral
+        old_provider = getattr(self.conversation, "ephemeral_provider", None)
         try:
             self.ephemeral = ""
+            self.conversation.ephemeral_provider = None
             messages = [
                 {k: v for k, v in msg.items() if not k.startswith("_")}
                 for msg in self.conversation._messages()
             ]
         finally:
             self.ephemeral = old_ephemeral
+            self.conversation.ephemeral_provider = old_provider
         try:
             estimated = client._estimate_input_tokens(client._input_bytes(messages))
         except Exception:
             estimated = None
-        if estimated is None:
-            return ""
-        threshold = int(limit * 0.85)
-        if estimated < threshold:
-            return ""
-        return (
-            "Context window is near capacity.\n"
-            "Use unview(path_or_uri) to remove files or expanded previews that are no longer needed."
-        )
+        if estimated is None and constraint is None:
+            return None
+        return {
+            "estimated_tokens": estimated,
+            "constraint": constraint,
+            "usage_percent": (
+                None
+                if estimated is None or constraint is None
+                else round((estimated / constraint) * 100)
+            ),
+        }
 
-    def _file_context_ephemeral(self, names: list[str]) -> str:
+    def _derive_rollup_eligibility(self):
+        from code_agent.turn_rollups import derive_rollup_eligibility
+
+        store = getattr(self, "_session_store", None)
+        session_id = getattr(self, "_session_id", None)
+        state = getattr(self, "_persisted_preview_state", None)
+        if store is None or session_id is None or state is None:
+            return None
+        try:
+            return derive_rollup_eligibility(
+                store.get_events(session_id),
+                self.conversation.messages,
+                state,
+            )
+        except Exception:
+            return None
+
+    def _rollup_eligibility_ephemeral(self) -> str:
+        from code_agent.turn_rollups import eligible_rollup_line
+
+        eligibility = self._derive_rollup_eligibility()
+        if eligibility is None:
+            return ""
+        return eligible_rollup_line([list(group) for group in eligibility.groups])
+
+    def _current_context_inventory(self, extra=None) -> list[dict]:
+        items = {}
+        attachments = self.list_attachments(include_auto_context=False)
+        for name, content in attachments.items():
+            if self._is_memory_attachment_name(name):
+                continue
+            items[name] = {
+                "kind": "expanded preview" if is_preview_uri(name) else "file",
+                "name": name,
+                "bytes": len(content.encode("utf-8")) if isinstance(content, str) else None,
+            }
+        for uri, content in self._expanded_preview_context().items():
+            items[uri] = {
+                "kind": "expanded preview",
+                "name": uri,
+                "bytes": len(content.encode("utf-8")),
+            }
+        for name, content in (extra or {}).items():
+            if self._is_auto_context_file(name):
+                continue
+            items[name] = {
+                "kind": "expanded preview" if is_preview_uri(name) else "file",
+                "name": name,
+                "bytes": len(content.encode("utf-8")) if isinstance(content, str) else None,
+            }
+        image_index = 0
+        for message in getattr(self.conversation, "messages", []):
+            for image in message.get("images") or []:
+                image_index += 1
+                name = f"image {image_index}"
+                items[f"__image_{image_index}"] = {
+                    "kind": "image",
+                    "name": name,
+                    "bytes": len(image) if isinstance(image, bytes) else None,
+                }
+        return list(items.values())
+
+    def _context_inventory_ephemeral(self, items, accounting=None) -> str | None:
+        if not items and not (accounting and accounting.get("estimated_tokens") is not None):
+            return None
+        lines = []
+        if items:
+            lines.append("Current attached context:")
+            for item in items:
+                size = item.get("bytes")
+                size_text = f" ({size:,} bytes)" if size is not None else ""
+                lines.append(f"- {item['kind']}: {item['name']}{size_text}")
+            known_bytes = [item["bytes"] for item in items if item.get("bytes") is not None]
+            if known_bytes:
+                lines.append(f"Attached context size: {sum(known_bytes):,} bytes.")
+        if accounting and accounting.get("estimated_tokens") is not None:
+            estimated = accounting["estimated_tokens"]
+            constraint = accounting.get("constraint")
+            if constraint is not None:
+                lines.append(
+                    f"Estimated input: {estimated:,} tokens of a {constraint:,}-token context constraint."
+                )
+            else:
+                lines.append(f"Estimated input: {estimated:,} tokens.")
+        return "\n".join(lines) if lines else None
+
+    def _observation_reminder_ephemeral(self) -> str | None:
+        since_observation = getattr(self, "_assistant_turns_since_observation", 0)
+        since_transition = getattr(self, "_assistant_turns_since_transition", 0)
+        if since_observation >= 5:
+            return (
+                f"No observation has been recorded in the last {since_observation} assistant turns. "
+                "Observations are required for context management. Follow the reflection instructions "
+                "in the system prompt and call observe(...) after substantive work."
+            )
+        if since_transition >= 15:
+            return (
+                f"No transition observation has been recorded in the last {since_transition} assistant turns. "
+                "If a distinct task or architectural stage has completed, record it with "
+                "observe(..., transition=True), following the reflection instructions in the system prompt."
+            )
+        return None
+
+    def _context_management_notices_ephemeral(
+        self,
+        *,
+        accounting,
+        rollup_eligibility,
+        detachable_names: list[str],
+    ) -> list[str]:
+        notices = []
+        reminder = self._observation_reminder_ephemeral()
+        if reminder:
+            notices.append(reminder)
+
+        if not accounting:
+            return notices
+        usage_percent = accounting.get("usage_percent")
+        constraint = accounting.get("constraint")
+        if usage_percent is None or constraint is None:
+            return notices
+
+        has_eligible_rollups = bool(
+            rollup_eligibility is not None and getattr(rollup_eligibility, "units", ())
+        )
+        has_detachable = bool(detachable_names)
+
+        if usage_percent >= 80:
+            if has_eligible_rollups and has_detachable:
+                action = (
+                    "Roll up eligible old context and detach attachments or expanded previews "
+                    "that are no longer needed."
+                )
+            elif has_eligible_rollups:
+                action = "Roll up eligible old context whose detailed contents are no longer needed."
+            elif has_detachable:
+                action = (
+                    "Detach attachments or expanded previews that are no longer needed with unview(...)."
+                )
+            else:
+                action = (
+                    "Warn the user that the context window is nearly exhausted and that continuing "
+                    "in a fresh session may be necessary."
+                )
+                notices.append(
+                    f"Context usage is {usage_percent}%, "
+                    "but no eligible rollups or detachable viewed context are available. "
+                    + action
+                )
+                return notices
+            notices.append(
+                f"Context usage is {usage_percent}%. "
+                f"You are expected to clean up context now. {action}"
+            )
+        elif usage_percent >= 30 and has_eligible_rollups:
+            notices.append(
+                f"Context usage is {usage_percent}%. "
+                "Eligible rollups exist. Remember to roll up old context when its detailed "
+                "contents are no longer needed."
+            )
+        return notices
+
+    def _context_management_ephemeral(self) -> str:
+        inventory_items = self._current_context_inventory()
+        names = [item["name"] for item in inventory_items]
+        accounting = self._context_accounting()
+        eligibility = self._derive_rollup_eligibility()
         sections = []
-        if names:
-            lines = ["Context currently expanded:"]
-            lines.extend(f"- {name}" for name in names)
-            lines.extend(["", "Use unview(path_or_uri) to remove/collapse context."])
-            sections.append("\n".join(lines))
-        if notice := self._context_pressure_ephemeral():
+        inventory = self._context_inventory_ephemeral(inventory_items, accounting)
+        if inventory:
+            sections.append(inventory)
+        rollup_line = ""
+        if eligibility is not None:
+            from code_agent.turn_rollups import eligible_rollup_line
+            rollup_line = eligible_rollup_line([list(group) for group in eligibility.groups])
+        if rollup_line:
+            sections.append(rollup_line)
+        for notice in self._context_management_notices_ephemeral(
+            accounting=accounting,
+            rollup_eligibility=eligibility,
+            detachable_names=names,
+        ):
             sections.append(notice)
         return "\n\n".join(sections)
+
+    def _file_context_ephemeral(self, names: list[str]) -> str:
+        accounting = self._context_accounting()
+        items = [
+            {
+                "kind": "expanded preview" if is_preview_uri(name) else "file",
+                "name": name,
+                "bytes": None,
+            }
+            for name in names
+        ]
+        inventory = self._context_inventory_ephemeral(items, accounting)
+        return inventory or ""
 
 
 
@@ -1504,9 +1733,7 @@ def _code_agent_send_rg_available():
         result = super().usermsg(content, **kwargs)
         if len(self.conversation.messages) > before_len:
             self._persist_message(self.conversation.messages[-1])
-        self.ephemeral = self._file_context_ephemeral(
-            self._current_file_context_names(kwargs.get('_attachments'))
-        )
+        self.ephemeral = ""
         return result
 
     welcome_message = "[bold]Code Agent[/bold]\nPython REPL-based coding assistant"
@@ -1724,8 +1951,9 @@ pin() preserves the exact previous turn's code and output in full rather than
 summarizing it. pin() is only for the previous turn; it cannot pin the current
 turn or other historical turns, viewed files, or expanded previews.
 
-If you see "Context window is near capacity", reduce active context by calling
-unview(path_or_uri) on no-longer-needed files or expanded previews.
+If context-management guidance indicates high usage, reduce active context by
+rolling up eligible old context and calling unview(path_or_uri) on no-longer-needed
+files or expanded previews.
 
 
 >>> tone_and_style()
@@ -1981,7 +2209,10 @@ If you don't know how to proceed:
             self._statement_had_diff = False
             self._statement_print_uses_variable = False
 
-            if not getattr(self, '_turn_output_started', False):
+            if (
+                not getattr(self, '_turn_output_started', False)
+                and self._statement_direct_call != "observe"
+            ):
                 self._turn_output_started = True
                 if (
                     self.repl_display
