@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import selectors
+import shlex
 import tempfile
 import socket
 import ssl
@@ -3517,11 +3518,42 @@ def _native_call_params(call: ToolCall) -> dict:
 
 def _native_repl_code(call: ToolCall) -> str:
     name = _native_call_name(call)
+    params = _native_call_params(call)
     content = _native_call_content(call)
     content_literal = json.dumps(str(content), ensure_ascii=False)
     if name == "ExecServerMessage":
         return f"think({content_literal})"
-    return f"# unsupported tool call: {name}({_native_call_params(call)!r})"
+    if name == "ShellStream":
+        command = params.get("command", "")
+        working_directory = params.get("working_directory")
+        if working_directory:
+            command = f"cd -- {shlex.quote(working_directory)} && {command}"
+        timeout = params.get("timeout")
+        if timeout is not None:
+            timeout = timeout / 1000
+            if timeout.is_integer():
+                timeout = int(timeout)
+        return (
+            f"bash(command={command!r}, timeout={timeout!r}, "
+            f"bg={bool(params.get('is_background', False))!r})"
+        )
+    if name == "Grep":
+        arguments = {
+            "pattern": params.get("pattern", ""),
+            "path": params.get("path"),
+            "glob": params.get("glob"),
+            "file_type": params.get("type"),
+            "context": params.get("context"),
+            "case_insensitive": params.get("case_insensitive"),
+            "multiline": params.get("multiline"),
+        }
+        rendered = ", ".join(
+            f"{key}={value!r}"
+            for key, value in arguments.items()
+            if value is not None
+        )
+        return f"grep({rendered})"
+    return f"# unsupported tool call: {name}({params!r})"
 
 
 def _openai_tool_call(call: ToolCall) -> dict:

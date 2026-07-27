@@ -157,26 +157,47 @@ def test_cursor_client_adapter(monkeypatch):
     assert result["_stop_reason"] == "tool_calls"
 
 
-def test_unsupported_native_tool_renders_flattened_known_parameters():
+def test_shell_stream_native_tool_translates_to_bash():
     call = cursor.ToolCall(
         id="tool-1",
         name="shell_stream",
         arguments={
-            "1": "date",
-            "10": 40000,
-            "3": 30000,
-            "15": "Get current system date",
-            "8": b"opaque",
+            "command": "python3.11 -m py_compile app.py",
+            "working_directory": "/tmp/project dir",
+            "timeout": 30000,
+            "is_background": False,
+            "description": "Compile app",
         },
         native=True,
         oneof_name="shell_stream_args",
     )
 
     assert cursor._native_repl_code(call) == (
-        "# unsupported tool call: ShellStream("
-        "{'command': 'date', 'file_output_threshold_bytes': 40000, "
-        "'timeout': 30000, 'description': 'Get current system date', "
-        "'parsing_result': b'opaque'})"
+        "bash(command=\"cd -- '/tmp/project dir' && "
+        "python3.11 -m py_compile app.py\", timeout=30, bg=False)"
+    )
+
+
+def test_grep_native_tool_translates_to_grep():
+    call = cursor.ToolCall(
+        id="tool-2",
+        name="grep",
+        arguments={
+            "pattern": "matched INTEGER|def find_pending",
+            "path": "/tmp/project",
+            "glob": "*.{py,md}",
+            "case_insensitive": False,
+            "multiline": False,
+            "tool_call_id": "tool-2",
+        },
+        native=True,
+        oneof_name="grep_args",
+    )
+
+    assert cursor._native_repl_code(call) == (
+        "grep(pattern='matched INTEGER|def find_pending', "
+        "path='/tmp/project', glob='*.{py,md}', "
+        "case_insensitive=False, multiline=False)"
     )
 
 
