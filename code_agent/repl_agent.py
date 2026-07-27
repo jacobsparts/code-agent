@@ -788,6 +788,34 @@ class REPLMixin:
 
     repl_transport = MultiprocessingTransport
 
+    direct_repl_protocol_prompt = """You are in a Python REPL. Your response body is executed directly as Python source code.
+
+Respond with raw Python only.
+- Do not wrap your code in markdown fences
+- Do not wrap it in <function_calls>, XML, JSON, or any tool-call protocol
+- Do not add prose before or after the code
+- Do not describe what you are about to do
+
+Important:
+- There is no separate tool-calling layer for your response
+- The text of your response itself is what gets executed
+- If you need to communicate text, do it from Python using print(...) or an appropriate provided Python function"""
+
+    def _repl_system_prompt_prefix(self) -> str:
+        tool_mode = getattr(self.llm_client, "tool_mode", None)
+        native_protocol = repl_protocol_prompt(tool_mode)
+        if native_protocol:
+            return (
+                "You are operating Code Agent through a provider-native execution tool.\n\n"
+                + native_protocol
+            )
+        return self.direct_repl_protocol_prompt
+
+    def _configure_conversation(self, conversation):
+        if hasattr(super(), "_configure_conversation"):
+            super()._configure_conversation(conversation)
+        conversation.system_prompt_prefix_provider = self._repl_system_prompt_prefix
+
     def build_output_for_llm(self, events: list[ReplEvent]) -> str:
         """Build the model-visible output from REPL events."""
         return events_output_text(events)
@@ -968,32 +996,8 @@ class REPLMixin:
         tools_str = "\n".join(tool_list) if tool_list else "(no tools defined)"
 
         emit_line = "\nemit(value, release=False) - Emit output. release=True yields control." if self.advertise_emit else ""
-        tool_mode = getattr(self.llm_client, "tool_mode", None)
-        native_protocol = repl_protocol_prompt(tool_mode)
-        protocol_intro = (
-            "You are operating Code Agent through a provider-native execution tool."
-            if native_protocol
-            else "You are in a Python REPL. Your response body is executed directly as Python source code."
-        )
-        if native_protocol:
-            response_rules = native_protocol
-        else:
-            response_rules = """Respond with raw Python only.
-- Do not wrap your code in markdown fences
-- Do not wrap it in <function_calls>, XML, JSON, or any tool-call protocol
-- Do not add prose before or after the code
-- Do not describe what you are about to do
 
-Important:
-- There is no separate tool-calling layer for your response
-- The text of your response itself is what gets executed
-- If you need to communicate text, do it from Python using print(...) or an appropriate provided Python function"""
-
-        return f"""{protocol_intro}
-
-{response_rules}
-
-{base_prompt}
+        return f"""{base_prompt}
 
 You have full access to Python. These additional functions are available:
 {tools_str}{emit_line}

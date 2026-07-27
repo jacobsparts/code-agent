@@ -38,6 +38,22 @@ class Conversation:
             result.append(out)
         self.rendered_preview_refs = rendered_preview_refs
 
+        system_prompt_prefix_provider = getattr(
+            self, "system_prompt_prefix_provider", None
+        )
+        if system_prompt_prefix_provider is not None:
+            system_prompt_prefix = system_prompt_prefix_provider()
+            if system_prompt_prefix:
+                for i, message in enumerate(result):
+                    if message.get("role") == "system":
+                        out = dict(message)
+                        content = out.get("content", "")
+                        out["content"] = system_prompt_prefix + (
+                            "\n\n" + content if content else ""
+                        )
+                        result[i] = out
+                        break
+
         ephemeral_parts = []
         if self.ephemeral:
             ephemeral_parts.append(self.ephemeral)

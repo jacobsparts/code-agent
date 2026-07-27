@@ -6,9 +6,12 @@ from code_agent.repl_agent import REPLAgent
 class OverflowThenSuccessClient:
     def __init__(self):
         self.calls = 0
+        self.tool_mode = "repl_execute"
+        self.requests = []
 
     def text_call(self, messages):
         self.calls += 1
+        self.requests.append(messages)
         if self.calls == 1:
             raise ContextOverflowError("too large")
         return {"role": "assistant", "content": "emit('ok', release=True)"}
@@ -22,6 +25,7 @@ class RecoveringAgent(REPLAgent):
         self._llm_client = OverflowThenSuccessClient()
         self._session_id = "test-session"
         self._conversation = Conversation(self._llm_client, self.system)
+        self._configure_conversation(self._conversation)
         self.coalesced = []
         self.committed = []
 
@@ -48,3 +52,12 @@ def test_text_call_coalesces_open_interaction_and_retries_after_context_overflow
     assert agent.coalesced == [{}]
     assert agent.conversation.messages[-1].get("_virtual_interaction_boundary") is True
     assert agent.committed == [agent.conversation.messages[-1]]
+    assert [
+        request[0]["content"].count(
+            "Every response must include a repl_execute tool call."
+        )
+        for request in agent.llm_client.requests
+    ] == [1, 1]
+    assert "Every response must include a repl_execute tool call." not in (
+        agent.conversation.messages[0]["content"]
+    )

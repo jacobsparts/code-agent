@@ -979,6 +979,8 @@ def _code_agent_send_rg_available():
     def _configure_conversation(self, conversation):
         from code_agent.turn_rollups import render_semantic_labels
 
+        if hasattr(super(), "_configure_conversation"):
+            super()._configure_conversation(conversation)
         conversation.expanded_preview_refs = self._expanded_preview_refs
         conversation.preview_loader = self._preview_blob_content
         conversation.messages_projector = render_semantic_labels
