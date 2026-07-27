@@ -30,6 +30,21 @@ Spawn isolated Code Agent instances as subprocesses with socket communication.
     response.wait()
     print(response.result)
 
+## Progress Updates
+
+Subagents can report intermediate progress with `emit(value, release=False)`.
+The parent receives these updates through `response.progress`:
+
+    response = agent.send("Review the architecture", bg=True)
+    response.wait()
+    print(response.progress)
+    print(response.result)
+
+`response.progress` is a snapshot list of progress-update strings. Progress
+updates are separate from `response.turns`, which counts subagent REPL turns.
+The response representation summarizes both counters without displaying result
+text, for example: `<SubagentResponse status='running', turns=3, progress_updates=2>`.
+
 ## Multiple Parallel Agents
 
     agents = [Subagent() for _ in range(3)]
@@ -61,7 +76,7 @@ are serialized into the response text when available.
 ## Attributes
 
     Subagent: .id, .cwd, .model, .done, .result, .send(), .wait(), .kill()
-    SubagentResponse: .done, .result, .progress, .is_error, .error, .wait()
+    SubagentResponse: .done, .result, .progress, .turns, .is_error, .error, .wait()
 """
 
 import fcntl
@@ -237,11 +252,13 @@ def worker_main(port, authkey, model, max_turns):
             self._host_sock = host_sock
             self.model = model_name
             self.max_turns = default_max_turns
+            self._turn_count = 0
             super().__init__()
 
-        # Disable CLI display hooks
+        # Disable CLI display hooks, but report turns to the parent.
         def on_repl_execute(self, code):
-            pass
+            self._turn_count += 1
+            _send_msg(self._host_sock, ("turn", self._turn_count))
 
         def on_repl_event(self, event):
             pass
@@ -304,6 +321,7 @@ def worker_main(port, authkey, model, max_turns):
             if cmd_type == "task":
                 prompt = cmd_data.get("prompt", "")
                 task_max_turns = cmd_data.get("max_turns", max_turns)
+                agent._turn_count = 0
 
                 try:
                     agent.usermsg(prompt)
@@ -359,6 +377,7 @@ class SubagentResponse:
         done: Whether the task has completed.
         result: Final response text. Empty until done. Errors are serialized here.
         progress: List of progress updates from emit(release=False).
+        turns: Number of REPL turns started for this task.
         is_error: Whether the response text represents a task/process error.
         error: Error text if failed, else None. Same text is included in result.
     """
@@ -369,6 +388,7 @@ class SubagentResponse:
         self._error: Optional[str] = None
         self._done = False
         self._progress: list[str] = []
+        self._turns = 0
 
     @property
     def done(self) -> bool:
@@ -390,6 +410,12 @@ class SubagentResponse:
         """Progress updates received so far."""
         self._agent._poll()
         return list(self._progress)
+
+    @property
+    def turns(self) -> int:
+        """Number of REPL turns started for this task."""
+        self._agent._poll()
+        return self._turns
 
     @property
     def is_error(self) -> bool:
@@ -435,13 +461,13 @@ class SubagentResponse:
     def __repr__(self) -> str:
         if not self._done:
             self._agent._poll()
-        if not self._done:
-            progress_info = f", {len(self._progress)} updates" if self._progress else ""
-            return f"[SubagentResponse: running{progress_info}]"
-        r = self._result or ""
-        if len(r) > 100:
-            r = r[:100] + "..."
-        return r if r else "[SubagentResponse: empty]"
+        status = "running"
+        if self._done:
+            status = "error" if self._error is not None else "complete"
+        return (
+            f"<SubagentResponse status='{status}', turns={self._turns}, "
+            f"progress_updates={len(self._progress)}>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +647,8 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
 
                 if msg_type == "progress":
                     response._progress.append(str(msg_data) if msg_data is not None else "")
+                elif msg_type == "turn":
+                    response._turns = int(msg_data)
                 elif msg_type == "result":
                     response._set_result(msg_data)
                     break
