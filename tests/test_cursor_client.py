@@ -254,7 +254,13 @@ def _decode_model_metadata(payload: bytes):
 def test_encode_model_metadata_defaults_omit_fast_and_effort():
     raw = cursor.RawMessage.decode(cursor.encode_model_metadata("grok-4.5"))
     assert (raw.first_bytes(1) or b"").decode() == "grok-4.5"
-    assert raw.matching(3, 2) == ()
+    entries = {}
+    for field in raw.matching(3, 2):
+        entry = cursor.RawMessage.decode(field.value)
+        entries[(entry.first_bytes(1) or b"").decode()] = (
+            entry.first_bytes(2) or b""
+        ).decode()
+    assert entries == {"fast": "false"}
 
 
 def test_encode_model_metadata_fast_and_effort():
@@ -277,7 +283,7 @@ def test_encode_model_metadata_fast_and_effort():
 
 def test_build_run_request_model_metadata_defaults():
     payload = cursor.build_run_request("hi", "grok-4.5")
-    assert _decode_model_metadata(payload) == ("grok-4.5", {})
+    assert _decode_model_metadata(payload) == ("grok-4.5", {"fast": "false"})
 
 
 def test_build_run_request_model_metadata_fast_and_effort():

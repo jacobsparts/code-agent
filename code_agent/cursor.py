@@ -2296,23 +2296,22 @@ def encode_model_metadata(
     """Encode modern AgentRunRequest model metadata (fields 9/14).
 
     OpenAI-style configuration:
-    - fast: bool, default False. Omitted from metadata when False.
+    - fast: bool, default False. Always encoded in metadata as "true" or "false".
     - reasoning_effort: optional string copied to metadata key "effort".
       Omitted when None/empty. The client does not invent a default effort.
     """
     if not isinstance(fast, bool):
         raise TypeError("fast must be bool")
-    fields: list[Field] = [_string(1, model)]
-    if fast:
-        fields.append(
-            _bytes(
-                3,
-                _message(
-                    _string(1, "fast"),
-                    _string(2, "true"),
-                ),
-            )
-        )
+    fields: list[Field] = [
+        _string(1, model),
+        _bytes(
+            3,
+            _message(
+                _string(1, "fast"),
+                _string(2, "true" if fast else "false"),
+            ),
+        ),
+    ]
     if reasoning_effort:
         if not isinstance(reasoning_effort, str):
             raise TypeError("reasoning_effort must be str or None")
