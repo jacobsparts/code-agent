@@ -102,6 +102,7 @@ class _InterruptedError(KeyboardInterrupt):
 from code_agent.tools.subrepl import (
     MultiprocessingTransport,
     SubREPL,
+    WORKER_RESTART_NOTICE,
     _format_echo,
     _format_echo_stdout,
     _noninteractive_stdin,
@@ -436,6 +437,7 @@ class ToolREPL(SubREPL):
     def _ensure_session(self) -> None:
         """Override to use tool-aware worker and add tool queues."""
         if self._transport is None or not self._transport.is_alive():
+            replacing_dead_worker = self._transport is not None
             cwd = None
             try:
                 from code_agent.tools.transports import SSHSubprocessTransport
@@ -462,6 +464,8 @@ class ToolREPL(SubREPL):
             self._tools_injected = False
             self._builtins_injected = False
             self._cmd_seq = 0  # Reset sequence on new session
+            if replacing_dead_worker:
+                self._pending_output += WORKER_RESTART_NOTICE + "\n"
 
 
     def inject_tools(self, tools: dict[str, tuple[Callable, Any]]) -> None:
@@ -1364,6 +1368,9 @@ Call help(function_name) for parameter descriptions.
         previous_publisher = getattr(self, "_active_repl_event_publisher", None)
         self._active_repl_event_publisher = publish
         try:
+            if repl._pending_output:
+                publish(ReplEvent(kind="output", text=repl._pending_output))
+                repl._pending_output = ""
             for original_stmt in original_statements:
                 exec_stmt = self._transform_toplevel_print(original_stmt)
                 with _silence_compile_warnings():

@@ -86,6 +86,32 @@ def test_execute_publishes_statement_boundaries_in_order():
     assert completed_statements[1][0].data["direct_call"] == "print"
 
 
+def test_dead_tool_repl_worker_restart_is_normal_repl_output():
+    agent = REPLMixin()
+    streamed = []
+    agent.on_repl_event = streamed.append
+    repl = ToolREPL(echo=False)
+    repl.inject_builtins()
+    old_transport = repl._transport
+    try:
+        old_transport.kill()
+        old_transport.join(timeout=1)
+
+        output, pure_syntax_error, events, _ = agent._execute_with_tool_handling(repl, "1")
+
+        notice = (
+            "REPL worker exited unexpectedly; started a new worker. "
+            "In-memory Python variables were lost.\n"
+        )
+        assert repl._transport is not old_transport
+        assert pure_syntax_error is False
+        assert output == notice + ">>> 1\n1\n"
+        assert events[0] == ReplEvent(kind="output", text=notice)
+        assert streamed == events
+    finally:
+        repl.close()
+
+
 def test_statement_output_spills_over_limit(monkeypatch):
     monkeypatch.setattr("code_agent.repl_agent._MAX_REPL_OUTPUT_CHARS", 10)
     agent = REPLMixin()

@@ -42,6 +42,10 @@ from typing import Any, Optional
 
 
 STILL_RUNNING = "[still running]\n"
+WORKER_RESTART_NOTICE = (
+    "REPL worker exited unexpectedly; started a new worker. "
+    "In-memory Python variables were lost."
+)
 
 
 from code_agent.tools.transports import MultiprocessingTransport, StdioSubprocessTransport
@@ -378,6 +382,7 @@ class SubREPL:
 
         self._running: bool = False
         self._echo: bool = echo
+        self._pending_output: str = ""
 
     def __del__(self) -> None:
         """Clean up worker process on garbage collection."""
@@ -389,6 +394,7 @@ class SubREPL:
     def _ensure_session(self) -> None:
         """Lazily create worker session if not exists."""
         if self._transport is None or not self._transport.is_alive():
+            replacing_dead_worker = self._transport is not None
             self._transport = MultiprocessingTransport(
                 target=_worker_main,
                 args=(os.getcwd(),),
@@ -398,6 +404,8 @@ class SubREPL:
             self._cmd_queue, self._output_queue = self._transport.queues
             self._worker = self._transport.worker
             self._running = False
+            if replacing_dead_worker:
+                self._pending_output += WORKER_RESTART_NOTICE + "\n"
 
     def _inject_code(self, code: str, timeout: float = 10.0) -> None:
         """
@@ -468,11 +476,13 @@ class SubREPL:
             return pending + prefix + "[Previous command still running. Use read(), interrupt(), or terminate() first.]\n"
 
         self._ensure_session()
+        pending_output = self._pending_output
+        self._pending_output = ""
         self._running = True
         # Send all statements as one batch
         self._cmd_queue.put('\n'.join(statements))
 
-        return prefix + self.read(timeout=timeout, hard_timeout=hard_timeout)
+        return pending_output + prefix + self.read(timeout=timeout, hard_timeout=hard_timeout)
 
     def read(
         self,
