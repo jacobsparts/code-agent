@@ -54,6 +54,9 @@ ACCESS_TOKEN_REFRESH_MARGIN = 5 * 60
 AGENT_RUNSSE_PATH = "agent.v1.AgentService/RunSSE"
 BIDI_APPEND_PATH = "aiserver.v1.BidiService/BidiAppend"
 
+# Cursor uses this identifier for inference routing/cache affinity.
+# A code-agent process represents one conversation session.
+_SESSION_CONVERSATION_ID = str(uuid.uuid4())
 
 
 
@@ -2349,7 +2352,7 @@ def build_run_request(
     conversation_id = (
         conversation_id
         or run_config.conversation_id
-        or str(uuid.uuid4())
+        or _SESSION_CONVERSATION_ID
     )
     message_id = message_id or str(uuid.uuid4())
 
