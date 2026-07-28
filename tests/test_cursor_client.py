@@ -10,7 +10,7 @@ import pytest
 
 from code_agent import cursor
 from code_agent.client import LLMClient
-from code_agent.llm_registry import get_model_config, resolve_model_name
+from code_agent.llm_registry import get_model_config
 from code_agent.repl_tool_adapter import REPL_EXECUTE_TOOL
 
 
@@ -23,11 +23,10 @@ def test_cursor_registry(tmp_path):
     }
     code = """
 import json
-from code_agent.llm_registry import get_model_config, resolve_model_name
-config = get_model_config("cursor")
+from code_agent.llm_registry import get_model_config
+config = get_model_config("cursor/composer-2.5")
 grok = get_model_config("cursor/grok-4.5")
 print(json.dumps({
-    "resolved": resolve_model_name("cursor"),
     "api_type": config["api_type"],
     "tool_mode": config["tool_mode"],
     "host": config["host"],
@@ -46,12 +45,11 @@ print(json.dumps({
     )
     config = json.loads(result.stdout)
     assert config == {
-        "resolved": "cursor/composer-2.5",
         "api_type": "cursor",
         "tool_mode": "repl_execute",
         "host": None,
         "path": None,
-        "grok_model": "grok-4.5",
+        "grok_model": "cursor-grok-4.5-high",
         "grok_api_type": "cursor",
         "grok_tool_mode": "repl_execute",
     }
@@ -237,69 +235,47 @@ def test_cursor_client_requires_repl_execute(monkeypatch):
         client._call_cursor([], None)
 
 
-def _decode_model_metadata(payload: bytes):
+def _decode_model_details(payload: bytes):
     client = cursor.RawMessage.decode(payload)
     run = cursor.RawMessage.decode(client.first_bytes(1))
-    meta = cursor.RawMessage.decode(run.first_bytes(14))
-    model = (meta.first_bytes(1) or b"").decode()
-    entries = {}
-    for field in meta.matching(3, 2):
-        entry = cursor.RawMessage.decode(field.value)
-        key = (entry.first_bytes(1) or b"").decode()
-        value = (entry.first_bytes(2) or b"").decode()
-        entries[key] = value
-    return model, entries
+    details = cursor.RawMessage.decode(run.first_bytes(3))
+    return {
+        number: (details.first_bytes(number) or b"").decode()
+        for number in (1, 3, 4, 5)
+    }, cursor._int(details, 7), run
 
 
-def test_encode_model_metadata_defaults_omit_fast_and_effort():
-    raw = cursor.RawMessage.decode(cursor.encode_model_metadata("grok-4.5"))
-    assert (raw.first_bytes(1) or b"").decode() == "grok-4.5"
-    entries = {}
-    for field in raw.matching(3, 2):
-        entry = cursor.RawMessage.decode(field.value)
-        entries[(entry.first_bytes(1) or b"").decode()] = (
-            entry.first_bytes(2) or b""
-        ).decode()
-    assert entries == {"fast": "false"}
-
-
-def test_encode_model_metadata_fast_and_effort():
+def test_encode_model_details():
     raw = cursor.RawMessage.decode(
-        cursor.encode_model_metadata(
-            "grok-4.5",
-            fast=True,
-            reasoning_effort="medium",
-        )
+        cursor.encode_model_details("cursor-grok-4.5-high")
     )
-    assert (raw.first_bytes(1) or b"").decode() == "grok-4.5"
-    entries = {}
-    for field in raw.matching(3, 2):
-        entry = cursor.RawMessage.decode(field.value)
-        entries[(entry.first_bytes(1) or b"").decode()] = (
-            entry.first_bytes(2) or b""
-        ).decode()
-    assert entries == {"fast": "true", "effort": "medium"}
+    assert {
+        number: (raw.first_bytes(number) or b"").decode()
+        for number in (1, 3, 4, 5)
+    } == {
+        1: "cursor-grok-4.5-high",
+        3: "cursor-grok-4.5-high",
+        4: "cursor-grok-4.5-high",
+        5: "cursor-grok-4.5-high",
+    }
+    assert cursor._int(raw, 7) == 1
 
 
-def test_build_run_request_model_metadata_defaults():
-    payload = cursor.build_run_request("hi", "grok-4.5")
-    assert _decode_model_metadata(payload) == ("grok-4.5", {"fast": "false"})
+def test_build_run_request_uses_legacy_model_details_only():
+    payload = cursor.build_run_request("hi", "cursor-grok-4.5-high")
+    values, mode, run = _decode_model_details(payload)
+    assert values == {
+        1: "cursor-grok-4.5-high",
+        3: "cursor-grok-4.5-high",
+        4: "cursor-grok-4.5-high",
+        5: "cursor-grok-4.5-high",
+    }
+    assert mode == 1
+    assert not run.has(9)
+    assert not run.has(14)
 
 
-def test_build_run_request_model_metadata_fast_and_effort():
-    payload = cursor.build_run_request(
-        "hi",
-        "grok-4.5",
-        fast=True,
-        reasoning_effort="high",
-    )
-    assert _decode_model_metadata(payload) == (
-        "grok-4.5",
-        {"fast": "true", "effort": "high"},
-    )
-
-
-def test_chat_completions_passes_fast_and_reasoning_effort(monkeypatch):
+def test_chat_completions_basic(monkeypatch):
     captured = {}
 
     def fake_run(prompt, **kwargs):
@@ -317,58 +293,194 @@ def test_chat_completions_passes_fast_and_reasoning_effort(monkeypatch):
 
     monkeypatch.setattr(cursor, "run", fake_run)
     response = cursor.chat_completions("key", {
-        "model": "grok-4.5",
+        "model": "composer-2.5",
         "messages": [{"role": "user", "content": "hello"}],
-        "fast": True,
-        "reasoning_effort": "medium",
     })
-    assert captured["model"] == "grok-4.5"
-    assert captured["fast"] is True
-    assert captured["reasoning_effort"] == "medium"
+    assert captured["model"] == "composer-2.5"
     assert response["choices"][0]["message"]["content"] == "ok"
 
 
-def test_chat_completions_rejects_non_bool_fast():
-    with pytest.raises(TypeError, match="fast must be bool"):
-        cursor.chat_completions("key", {
-            "model": "grok-4.5",
-            "messages": [{"role": "user", "content": "hello"}],
-            "fast": "true",
-        })
+def _turn_structure_frame(request_id):
+    structure = cursor.protobuf_message(
+        cursor.Field.bytes(1, b"u" * 32),
+        cursor.Field.bytes(2, b"s" * 32),
+        cursor.Field.bytes(3, request_id.encode()),
+        cursor.Field.varint(5, 0),
+    )
+    blob = cursor.protobuf_message(cursor.Field.bytes(1, structure))
+    set_args = cursor.protobuf_message(cursor.Field.bytes(2, blob))
+    kv = cursor.protobuf_message(
+        cursor.Field.varint(1, 9),
+        cursor.Field.bytes(3, set_args),
+    )
+    return cursor.ConnectFrame.from_decoded(
+        cursor.protobuf_message(cursor.Field.bytes(4, kv))
+    )
 
 
-def test_cursor_client_adapter_passes_config(monkeypatch):
-    config = {
-        "provider": "cursor",
-        "model": "grok-4.5",
-        "api_key": "key",
-        "api_type": "cursor",
-        "tool_mode": "repl_execute",
-        "tpm": 17,
-        "tools": True,
-        "concurrency": 1,
-        "config": {
-            "fast": True,
-            "reasoning_effort": "medium",
-        },
-    }
-    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
-    monkeypatch.setattr("code_agent.client.throttle", lambda key, tpm: None)
-    captured = {}
+def test_agent_conversation_turn_structure_detection():
+    request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
+    frame = _turn_structure_frame(request_id)
 
-    def chat(api_key, body):
-        captured.update(api_key=api_key, body=body)
-        return {
-            "choices": [{
-                "message": {"role": "assistant", "content": "done"},
-                "finish_reason": "stop",
-            }]
-        }
+    assert cursor.is_agent_conversation_turn_structure(
+        frame.decoded_payload, request_id
+    )
+    assert not cursor.is_agent_conversation_turn_structure(
+        frame.decoded_payload, "other-request"
+    )
 
-    monkeypatch.setattr(cursor, "chat_completions", chat)
-    client = LLMClient("cursor/grok-4.5")
-    result = client._call([{"role": "user", "content": "hello"}])
-    assert captured["body"]["model"] == "grok-4.5"
-    assert captured["body"]["fast"] is True
-    assert captured["body"]["reasoning_effort"] == "medium"
-    assert result["content"] == "done"
+
+def test_cursor_turn_structure_closes_without_tool_call(monkeypatch):
+    request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
+    closed = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                closed.append(True)
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            answer = cursor.ConnectFrame.from_decoded(
+                cursor.AnswerText.create("done").encode()
+            )
+            self.stream_callback(answer.encode())
+            self.stream_callback(_turn_structure_frame(request_id).encode())
+            assert self.closed
+
+    monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    result = cursor.CursorClient("token").run("hello")
+
+    assert result.text == "done"
+    assert result.tool_calls == []
+    assert result.turn_ended is True
+    assert closed == [True]
+
+
+def test_cursor_turn_structure_collects_tools_and_closes(monkeypatch):
+    request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
+    closed = []
+
+    def tool_frame(call_id, code):
+        arguments = cursor.protobuf_message(
+            cursor.Field.bytes(1, b"repl_execute"),
+            cursor.Field.bytes(
+                2,
+                cursor.protobuf_message(
+                    cursor.Field.bytes(1, b"code"),
+                    cursor.Field.bytes(2, cursor._protobuf_value(code)),
+                ),
+            ),
+            cursor.Field.bytes(3, call_id.encode()),
+            cursor.Field.bytes(5, b"repl_execute"),
+        )
+        execution = cursor.protobuf_message(
+            cursor.Field.varint(1, 1),
+            cursor.Field.bytes(11, arguments),
+            cursor.Field.bytes(15, (call_id + "-exec").encode()),
+        )
+        return cursor.ConnectFrame.from_decoded(
+            cursor.protobuf_message(cursor.Field.bytes(2, execution))
+        ).encode()
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                closed.append(True)
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            for payload in (
+                tool_frame("call-1", "emit('one')"),
+                tool_frame("call-2", "emit('two')"),
+                _turn_structure_frame(request_id).encode(),
+            ):
+                self.stream_callback(payload)
+            assert self.closed
+
+    monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    result = cursor.CursorClient("token").run("hello")
+
+    assert [call.id for call in result.tool_calls] == ["call-1", "call-2"]
+    assert result.turn_ended is True
+    assert closed == [True]
+
+
+
+def test_cursor_turn_ended_still_closes_immediately(monkeypatch):
+    closed = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                closed.append(True)
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            frame = cursor.ConnectFrame.from_decoded(
+                cursor.InteractionUpdate.create("turn_ended").encode()
+            )
+            self.stream_callback(frame.encode())
+            assert self.closed
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    result = cursor.CursorClient("token").run("hello")
+
+    assert result.turn_ended is True
+    assert closed == [True]

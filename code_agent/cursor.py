@@ -2012,7 +2012,9 @@ class SSEClient:
     def reset_heartbeat_timeout(self):
         self._heartbeat_deadline = time.monotonic() + HEARTBEAT_TIMEOUT
 
-    def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+    def run_forever(
+        self, timeout=None, *, heartbeat_timeout=None,
+    ):
         now = time.monotonic()
         deadline = None if timeout is None else now + timeout
         self._heartbeat_deadline = (
@@ -2113,6 +2115,53 @@ def build_kv_response(server_payload: bytes, blobs) -> bytes | None:
         _bytes(2, _message(*result_fields)),
     )
     return _message(_bytes(3, kv_client))
+
+
+def is_agent_conversation_turn_structure(
+    server_payload: bytes, request_id: str
+) -> bool:
+    try:
+        server = RawMessage.decode(server_payload)
+        kv_payload = server.first_bytes(4)
+        if kv_payload is None:
+            return False
+        kv = RawMessage.decode(kv_payload)
+        set_args_payload = kv.first_bytes(3)
+        if set_args_payload is None:
+            return False
+        set_args = RawMessage.decode(set_args_payload)
+        blob_payload = set_args.first_bytes(2)
+        if blob_payload is None:
+            return False
+        blob = RawMessage.decode(blob_payload)
+        structure_payload = blob.first_bytes(1)
+        if structure_payload is None:
+            return False
+        structure = RawMessage.decode(structure_payload)
+    except ValueError:
+        return False
+
+    if any(
+        field.number not in (1, 2, 3, 4, 5)
+        or field.wire_type != (0 if field.number == 5 else 2)
+        for field in structure.fields
+    ):
+        return False
+    user_messages = structure.matching(1, 2)
+    steps = structure.matching(2, 2)
+    request_ids = structure.matching(3, 2)
+    if (
+        len(user_messages) != 1
+        or len(user_messages[0].value) != 32
+        or not steps
+        or any(len(step.value) != 32 for step in steps)
+        or len(request_ids) != 1
+    ):
+        return False
+    try:
+        return request_ids[0].value.decode() == request_id
+    except UnicodeDecodeError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -2290,44 +2339,15 @@ def encode_conversation_state(
     return _message(*state_fields), prefetched
 
 
-def encode_model_metadata(
-    model: str,
-    *,
-    fast: bool = False,
-    reasoning_effort: str | None = None,
-) -> bytes:
-    """Encode modern AgentRunRequest model metadata (fields 9/14).
-
-    OpenAI-style configuration:
-    - fast: bool, default False. Always encoded in metadata as "true" or "false".
-    - reasoning_effort: optional string copied to metadata key "effort".
-      Omitted when None/empty. The client does not invent a default effort.
-    """
-    if not isinstance(fast, bool):
-        raise TypeError("fast must be bool")
-    fields: list[Field] = [
+def encode_model_details(model: str) -> bytes:
+    """Encode AgentRunRequest model details (field 3)."""
+    return _message(
         _string(1, model),
-        _bytes(
-            3,
-            _message(
-                _string(1, "fast"),
-                _string(2, "true" if fast else "false"),
-            ),
-        ),
-    ]
-    if reasoning_effort:
-        if not isinstance(reasoning_effort, str):
-            raise TypeError("reasoning_effort must be str or None")
-        fields.append(
-            _bytes(
-                3,
-                _message(
-                    _string(1, "effort"),
-                    _string(2, reasoning_effort),
-                ),
-            )
-        )
-    return _message(*fields)
+        _string(3, model),
+        _string(4, model),
+        _string(5, model),
+        Field.varint(7, 1),
+    )
 
 
 def build_run_request(
@@ -2342,8 +2362,6 @@ def build_run_request(
     run_config: RunConfig | None = None,
     workspace_uri: str | None = None,
     client_name: str | None = None,
-    fast: bool = False,
-    reasoning_effort: str | None = None,
 ) -> bytes:
     """Build the smallest useful AgentClientMessage.run_request."""
 
@@ -2411,22 +2429,15 @@ def build_run_request(
     )
     if run_config.conversation_state is not None:
         conversation_state = run_config.conversation_state
-    model_metadata = encode_model_metadata(
-        model,
-        fast=fast,
-        reasoning_effort=reasoning_effort,
-    )
+    model_details = encode_model_details(model)
     run_fields = [
         _bytes(1, conversation_state),
         _bytes(2, run_config.action or action),
+        _bytes(3, run_config.model_details or model_details),
         _bytes(4, encode_mcp_tools(tools)),
         _string(5, conversation_id),
-        _bytes(9, run_config.requested_model or model_metadata),
-        _bytes(14, model_metadata),
         *(_bytes(17, blob) for blob in prefetched),
     ]
-    if run_config.model_details is not None:
-        run_fields.append(_bytes(3, run_config.model_details))
     for number, value in (
         (6, run_config.mcp_file_system_options),
         (7, run_config.skill_options),
@@ -2593,7 +2604,6 @@ class RunConfig:
     mcp_file_system_options: bytes | None = None
     skill_options: bytes | None = None
     custom_system_prompt: str | None = None
-    requested_model: bytes | None = None
     suggest_next_prompt: bool | None = None
     subagent_type_name: str | None = None
     exclude_workspace_context: bool | None = None
@@ -3119,8 +3129,7 @@ class CursorClient:
         tools=(),
         user_config: UserMessageConfig | None = None,
         run_config: RunConfig | None = None,
-        fast: bool = False,
-        reasoning_effort: str | None = None,
+
     ):
         if not token:
             raise ValueError("token is required")
@@ -3134,8 +3143,7 @@ class CursorClient:
         self.run_config = run_config or RunConfig(
             client_supports_send_to_user=True
         )
-        self.fast = fast
-        self.reasoning_effort = reasoning_effort
+
 
     @property
     def headers(self) -> dict[str, str]:
@@ -3158,16 +3166,10 @@ class CursorClient:
         history=(),
         user_config: UserMessageConfig | None = None,
         run_config: RunConfig | None = None,
-        fast: bool | None = None,
-        reasoning_effort: str | None = None,
     ) -> RunResult:
         request_id = str(uuid.uuid4())
         model = self.model if model is None else model
         tools = self.tools if tools is None else tuple(tools)
-        if fast is None:
-            fast = self.fast
-        if reasoning_effort is None:
-            reasoning_effort = self.reasoning_effort
         input_payload = build_run_request(
             prompt,
             model,
@@ -3175,8 +3177,6 @@ class CursorClient:
             history=history,
             user_config=user_config or self.user_config,
             run_config=run_config or self.run_config,
-            fast=fast,
-            reasoning_effort=reasoning_effort,
         )
         prefetched_blobs = extract_prefetched_blobs(input_payload)
         downlink_body = ConnectFrame.from_decoded(
@@ -3225,6 +3225,12 @@ class CursorClient:
             if (
                 frame.classification
                 == "agent_server.interaction_update.turn_ended"
+                or (
+                    not connect.eos
+                    and is_agent_conversation_turn_structure(
+                        connect.decoded_payload, request_id
+                    )
+                )
             ):
                 turn_ended = True
                 transport.close()
@@ -3339,8 +3345,6 @@ def run(
     client_version: str = DEFAULT_CLIENT_VERSION,
     user_config: UserMessageConfig | None = None,
     run_config: RunConfig | None = None,
-    fast: bool = False,
-    reasoning_effort: str | None = None,
 ) -> RunResult:
     """Perform one independent stateless Cursor Agent request."""
     deadline = (
@@ -3380,8 +3384,6 @@ def run(
         tools=normalized_tools,
         user_config=user_config,
         run_config=run_config,
-        fast=fast,
-        reasoning_effort=reasoning_effort,
     ).run(prompt, history=normalized_history)
 
 
@@ -3583,12 +3585,6 @@ def chat_completions(api_key: str, body: dict) -> dict:
         raise ValueError("streaming chat completions are not supported")
     prompt, history = _openai_messages(body.get("messages"))
     model = body.get("model") or DEFAULT_MODEL
-    fast = body.get("fast", False)
-    if not isinstance(fast, bool):
-        raise TypeError("fast must be bool")
-    reasoning_effort = body.get("reasoning_effort")
-    if reasoning_effort is not None and not isinstance(reasoning_effort, str):
-        raise TypeError("reasoning_effort must be str or None")
     result = run(
         prompt,
         api_key=api_key,
@@ -3596,8 +3592,6 @@ def chat_completions(api_key: str, body: dict) -> dict:
         tools=_openai_tools(body.get("tools")),
         history=history,
         timeout=body.get("timeout", DEFAULT_TIMEOUT),
-        fast=fast,
-        reasoning_effort=reasoning_effort,
     )
     tool_calls = [
         _openai_tool_call(call)
