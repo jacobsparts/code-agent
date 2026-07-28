@@ -301,7 +301,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         self._next_event_seq += 1
         return seq
 
-    def _authoritative_persisted_projection(self):
+    def _authoritative_persisted_projection(self, *, coalesce=True):
         from code_agent.code_agent_coalesce import coalesce_repl_messages, message_source_range
         from code_agent.conversation import Conversation
 
@@ -316,11 +316,13 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         target.conversation.messages[0] = system_message
         replay_session_into_agent(target, self._session_id, self._session_store)
 
-        projected = coalesce_repl_messages(
-            target.conversation.messages,
-            keep_last_execution_interactions=self.code_agent_coalesce_keep_last_execution_interactions,
-            min_savings_chars=self.code_agent_coalesce_min_savings_chars,
-        )
+        projected = target.conversation.messages
+        if coalesce:
+            projected = coalesce_repl_messages(
+                projected,
+                keep_last_execution_interactions=self.code_agent_coalesce_keep_last_execution_interactions,
+                min_savings_chars=self.code_agent_coalesce_min_savings_chars,
+            )
 
         live_by_provenance = {}
         for message in self.conversation.messages:
@@ -403,8 +405,9 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         """Replace an eligible interval of completed turns with a persisted preview summary."""
         from code_agent.code_agent_coalesce import Preview
         from code_agent.turn_rollups import (
-            derive_rollup_eligibility,
-            validate_rollup_interval,
+            completed_turns,
+            derive_agent_rollup_context,
+            resolve_rollup_boundary_interval,
         )
 
         if type(start_turn) is not int or type(end_turn) is not int:
@@ -434,66 +437,21 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         if store is None or session_id is None or state is None or conversation is None:
             raise RuntimeError("rollup is unavailable without a live persisted session.")
 
-        events = store.get_events(session_id)
-        authoritative_messages, authoritative_state = (
-            self._authoritative_persisted_projection()
-        )
-        eligibility = derive_rollup_eligibility(
-            events,
-            authoritative_messages,
-            authoritative_state,
-        )
-        units = list(eligibility.all_units)
-        eligible_groups = [list(group) for group in eligibility.groups]
-        eligible = list(eligibility.units)
-        if not units:
-            raise ValueError("no canonical completed rollup units are available.")
-        if not eligible:
-            raise ValueError("no rollup units are currently eligible.")
+        context = derive_agent_rollup_context(self)
+        if context is None:
+            raise RuntimeError("rollup is unavailable without a live persisted session.")
+        events, authoritative_messages, authoritative_state, eligibility = context
+        if not eligibility.all_units:
+            raise ValueError("no canonical completed rollup boundaries are available.")
+        if not eligibility.units:
+            raise ValueError("no rollup boundaries are currently eligible.")
 
-        start_unit = next(
-            (unit for unit in eligible if unit.start_turn == start_turn),
-            None,
+        source_start_seq, source_end_seq, _ = resolve_rollup_boundary_interval(
+            eligibility,
+            completed_turns(events),
+            start_turn,
+            end_turn,
         )
-        end_unit = next(
-            (unit for unit in eligible if unit.end_turn == end_turn),
-            None,
-        )
-        if start_unit is None:
-            raise ValueError("start_turn is not an eligible unit boundary.")
-        if end_unit is None:
-            raise ValueError("end_turn is not an eligible unit boundary.")
-
-        start_index = units.index(start_unit)
-        end_index = units.index(end_unit)
-        if start_index > end_index:
-            raise ValueError("rollup endpoints are reversed.")
-
-        selected = units[start_index:end_index + 1]
-        eligible_set = set(eligible)
-        if any(unit not in eligible_set for unit in selected):
-            raise ValueError("every unit in the selected interval must be eligible.")
-        if not any(
-            selected == group[start:start + len(selected)]
-            for group in eligible_groups
-            for start in range(len(group) - len(selected) + 1)
-        ):
-            raise ValueError(
-                "selected eligible endpoints cross an uncovered canonical/projected gap; "
-                "choose units from one advertised bracketed group."
-            )
-        if sum(len(unit.turn_ids) for unit in selected) < 2:
-            raise ValueError("rollup must include at least two completed turns.")
-        if not validate_rollup_interval(
-            events,
-            authoritative_messages,
-            authoritative_state,
-            selected,
-        ):
-            raise ValueError("selected rollup interval does not exactly cover canonical units.")
-
-        source_start_seq = selected[0].source_start_seq
-        source_end_seq = selected[-1].source_end_seq
         create_from_projection = getattr(
             self,
             "_create_persisted_preview_from_projection",
@@ -1493,22 +1451,17 @@ def _code_agent_send_rg_available():
             ),
         }
 
-    def _derive_rollup_eligibility(self):
-        from code_agent.turn_rollups import derive_rollup_eligibility
+    def _rollup_context(self):
+        from code_agent.turn_rollups import derive_agent_rollup_context
 
-        store = getattr(self, "_session_store", None)
-        session_id = getattr(self, "_session_id", None)
-        state = getattr(self, "_persisted_preview_state", None)
-        if store is None or session_id is None or state is None:
-            return None
+        return derive_agent_rollup_context(self)
+
+    def _derive_rollup_eligibility(self):
         try:
-            return derive_rollup_eligibility(
-                store.get_events(session_id),
-                self.conversation.messages,
-                state,
-            )
+            context = self._rollup_context()
         except Exception:
             return None
+        return None if context is None else context[3]
 
     def _rollup_eligibility_ephemeral(self) -> str:
         from code_agent.turn_rollups import eligible_rollup_line
@@ -1837,13 +1790,12 @@ canonical identifier for that user-initiated interaction. These labels are
 navigation metadata; do not repeat or edit them.
 
 When present, `Eligible rollup turns: [...] | [...]` lists bracketed groups of
-atomic completed historical units available to a future
-`rollup(start_turn, end_turn, summary)` call. A single number is a one-turn
-unit; `A-B` is one inseparable child-preview unit. Combine units only within
-one bracketed group. Both endpoints are inclusive and must match listed unit
-boundaries, and every atomic unit in the selected transcript interval must be
-eligible. Recent, active, unlisted, and child-internal turn boundaries are
-protected and cannot be selected.
+surviving historical boundaries available to a future
+`rollup(start_turn, end_turn, summary)` call. Combine boundaries only within
+one bracketed group. A rollup from A to B replaces completed history beginning
+at A and ending immediately before B. A and B remain as outer boundaries;
+strict interior boundaries disappear. Adjacent rollups may share a boundary.
+Recent, active, unlisted, and strict interior boundaries cannot be selected.
 
 Use rollup only when detailed historical content is no longer needed in active
 context. When context pressure is high, consider rolling up eligible historical

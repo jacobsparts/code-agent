@@ -498,7 +498,7 @@ def test_deterministic_coalescing_preserves_older_eligible_units():
     assert eligible_rollup_line(groups) == (
         "Eligible rollup turns: ["
         + ", ".join(str(turn_id) for turn_id in ids[:5])
-        + "] (combine units only within one bracketed group)"
+        + "] (combine boundaries only within one bracketed group)"
     )
 
 
@@ -535,7 +535,7 @@ def test_active_child_is_atomic_and_eligibility_line_is_single_ordered_line():
     groups = eligible_rollup_groups(events, projection, state)
     assert eligible_rollup_line(groups) == (
         f"Eligible rollup turns: [{ids[0]}, {ids[1]}-{ids[2]}, {ids[3]}, {ids[4]}] "
-        "(combine units only within one bracketed group)"
+        "(combine boundaries only within one bracketed group)"
     )
     assert eligible_rollup_line([]) == ""
 
@@ -551,7 +551,7 @@ def test_eligibility_line_keeps_one_atomic_multi_turn_unit():
 
     assert eligible_rollup_line([[unit]]) == (
         "Eligible rollup turns: [6-14] "
-        "(combine units only within one bracketed group)"
+        "(combine boundaries only within one bracketed group)"
     )
 
 
@@ -613,7 +613,7 @@ def test_sparse_individually_covered_units_without_valid_pairs_are_not_advertise
     ]
     assert eligible_rollup_line(groups) == (
         "Eligible rollup turns: [321, 325] "
-        "(combine units only within one bracketed group)"
+        "(combine boundaries only within one bracketed group)"
     )
 
 
@@ -1846,10 +1846,11 @@ def test_system_prompt_contains_stable_stage_three_guidance():
     assertions = [
         "# Turn N",
         "Eligible rollup turns:",
-        "Both endpoints are inclusive",
+        "A and B remain as outer boundaries",
+        "Adjacent rollups may share a boundary",
         "Recent,",
         "unlisted",
-        "child-internal",
+        "strict interior",
         "context pressure",
         "PreviewRef",
         "user's intent",
@@ -1916,7 +1917,7 @@ def _mock_rollup_agent(units, max_chars=20):
         _session_id="session",
         _persisted_preview_state=state,
         _conversation=SimpleNamespace(messages=messages),
-        _authoritative_persisted_projection=lambda: (messages, state),
+        _authoritative_persisted_projection=lambda **kwargs: (messages, state),
     )
 
 
@@ -1992,24 +1993,123 @@ def test_observe_transition_retry_and_abandonment_state_does_not_leak():
     assert "_observation_transition" not in later_message
 
 
-def test_rollup_maps_nonconsecutive_canonical_units_and_calls_persistence_once(monkeypatch):
+
+def _mock_boundary_context(monkeypatch, turn_rollups, agent, turns, groups):
+    eligibility = turn_rollups.RollupEligibility(
+        tuple(unit for group in groups for unit in group),
+        tuple(unit for group in groups for unit in group),
+        tuple(tuple(group) for group in groups),
+    )
+    events = [
+        event(turn.turn_id, input_message(str(turn.turn_id)))
+        for turn in turns
+    ]
+    monkeypatch.setattr(
+        turn_rollups,
+        "derive_agent_rollup_context",
+        lambda target: (
+            events,
+            target._conversation.messages,
+            target._persisted_preview_state,
+            eligibility,
+        ),
+    )
+    monkeypatch.setattr(
+        turn_rollups,
+        "completed_turns",
+        lambda snapshot: turns,
+    )
+
+
+def test_boundary_eligibility_preserves_outer_endpoints_and_hides_interiors(
+    monkeypatch,
+):
+    import code_agent.turn_rollups as turn_rollups
+
+    turns = [
+        CompletedTurn(turn_id, turn_id, turn_id + 1, False)
+        for turn_id in (2, 5, 10, 12, 14, 17, 20, 23, 26, 29)
+    ]
+    projection = projected_messages(
+        completed_events(10)[0]
+    )
+    monkeypatch.setattr(
+        turn_rollups,
+        "completed_turns",
+        lambda events: turns,
+    )
+    monkeypatch.setattr(
+        turn_rollups,
+        "_rollup_units_from_snapshot",
+        lambda *args: [_boundary_unit for _boundary_unit in (
+            RollupUnit(
+                turn.turn_id,
+                turn.turn_id,
+                turn.source_start_seq,
+                turn.source_end_seq,
+                (turn.turn_id,),
+            )
+            for turn in turns
+        )],
+    )
+    replacement = {
+        "role": "user",
+        "content": "replacement",
+        "_source_start_seq": 10,
+        "_source_end_seq": 15,
+        "_synthetic": True,
+        "_coalesced": True,
+    }
+    monkeypatch.setattr(
+        turn_rollups,
+        "has_valid_deterministic_identity",
+        lambda message: message is replacement,
+    )
+
+    eligibility = turn_rollups.derive_rollup_boundary_eligibility(
+        [],
+        [replacement],
+        PersistedPreviewState.empty(),
+        exact_messages=projection,
+    )
+
+    assert [
+        unit.start_turn for unit in eligibility.all_units
+    ] == [2, 5, 10, 14, 17, 20, 23, 26, 29]
+    assert [
+        [unit.start_turn for unit in group]
+        for group in eligibility.groups
+    ] == [[2, 5, 10, 14, 17, 20]]
+
+
+
+def test_rollup_maps_boundary_interval_and_calls_persistence_once(monkeypatch):
     from code_agent.agent import CodeAgentBase
     from code_agent.code_agent_coalesce import Preview
     import code_agent.turn_rollups as turn_rollups
 
-    units = [
-        turn_rollups.RollupUnit(2, 2, 10, 12, (2,)),
-        turn_rollups.RollupUnit(7, 11, 20, 30, (7, 11)),
-        turn_rollups.RollupUnit(20, 20, 40, 42, (20,)),
+    turns = [
+        CompletedTurn(2, 10, 12, False),
+        CompletedTurn(7, 20, 30, False),
+        CompletedTurn(11, 31, 35, False),
+        CompletedTurn(20, 40, 42, False),
+    ]
+    boundaries = [
+        RollupUnit(turn.turn_id, turn.turn_id, turn.source_start_seq, turn.source_end_seq, (turn.turn_id,))
+        for turn in turns
     ]
     calls = []
-    agent = _mock_rollup_agent(units)
+    agent = _mock_rollup_agent(boundaries)
     agent.create_persisted_preview = lambda preview, **kwargs: (
         calls.append((preview, kwargs)) or ("preview-key", 99)
     )
-    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(turn_rollups, "derive_rollup_eligibility", lambda *args: turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),)))
-    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
+    _mock_boundary_context(
+        monkeypatch,
+        turn_rollups,
+        agent,
+        turns,
+        [boundaries],
+    )
 
     result = CodeAgentBase.rollup(agent, 2, 11, "summary")
 
@@ -2020,87 +2120,37 @@ def test_rollup_maps_nonconsecutive_canonical_units_and_calls_persistence_once(m
     )]
 
 
-def test_rollup_requires_eligible_outer_boundaries_and_every_selected_unit(monkeypatch):
+def test_rollup_requires_boundaries_from_one_advertised_group(monkeypatch):
     from code_agent.agent import CodeAgentBase
     import code_agent.turn_rollups as turn_rollups
 
-    units = [
-        turn_rollups.RollupUnit(2, 2, 10, 12, (2,)),
-        turn_rollups.RollupUnit(7, 11, 20, 30, (7, 11)),
-        turn_rollups.RollupUnit(20, 20, 40, 42, (20,)),
+    turns = [
+        CompletedTurn(turn_id, source, source + 1, False)
+        for turn_id, source in ((2, 10), (7, 20), (11, 30), (20, 40))
     ]
-    agent = _mock_rollup_agent(units)
-    agent.create_persisted_preview = lambda *args, **kwargs: pytest.fail("must not persist")
-    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(
-        turn_rollups,
-        "derive_rollup_eligibility",
-        lambda *args: turn_rollups.RollupEligibility(
-            tuple(units),
-            (units[0], units[2]),
-            ((units[0],), (units[2],)),
-        ),
-    )
-    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
-
-    with pytest.raises(ValueError, match="end_turn is not an eligible unit boundary"):
-        CodeAgentBase.rollup(agent, 2, 11, "summary")
-    with pytest.raises(ValueError, match="every unit"):
-        CodeAgentBase.rollup(agent, 2, 20, "summary")
-    with pytest.raises(ValueError, match="start_turn is not an eligible unit boundary"):
-        CodeAgentBase.rollup(agent, 7, 20, "summary")
-
-
-
-def test_rollup_reports_uncovered_gap_between_individually_eligible_groups(
-    monkeypatch,
-):
-    from code_agent.agent import CodeAgentBase
-    import code_agent.turn_rollups as turn_rollups
-
-    units = [
-        turn_rollups.RollupUnit(141, 141, 10, 12, (141,)),
-        turn_rollups.RollupUnit(313, 313, 20, 22, (313,)),
-        turn_rollups.RollupUnit(317, 317, 30, 32, (317,)),
-        turn_rollups.RollupUnit(321, 321, 40, 42, (321,)),
+    boundaries = [
+        RollupUnit(turn.turn_id, turn.turn_id, turn.source_start_seq, turn.source_end_seq, (turn.turn_id,))
+        for turn in turns
     ]
-    agent = _mock_rollup_agent(units)
+    agent = _mock_rollup_agent(boundaries)
     agent.create_persisted_preview = lambda *args, **kwargs: pytest.fail(
         "must not persist"
     )
-    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(
+    _mock_boundary_context(
+        monkeypatch,
         turn_rollups,
-        "derive_rollup_eligibility",
-        lambda *args: turn_rollups.RollupEligibility(
-            tuple(units),
-            tuple(units),
-            (tuple(units[:2]), tuple(units[2:])),
-        ),
+        agent,
+        turns,
+        [boundaries[:2], boundaries[2:]],
     )
-    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
 
-    with pytest.raises(ValueError, match="uncovered canonical/projected gap"):
-        CodeAgentBase.rollup(agent, 141, 321, "summary")
-
-
-def test_rollup_rejects_reversed_and_single_turn_intervals(monkeypatch):
-    from code_agent.agent import CodeAgentBase
-    import code_agent.turn_rollups as turn_rollups
-
-    units = [
-        turn_rollups.RollupUnit(2, 2, 10, 12, (2,)),
-        turn_rollups.RollupUnit(7, 7, 20, 22, (7,)),
-    ]
-    agent = _mock_rollup_agent(units)
-    agent.create_persisted_preview = lambda *args, **kwargs: pytest.fail("must not persist")
-    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(turn_rollups, "derive_rollup_eligibility", lambda *args: turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),)))
-    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
-
-    with pytest.raises(ValueError, match="reversed"):
+    with pytest.raises(ValueError, match="one advertised bracketed group"):
+        CodeAgentBase.rollup(agent, 2, 20, "summary")
+    with pytest.raises(ValueError, match="start_turn is not an eligible boundary"):
+        CodeAgentBase.rollup(agent, 9, 11, "summary")
+    with pytest.raises(ValueError, match="reversed or identical"):
         CodeAgentBase.rollup(agent, 7, 2, "summary")
-    with pytest.raises(ValueError, match="at least two completed turns"):
+    with pytest.raises(ValueError, match="reversed or identical"):
         CodeAgentBase.rollup(agent, 2, 2, "summary")
 
 
@@ -2131,51 +2181,65 @@ def test_rollup_summary_accepts_boundary_length(monkeypatch):
     from code_agent.agent import CodeAgentBase
     import code_agent.turn_rollups as turn_rollups
 
-    units = [
-        turn_rollups.RollupUnit(2, 2, 10, 12, (2,)),
-        turn_rollups.RollupUnit(7, 7, 20, 22, (7,)),
+    turns = [
+        CompletedTurn(2, 10, 12, False),
+        CompletedTurn(7, 20, 22, False),
     ]
-    agent = _mock_rollup_agent(units, max_chars=5)
+    boundaries = [
+        RollupUnit(turn.turn_id, turn.turn_id, turn.source_start_seq, turn.source_end_seq, (turn.turn_id,))
+        for turn in turns
+    ]
+    agent = _mock_rollup_agent(boundaries, max_chars=5)
     agent.create_persisted_preview = lambda *args, **kwargs: ("key", 8)
-    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(turn_rollups, "derive_rollup_eligibility", lambda *args: turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),)))
-    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
+    _mock_boundary_context(
+        monkeypatch,
+        turn_rollups,
+        agent,
+        turns,
+        [boundaries],
+    )
+
     assert "preview key" in CodeAgentBase.rollup(agent, 2, 7, "12345")
 
 
-def test_rollup_rebuilds_stale_eligibility_on_every_call(monkeypatch):
+def test_rollup_rebuilds_shared_context_on_every_call(monkeypatch):
     from code_agent.agent import CodeAgentBase
     import code_agent.turn_rollups as turn_rollups
 
-    units = [
-        turn_rollups.RollupUnit(2, 2, 10, 12, (2,)),
-        turn_rollups.RollupUnit(7, 7, 20, 22, (7,)),
+    turns = [
+        CompletedTurn(2, 10, 12, False),
+        CompletedTurn(7, 20, 22, False),
     ]
-    event_reads = []
-    eligibility_calls = []
-    agent = _mock_rollup_agent(units)
-    agent._session_store = SimpleNamespace(
-        get_events=lambda session_id: event_reads.append(session_id) or []
-    )
+    boundaries = [
+        RollupUnit(turn.turn_id, turn.turn_id, turn.source_start_seq, turn.source_end_seq, (turn.turn_id,))
+        for turn in turns
+    ]
+    agent = _mock_rollup_agent(boundaries)
     agent.create_persisted_preview = lambda *args, **kwargs: ("key", 8)
-    monkeypatch.setattr(turn_rollups, "rollup_units", lambda *args: units)
-    monkeypatch.setattr(
-        turn_rollups,
-        "derive_rollup_eligibility",
-        lambda *args: eligibility_calls.append(True)
-        or (
-            turn_rollups.RollupEligibility(tuple(units), tuple(units), (tuple(units),))
-            if len(eligibility_calls) == 1
-            else turn_rollups.RollupEligibility(tuple(units), (), ())
-        ),
-    )
-    monkeypatch.setattr(turn_rollups, "validate_rollup_interval", lambda *args: True)
+    calls = []
+
+    def context(target):
+        calls.append(True)
+        groups = (tuple(boundaries),) if len(calls) == 1 else ()
+        eligibility = turn_rollups.RollupEligibility(
+            tuple(boundaries),
+            tuple(boundaries) if groups else (),
+            groups,
+        )
+        return (
+            [],
+            target._conversation.messages,
+            target._persisted_preview_state,
+            eligibility,
+        )
+
+    monkeypatch.setattr(turn_rollups, "derive_agent_rollup_context", context)
+    monkeypatch.setattr(turn_rollups, "completed_turns", lambda events: turns)
 
     CodeAgentBase.rollup(agent, 2, 7, "first")
-    with pytest.raises(ValueError, match="no rollup units are currently eligible"):
+    with pytest.raises(ValueError, match="no rollup boundaries are currently eligible"):
         CodeAgentBase.rollup(agent, 2, 7, "second")
-    assert event_reads == ["session", "session"]
-    assert len(eligibility_calls) == 2
+    assert len(calls) == 2
 
 
 def test_rollup_live_success_and_validation_failure_are_atomic(tmp_path):
@@ -2197,7 +2261,7 @@ def test_rollup_live_success_and_validation_failure_are_atomic(tmp_path):
     ]
     assert new_events[0]["payload"]["summary"] == "combined summary"
     assert agent._persisted_preview_state.active_placements == {
-        (events[0]["seq"], events[3]["seq"]): new_events[0]["seq"]
+        (events[0]["seq"], events[1]["seq"]): new_events[0]["seq"]
     }
 
 
@@ -2218,23 +2282,21 @@ def test_rollup_injected_persistence_failure_is_atomic(tmp_path, monkeypatch):
     assert _rollup_snapshot(agent, store, session_id) == before
 
 
-def test_recursive_rollup_preserves_child_ref_and_rejects_child_internal_endpoint(tmp_path):
+def test_recursive_and_adjacent_rollups_preserve_outer_boundaries(tmp_path):
     events, ids = completed_events(7)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
 
     child_result = agent.rollup(ids[0], ids[1], "child summary")
     child_key = child_result.split("preview ", 1)[1].split(" ", 1)[0]
-    child_snapshot = _rollup_snapshot(agent, store, session_id)
 
-    with pytest.raises(ValueError, match="start_turn is not an eligible unit boundary"):
-        agent.rollup(ids[1], ids[2], "partial child")
-    assert _rollup_snapshot(agent, store, session_id) == child_snapshot
+    adjacent_result = agent.rollup(ids[1], ids[2], "adjacent summary")
+    adjacent_key = adjacent_result.split("preview ", 1)[1].split(" ", 1)[0]
 
     parent_result = agent.rollup(ids[0], ids[2], "parent summary")
     parent_key = parent_result.split("preview ", 1)[1].split(" ", 1)[0]
-    assert f"session://preview/{child_key}" in store.get_preview_blob(
-        session_id, parent_key
-    )
+    parent_content = store.get_preview_blob(session_id, parent_key)
+    assert f"session://preview/{child_key}" in parent_content
+    assert f"session://preview/{adjacent_key}" in parent_content
 
 
 def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_path):
@@ -2263,7 +2325,7 @@ def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_p
         )
     }
     assert agent._persisted_preview_state.active_placements == {
-        (events[0]["seq"], events[3]["seq"]): new_events[0]["seq"]
+        (events[0]["seq"], events[1]["seq"]): new_events[0]["seq"]
     }
     assert all(
         message.get("_event_seq") != 999

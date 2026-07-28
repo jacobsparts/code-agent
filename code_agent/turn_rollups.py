@@ -611,6 +611,213 @@ def derive_rollup_eligibility(
     )
 
 
+
+def _replacement_source_ranges(
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+) -> list[tuple[int, int]]:
+    ranges = list(_outer_active_placements(persisted_state.active_placements))
+    for message in projected_messages:
+        if message.get("_persisted_preview"):
+            continue
+        if not has_valid_deterministic_identity(message):
+            continue
+        source_range = message_source_range(message)
+        if source_range is not None:
+            ranges.append(source_range)
+    return ranges
+
+
+def _surviving_rollup_boundary_indexes(
+    turns: list[CompletedTurn],
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+) -> list[int]:
+    connected = {index: {index} for index in range(len(turns))}
+
+    for source_start, source_end in _replacement_source_ranges(
+        projected_messages,
+        persisted_state,
+    ):
+        overlapping = [
+            index
+            for index, turn in enumerate(turns)
+            if turn.source_start_seq <= source_end
+            and source_start <= turn.source_end_seq
+        ]
+        if len(overlapping) < 2:
+            continue
+        merged = set().union(*(connected[index] for index in overlapping))
+        for index in merged:
+            connected[index] = merged
+
+    hidden = set()
+    seen = set()
+    for index in range(len(turns)):
+        component = connected[index]
+        if index in seen or len(component) < 2:
+            continue
+        seen.update(component)
+        hidden.update(range(min(component) + 1, max(component)))
+
+    return [
+        index
+        for index in range(len(turns))
+        if index not in hidden
+    ]
+
+
+def _boundary_unit(turn: CompletedTurn) -> RollupUnit:
+    return RollupUnit(
+        turn.turn_id,
+        turn.turn_id,
+        turn.source_start_seq,
+        turn.source_end_seq,
+        (turn.turn_id,),
+    )
+
+
+def derive_rollup_boundary_eligibility(
+    events: list[dict],
+    projected_messages: list[dict],
+    persisted_state: PersistedPreviewState,
+    *,
+    exact_messages: list[dict] | None = None,
+) -> RollupEligibility:
+    if not isinstance(persisted_state, PersistedPreviewState):
+        raise TypeError("complete persisted preview state is required")
+    turns = completed_turns(events)
+    if not turns:
+        return RollupEligibility((), (), ())
+
+    if exact_messages is None:
+        exact_messages = projected_messages
+    canonical_messages, _ = _canonical_messages(events)
+    exact_units = _rollup_units_from_snapshot(
+        turns,
+        canonical_messages,
+        exact_messages,
+        persisted_state,
+    )
+    valid_turn_ids = {
+        turn_id
+        for unit in exact_units
+        for turn_id in unit.turn_ids
+    }
+    surviving = _surviving_rollup_boundary_indexes(
+        turns,
+        projected_messages,
+        persisted_state,
+    )
+
+    protected = {turn.turn_id for turn in turns[-3:]}
+    execution_turns = [turn for turn in turns if turn.has_execution]
+    if execution_turns:
+        protected.add(execution_turns[-1].turn_id)
+
+    all_boundaries = tuple(_boundary_unit(turns[index]) for index in surviving)
+    groups = []
+    current = []
+    for index in surviving:
+        turn = turns[index]
+        if turn.turn_id in protected:
+            if len(current) >= 2:
+                groups.append(tuple(current))
+            current = []
+            continue
+        if current:
+            previous_index = next(
+                candidate
+                for candidate in reversed(surviving)
+                if candidate < index
+            )
+            covered_ids = {
+                item.turn_id
+                for item in turns[previous_index:index]
+            }
+            if not covered_ids or not covered_ids.issubset(valid_turn_ids):
+                if len(current) >= 2:
+                    groups.append(tuple(current))
+                current = []
+        current.append(_boundary_unit(turn))
+    if len(current) >= 2:
+        groups.append(tuple(current))
+
+    units = tuple(unit for group in groups for unit in group)
+    return RollupEligibility(all_boundaries, units, tuple(groups))
+
+
+def resolve_rollup_boundary_interval(
+    eligibility: RollupEligibility,
+    turns: list[CompletedTurn],
+    start_turn: int,
+    end_turn: int,
+) -> tuple[int, int, tuple[int, ...]]:
+    selected_group = next(
+        (
+            group
+            for group in eligibility.groups
+            if any(unit.start_turn == start_turn for unit in group)
+            and any(unit.start_turn == end_turn for unit in group)
+        ),
+        None,
+    )
+    if selected_group is None:
+        starts = {
+            unit.start_turn
+            for group in eligibility.groups
+            for unit in group
+        }
+        if start_turn not in starts:
+            raise ValueError("start_turn is not an eligible boundary.")
+        if end_turn not in starts:
+            raise ValueError("end_turn is not an eligible boundary.")
+        raise ValueError(
+            "rollup boundaries must come from one advertised bracketed group."
+        )
+
+    order = {turn.turn_id: index for index, turn in enumerate(turns)}
+    start_index = order[start_turn]
+    end_index = order[end_turn]
+    if start_index >= end_index:
+        raise ValueError("rollup endpoints are reversed or identical.")
+
+    covered = turns[start_index:end_index]
+    return (
+        covered[0].source_start_seq,
+        covered[-1].source_end_seq,
+        tuple(turn.turn_id for turn in covered),
+    )
+
+
+def derive_agent_rollup_context(agent):
+    from code_agent.code_agent_coalesce import coalesce_repl_messages
+
+    store = getattr(agent, "_session_store", None)
+    session_id = getattr(agent, "_session_id", None)
+    if store is None or session_id is None:
+        return None
+
+    events = store.get_events(session_id)
+    exact_messages, state = agent._authoritative_persisted_projection(
+        coalesce=False
+    )
+    projected_messages = coalesce_repl_messages(
+        exact_messages,
+        keep_last_execution_interactions=(
+            agent.code_agent_coalesce_keep_last_execution_interactions
+        ),
+        min_savings_chars=agent.code_agent_coalesce_min_savings_chars,
+    )
+    eligibility = derive_rollup_boundary_eligibility(
+        events,
+        projected_messages,
+        state,
+        exact_messages=exact_messages,
+    )
+    return events, exact_messages, state, eligibility
+
+
 def eligible_rollup_groups(
     events: list[dict],
     projected_messages: list[dict],
@@ -656,5 +863,5 @@ def eligible_rollup_line(groups: list[list[RollupUnit]]) -> str:
     return (
         "Eligible rollup turns: "
         + " | ".join(render_group(group) for group in groups)
-        + " (combine units only within one bracketed group)"
+        + " (combine boundaries only within one bracketed group)"
     )
