@@ -61,6 +61,8 @@ from typing import Any, Callable, Optional, Tuple
 class MultiprocessingTransport:
     """Worker lifecycle plus queue endpoints backed by multiprocessing."""
 
+    receives_terminal_sigint = True
+
     def __init__(
         self,
         target: Callable[..., None],
@@ -126,6 +128,9 @@ class MultiprocessingTransport:
 class StdioSubprocessTransport:
     """Worker lifecycle plus queue endpoints backed by subprocess stdio."""
 
+    receives_terminal_sigint = True
+    _INTERRUPT_CHANNEL = "__interrupt__"
+
     LOADER = (
         'import sys,struct;'
         'exec(sys.stdin.buffer.read(struct.unpack("!I",sys.stdin.buffer.read(4))[0]))'
@@ -170,6 +175,7 @@ import base64
 import os
 import pickle
 import queue
+import signal
 import struct
 import sys
 import threading
@@ -221,6 +227,9 @@ class _StdioMux:
                 header = self._read_exact(4)
                 size = struct.unpack("!I", header)[0]
                 channel, item = pickle.loads(self._read_exact(size))
+                if channel == "__interrupt__":
+                    os.kill(os.getpid(), signal.SIGINT)
+                    continue
                 self._queues[channel].put(item)
         except BaseException as exc:
             self._closed = True
@@ -577,12 +586,9 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
         return self.worker is not None and self.worker.poll() is None
 
     def interrupt(self) -> None:
-        if self.worker is None:
+        if self._mux is None:
             return
-        try:
-            self.worker.send_signal(signal.SIGINT)
-        except (ProcessLookupError, OSError):
-            pass
+        self._mux.send(self._INTERRUPT_CHANNEL, None)
 
     def kill(self) -> None:
         if self.worker is None:
@@ -618,6 +624,8 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
 
 class SSHSubprocessTransport(StdioSubprocessTransport):
     """Worker lifecycle plus queue endpoints backed by a remote Python over ssh."""
+
+    receives_terminal_sigint = False
 
     def __init__(
         self,

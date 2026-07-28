@@ -271,9 +271,14 @@ def _worker_main(cmd_queue: Queue, output_queue: Queue, cwd: str) -> None:
     """
     os.chdir(cwd)
     repl_locals: dict[str, Any] = {}
+    command_active = False
+    interrupt_in_progress = False
 
     def sigint_handler(signum: int, frame: Any) -> None:
-        raise KeyboardInterrupt()
+        nonlocal interrupt_in_progress
+        if command_active and not interrupt_in_progress:
+            interrupt_in_progress = True
+            raise KeyboardInterrupt()
 
     signal.signal(signal.SIGINT, sigint_handler)
 
@@ -284,6 +289,8 @@ def _worker_main(cmd_queue: Queue, output_queue: Queue, cwd: str) -> None:
             if cmd is None:
                 break
 
+            command_active = True
+            interrupt_in_progress = False
             old_stdout = sys.stdout
             old_stderr = sys.stderr
             sys.stdout = _StreamingWriter(output_queue, old_stdout)
@@ -331,14 +338,16 @@ def _worker_main(cmd_queue: Queue, output_queue: Queue, cwd: str) -> None:
                     sys.stderr.write("".join(traceback.format_tb(tb)))
                 sys.stderr.write(f"{type(e).__name__}: {e}\n")
             finally:
+                interrupt_in_progress = True
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
 
             output_queue.put(("done", had_error))
+            command_active = False
+            interrupt_in_progress = False
 
         except KeyboardInterrupt:
-            output_queue.put(("output", "\nKeyboardInterrupt\n"))
-            output_queue.put(("done", True))
+            continue
 
 
 class SubREPL:

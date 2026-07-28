@@ -327,9 +327,14 @@ def _tool_worker_main(
         '_tool_request_queue': tool_request_queue,
         '_tool_response_queue': tool_response_queue,
     }
+    command_active = False
+    interrupt_in_progress = False
 
     def sigint_handler(signum: int, frame: Any) -> None:
-        raise KeyboardInterrupt()
+        nonlocal interrupt_in_progress
+        if command_active and not interrupt_in_progress:
+            interrupt_in_progress = True
+            raise KeyboardInterrupt()
 
     signal.signal(signal.SIGINT, sigint_handler)
 
@@ -346,6 +351,8 @@ def _tool_worker_main(
             else:
                 seq_id, cmd = None, msg
 
+            command_active = True
+            interrupt_in_progress = False
             old_stdout = sys.stdout
             old_stderr = sys.stderr
             statement_output = _StatementOutput(output_queue)
@@ -393,15 +400,17 @@ def _tool_worker_main(
                     sys.stderr.write("".join(traceback.format_tb(tb)))
                 sys.stderr.write(f"{type(e).__name__}: {e}\n")
             finally:
+                interrupt_in_progress = True
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
                 statement_output.finish()
 
             output_queue.put(("done", (seq_id, had_error)))
+            command_active = False
+            interrupt_in_progress = False
 
         except KeyboardInterrupt:
-            output_queue.put(("output", "\nKeyboardInterrupt\n"))
-            output_queue.put(("done", (seq_id, True)))
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -1388,8 +1397,8 @@ Call help(function_name) for parameter descriptions.
                 statement_had_error = False
                 completed_early = False
 
-                try:
-                    while True:
+                while True:
+                    try:
                         tool_req = repl.poll_tool_request(timeout=0)
                         if tool_req:
                             self._handle_tool_request(repl, tool_req)
@@ -1422,12 +1431,9 @@ Call help(function_name) for parameter descriptions.
                             publish_worker(msg_type, msg_data)
                         except Empty:
                             repl._check_worker_alive()
-                except KeyboardInterrupt:
-                    interrupted_output = repl.interrupt()
-                    if interrupted_output:
-                        publish_worker("output", interrupted_output)
-                    repl._running = False
-                    raise _InterruptedError()
+                    except KeyboardInterrupt:
+                        if not repl._transport.receives_terminal_sigint:
+                            repl._transport.interrupt()
 
                 publish(ReplEvent(
                     kind="statement_finished",
