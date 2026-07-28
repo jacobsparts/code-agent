@@ -3557,6 +3557,19 @@ def _native_repl_code(call: ToolCall) -> str:
             if value is not None
         )
         return f"grep({rendered})"
+    if name == "Read":
+        path = params.get("path", "")
+        offset = params.get("offset")
+        limit = params.get("limit")
+        if offset is None and limit is None:
+            return f"view({path!r})"
+        if offset is None:
+            slice_spec = f":{limit}"
+        elif limit is None:
+            slice_spec = f"{offset}:"
+        else:
+            slice_spec = f"{offset}:{offset + limit}"
+        return f"print(read({path!r})[{slice_spec}])"
     return f"# unsupported tool call: {name}({params!r})"
 
 
