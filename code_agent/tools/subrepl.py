@@ -641,7 +641,7 @@ class SubREPL:
                     msg_type, msg_data = self._output_queue.get_nowait()
                     if msg_type == "output":
                         output_chunks.append(msg_data)
-                except Empty:
+                except (Empty, EOFError, BrokenPipeError):
                     break
 
         if self._transport.is_alive():

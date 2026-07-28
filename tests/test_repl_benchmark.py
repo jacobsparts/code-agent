@@ -324,6 +324,19 @@ def test_tool_repl_worker_imports_from_current_directory(tmp_path, monkeypatch):
     assert items[-1] == ("done", (1, False))
 
 
+def test_ssh_transport_isolated_from_terminal_process_group():
+    from code_agent.tools.subrepl import _worker_main
+    from code_agent.tools.transports import SSHSubprocessTransport
+
+    transport = SSHSubprocessTransport(
+        target=_worker_main,
+        ssh_target="example.invalid",
+    )
+
+    assert transport.receives_terminal_sigint is False
+    assert transport._popen_kwargs() == {"start_new_session": True}
+
+
 def test_tool_repl_does_not_pass_local_cwd_to_ssh_transport():
     from queue import Queue
 

@@ -497,6 +497,9 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
     def _popen_command(self) -> list[str]:
         return [self._executable, "-u", "-c", self.LOADER]
 
+    def _popen_kwargs(self) -> dict[str, Any]:
+        return {}
+
     def start(self) -> None:
         import base64
         import pickle
@@ -520,6 +523,7 @@ _runtime_globals[__TARGET_NAME__](*_queues, *_args)
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **self._popen_kwargs(),
         )
         if self.worker.stdin is None or self.worker.stdout is None:
             raise RuntimeError("Failed to open subprocess stdio pipes")
@@ -662,3 +666,6 @@ class SSHSubprocessTransport(StdioSubprocessTransport):
         else:
             python_cmd = f"exec {python_cmd}"
         return [self._ssh_executable, self._ssh_target, python_cmd]
+
+    def _popen_kwargs(self) -> dict[str, Any]:
+        return {"start_new_session": True}
