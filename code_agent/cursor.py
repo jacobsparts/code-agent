@@ -76,6 +76,7 @@ _CURSOR_RATIO_MIN_BYTES = 1_000
 _CURSOR_RATIO_MIN = 0.05
 _CURSOR_RATIO_MAX = 1.0
 _CURSOR_RATIO_SAMPLE_LIMIT = 32
+_CURSOR_ROTATION_MIN_REQUESTS = 4
 _CURSOR_CALIBRATION_SAMPLE = 'from collections import defaultdict\nfrom pathlib import Path\n\n\ndef summarize_python_files(root):\n    grouped = defaultdict(list)\n    for path in Path(root).rglob("*.py"):\n        if "__pycache__" in path.parts or path.name.startswith("."):\n            continue\n        try:\n            source = path.read_text(encoding="utf-8")\n        except (OSError, UnicodeDecodeError):\n            continue\n        grouped[str(path.parent)].append({\n            "path": str(path),\n            "bytes": len(source.encode("utf-8")),\n            "lines": len(source.splitlines()),\n        })\n    return dict(grouped)\n'
 _CURSOR_DEFAULT_INPUT_COST = 0.5
 _CURSOR_DEFAULT_CACHE_READ_COST = 0.2
@@ -2579,18 +2580,6 @@ def openai_usage(usage: TurnUsage) -> dict:
     return {
         "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
-        "total_tokens": (
-            usage.input_tokens
-            + usage.output_tokens
-            + usage.reasoning_tokens
-        ),
-        "prompt_tokens_details": {
-            "cached_tokens": usage.cache_read_tokens,
-            "cache_write_tokens": usage.cache_write_tokens,
-        },
-        "completion_tokens_details": {
-            "reasoning_tokens": usage.reasoning_tokens,
-        },
     }
 
 
@@ -3862,6 +3851,7 @@ def _cursor_model_stats(model: str) -> dict:
             "previous_request_bytes": None,
             "previous_reported_cost": None,
             "accumulated_excess": 0.0,
+            "request_count": 0,
             "ratio_samples": [],
         }
         _MODEL_CURSOR_STATS[model] = stats
@@ -3906,6 +3896,8 @@ def _should_rotate_cursor_conversation(
     previous_bytes = stats["previous_request_bytes"]
     previous_cost = stats["previous_reported_cost"]
     if previous_bytes is None or previous_cost is None:
+        return False
+    if stats.get("request_count", 0) < _CURSOR_ROTATION_MIN_REQUESTS:
         return False
     ratio = _cursor_tokens_per_byte(model, stats)
     predicted_cost = max(
@@ -3957,6 +3949,7 @@ def _record_cursor_usage(
     stats["previous_reported_cost"] = _reported_cursor_cost_equivalent(
         model, usage
     )
+    stats["request_count"] = stats.get("request_count", 0) + 1
 
 
 def _rotate_cursor_conversation(stats: dict) -> None:
@@ -3964,6 +3957,7 @@ def _rotate_cursor_conversation(stats: dict) -> None:
     stats["previous_request_bytes"] = None
     stats["previous_reported_cost"] = None
     stats["accumulated_excess"] = 0.0
+    stats["request_count"] = 0
 
 
 def chat_completions(api_key: str, body: dict) -> dict:
@@ -4024,14 +4018,6 @@ def chat_completions(api_key: str, body: dict) -> dict:
         response["usage"] = {
             "prompt_tokens": estimated_input_tokens,
             "completion_tokens": result.usage.output_tokens,
-            "total_tokens": (
-                estimated_input_tokens
-                + result.usage.output_tokens
-                + result.usage.reasoning_tokens
-            ),
-            "completion_tokens_details": {
-                "reasoning_tokens": result.usage.reasoning_tokens,
-            },
         }
     return response
 

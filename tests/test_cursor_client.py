@@ -393,10 +393,6 @@ def test_chat_completions_basic(monkeypatch):
     assert response["usage"] == {
         "prompt_tokens": expected_input,
         "completion_tokens": 30,
-        "total_tokens": expected_input + 30 + 7,
-        "completion_tokens_details": {
-            "reasoning_tokens": 7,
-        },
     }
 
 
@@ -491,6 +487,7 @@ def test_cursor_ratio_uses_lower_third_and_weights_first_request():
         cursor.TurnUsage(input_tokens=system_tokens + 2_000),
     )
     assert stats["ratio_samples"] == [0.2, 0.2, 0.2]
+    assert stats["request_count"] == 1
 
     for request_bytes, uncached_tokens in (
         (12_000, 500),
@@ -505,6 +502,7 @@ def test_cursor_ratio_uses_lower_third_and_weights_first_request():
         )
 
     assert cursor._cursor_tokens_per_byte(model, stats) == pytest.approx(0.2)
+    assert stats["request_count"] == 4
 
 
 def test_cursor_rotates_before_request_when_accumulated_excess_is_high(
@@ -517,6 +515,7 @@ def test_cursor_rotates_before_request_when_accumulated_excess_is_high(
         "previous_request_bytes": 50_000,
         "previous_reported_cost": 100_000.0,
         "accumulated_excess": 100_000.0,
+        "request_count": 4,
         "ratio_samples": [0.2, 0.2, 0.2],
     }
     conversation_ids = []
@@ -540,6 +539,39 @@ def test_cursor_rotates_before_request_when_accumulated_excess_is_high(
     assert stats["conversation_id"] == conversation_ids[0]
     assert stats["accumulated_excess"] >= 0
     assert stats["previous_request_bytes"] is not None
+    assert stats["request_count"] == 1
+
+
+def test_cursor_does_not_rotate_before_four_completed_requests(monkeypatch):
+    model = "cursor-grok-4.5-high"
+    conversation_id = "young-conversation"
+    stats = {
+        "conversation_id": conversation_id,
+        "previous_request_bytes": 50_000,
+        "previous_reported_cost": 100_000.0,
+        "accumulated_excess": 100_000.0,
+        "request_count": 3,
+        "ratio_samples": [0.2, 0.2, 0.2],
+    }
+    conversation_ids = []
+
+    monkeypatch.setitem(cursor._MODEL_CURSOR_STATS, model, stats)
+    monkeypatch.setattr(
+        cursor,
+        "run",
+        lambda prompt, **kwargs: (
+            conversation_ids.append(kwargs["run_config"].conversation_id)
+            or _run_result(cursor.TurnUsage(input_tokens=12_000))
+        ),
+    )
+
+    cursor.chat_completions("key", {
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert conversation_ids == [conversation_id]
+    assert stats["request_count"] == 4
 
 
 def test_cursor_rotates_before_shrunken_request_when_predicted_cost_is_high(
@@ -552,6 +584,7 @@ def test_cursor_rotates_before_shrunken_request_when_predicted_cost_is_high(
         "previous_request_bytes": 100_000,
         "previous_reported_cost": 80_000.0,
         "accumulated_excess": 10_000.0,
+        "request_count": 4,
         "ratio_samples": [0.2, 0.2, 0.2],
     }
     conversation_ids = []
@@ -582,6 +615,7 @@ def test_cursor_reuses_conversation_before_threshold(monkeypatch):
         "previous_request_bytes": 1_000,
         "previous_reported_cost": 1_000.0,
         "accumulated_excess": 1.0,
+        "request_count": 4,
         "ratio_samples": [0.2, 0.2, 0.2],
     }
     conversation_ids = []
