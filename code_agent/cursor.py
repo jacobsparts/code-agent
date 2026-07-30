@@ -29,22 +29,58 @@ import tempfile
 import socket
 import ssl
 import struct
+import sys
 import time
 from types import MappingProxyType
 from typing import Iterable, Iterator, Mapping
 import uuid
 from urllib.parse import urljoin, urlsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
 # === Configuration globals ===
 
 DEFAULT_BASE_URL = "https://api2.cursor.sh"
-DEFAULT_MODEL = "composer-2.5"
 DEFAULT_CLIENT_VERSION = "cli-2026.07.08-0c04a8a"
 DEFAULT_TIMEOUT = 30 * 60
 KEY_EXCHANGE_TIMEOUT = 30
 HEARTBEAT_TIMEOUT = 30
+RESPONSE_USAGE_GRACE_TIMEOUT = 3
+USAGE_LOOKUP_ATTEMPTS = 4
+USAGE_LOOKUP_RETRY_DELAY = 1
+USAGE_LOOKUP_WINDOW_MS = 5_000
+
+CURSOR_MODEL_CALIBRATION = {
+    "composer-2.5": {
+        "system_prompt_tokens": 10_752,
+        "variable_tokens_per_byte": 0.205204021289178,
+        "input_cost": 0.5,
+        "cache_read_cost": 0.2,
+    },
+    "cursor-grok-4.5-high": {
+        "system_prompt_tokens": 10_960,
+        "variable_tokens_per_byte": 0.23536369012418687,
+        "input_cost": 2.0,
+        "cache_read_cost": 0.5,
+    },
+    "kimi-k3-high": {
+        "system_prompt_tokens": 15_042,
+        "variable_tokens_per_byte": 0.205204021289178,
+        "input_cost": 3.0,
+        "cache_read_cost": 0.3,
+    },
+}
+
+_CURSOR_RATIO_MIN_BYTES = 1_000
+_CURSOR_RATIO_MIN = 0.05
+_CURSOR_RATIO_MAX = 1.0
+_CURSOR_RATIO_SAMPLE_LIMIT = 32
+_CURSOR_CALIBRATION_SAMPLE = 'from collections import defaultdict\nfrom pathlib import Path\n\n\ndef summarize_python_files(root):\n    grouped = defaultdict(list)\n    for path in Path(root).rglob("*.py"):\n        if "__pycache__" in path.parts or path.name.startswith("."):\n            continue\n        try:\n            source = path.read_text(encoding="utf-8")\n        except (OSError, UnicodeDecodeError):\n            continue\n        grouped[str(path.parent)].append({\n            "path": str(path),\n            "bytes": len(source.encode("utf-8")),\n            "lines": len(source.splitlines()),\n        })\n    return dict(grouped)\n'
+_CURSOR_DEFAULT_INPUT_COST = 0.5
+_CURSOR_DEFAULT_CACHE_READ_COST = 0.2
+_MODEL_CURSOR_STATS = {}
+
 DEFAULT_AGENT_MODE = 1
 KEY_EXCHANGE_URL = "https://api2.cursor.sh/auth/exchange_user_api_key"
 AUTH_CACHE_PATH = os.path.expanduser("~/.code-agent/cursor-auth.json")
@@ -53,12 +89,13 @@ ACCESS_TOKEN_LIFETIME = 60 * 60
 ACCESS_TOKEN_REFRESH_MARGIN = 5 * 60
 AGENT_RUNSSE_PATH = "agent.v1.AgentService/RunSSE"
 BIDI_APPEND_PATH = "aiserver.v1.BidiService/BidiAppend"
+FILTERED_USAGE_PATH = "aiserver.v1.DashboardService/GetFilteredUsageEvents"
 
 # Cursor uses this identifier for inference routing/cache affinity.
 # A code-agent process represents one conversation session.
 _SESSION_CONVERSATION_ID = str(uuid.uuid4())
 
-
+DEBUG = True
 
 # === Protobuf wire codec ===
 
@@ -99,7 +136,6 @@ INTERACTION_UPDATE_FIELD_NAMES = {
     20: "active_branch_change", 21: "feedback_request",
     22: "response_comparison",
 }
-
 
 def _validate_field_number(number: int) -> None:
     if not isinstance(number, int):
@@ -787,11 +823,6 @@ class AnswerText(CursorMessage):
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class Finalization(CursorMessage):
-    pass
-
-
-@dataclass(frozen=True, slots=True, repr=False)
 class InteractionUpdate(CursorMessage):
     subtype_number: int
     subtype: str
@@ -889,35 +920,6 @@ def _answer_decode_text(raw: RawMessage) -> str:
     return _decode_text(value) if value else ""
 
 
-def _contains_finalization(data: bytes, depth: int = 0) -> bool:
-    if depth >= 5:
-        return False
-    raw = _decode_or_none(data)
-    if raw is None:
-        return False
-    lengths = raw.matching(3, 2) + raw.matching(4, 2)
-    has_three = any(item.number == 3 and item.value for item in lengths)
-    has_four = any(item.number == 4 and item.value for item in lengths)
-    return (has_three and has_four) or any(
-        _contains_finalization(item.value, depth + 1)
-        for item in raw.fields if item.wire_type == 2
-    )
-
-
-def _is_finalization(raw: RawMessage) -> bool:
-    for outer in raw.matching(4, 2):
-        event = _decode_or_none(outer.value)
-        if event is None:
-            continue
-        for item in event.matching(3, 2):
-            event_data = _decode_or_none(item.value)
-            if event_data is None:
-                continue
-            if any(_contains_finalization(metadata.value) for metadata in event_data.matching(2, 2)):
-                return True
-    return False
-
-
 def _live_mcp(raw: RawMessage) -> dict[str, object] | None:
     execution = _nested(raw, 2)
     if execution is None:
@@ -1004,9 +1006,6 @@ def classify(raw: RawMessage, direction: str) -> CursorMessage:
     answer = _answer_decode_text(raw)
     if answer:
         return AnswerText(raw, "agent_server.answer_text", direction, answer)
-    if _is_finalization(raw):
-        return Finalization(raw, "agent_server.finalization", direction)
-
     value = raw.first_bytes(1)
     if value is not None and len(value) > 0:
         interaction = _decode_or_none(value)
@@ -1185,8 +1184,8 @@ class LosslessFrameGrouper:
         message = frame.message
         if isinstance(message, InteractionUpdate):
             self._pending.append(frame)
-            return self._flush() if message.subtype == "turn_ended" else []
-        if isinstance(message, (AnswerText, Finalization, CompletedMCPUpdate)):
+            return []
+        if isinstance(message, (AnswerText, CompletedMCPUpdate)):
             self._pending.append(frame)
             return self._flush()
         # Flush before an intervening immediate, KV, or singleton frame so
@@ -1323,7 +1322,7 @@ __all__ = [
     "MessageRepresentation", "ConnectFrame", "CursorFrame",
     "decode_connect_frames", "encode_connect_frame", "encode_varint",
     "protobuf_field", "protobuf_message", "CursorMessage", "NativeExec",
-    "LiveMCPCall", "CompletedMCPUpdate", "AnswerText", "Finalization",
+    "LiveMCPCall", "CompletedMCPUpdate", "AnswerText",
     "InteractionUpdate", "AgentExecMessage", "CheckpointUpdate",
     "KVServerMessage", "ExecControlMessage", "InteractionQuery",
     "RunRequest", "ClientExecMessage", "KVResponse", "Control",
@@ -1593,16 +1592,24 @@ class _PostRequest:
             })
 
     def run(self, mask):
+        if self.finished or self.sock is None:
+            return
         if not self.connected:
             self._finish_connect()
+        if self.finished or self.sock is None:
+            return
         if not self.tls_handshake_done:
             self._do_tls_handshake()
         else:
             if mask & selectors.EVENT_WRITE:
                 self._send()
-            if mask & selectors.EVENT_READ:
+            if (
+                not self.finished
+                and self.sock is not None
+                and mask & selectors.EVENT_READ
+            ):
                 self._receive()
-        if not self.finished:
+        if not self.finished and self.sock is not None:
             self._set_interest()
 
     def close(self):
@@ -1657,6 +1664,7 @@ class SSEClient:
         self.last_event_id = None
         self.retry = None
         self._posts = set()
+        self._grace_deadline = None
 
         self._parts = urlsplit(url)
         if self._parts.scheme not in ("http", "https"):
@@ -1798,6 +1806,9 @@ class SSEClient:
     def _receive(self):
         try:
             data = self.sock.recv(65536)
+            if DEBUG:
+                with open(f"/tmp/coda-cursor-protobuf-{_SESSION_CONVERSATION_ID[:8]}.log",'ab') as f:
+                    f.write(data)
         except (BlockingIOError, ssl.SSLWantReadError):
             return
         except ssl.SSLWantWriteError:
@@ -2012,6 +2023,9 @@ class SSEClient:
     def reset_heartbeat_timeout(self):
         self._heartbeat_deadline = time.monotonic() + HEARTBEAT_TIMEOUT
 
+    def start_grace_period(self, timeout):
+        self._grace_deadline = time.monotonic() + timeout
+
     def run_forever(
         self, timeout=None, *, heartbeat_timeout=None,
     ):
@@ -2032,6 +2046,13 @@ class SSEClient:
                 remaining = self._heartbeat_deadline - now
                 if remaining <= 0:
                     raise SSEError("server heartbeat timeout")
+                waits.append(remaining)
+            if self._grace_deadline is not None:
+                remaining = self._grace_deadline - now
+                if remaining <= 0:
+                    self._grace_deadline = None
+                    self.close()
+                    break
                 waits.append(remaining)
             wait = min(waits) if waits else None
             if not self.run_once(wait):
@@ -2096,28 +2117,34 @@ def build_kv_response(server_payload: bytes, blobs) -> bytes | None:
         return None
     kv = RawMessage.decode(kv_payload)
     request_id_fields = kv.matching(1, 0)
-    args_payload = kv.first_bytes(2)
-    if args_payload is None:
-        return None
-    args = RawMessage.decode(args_payload)
-    blob_id = args.first_bytes(1)
-    if blob_id is None:
-        return None
-    result_fields = []
-    value = blobs.get(blob_id)
-    if value is not None:
-        result_fields.append(_bytes(1, value))
-    kv_client = _message(
-        Field.varint(
-            1,
-            int(request_id_fields[0].value) if request_id_fields else 0,
-        ),
-        _bytes(2, _message(*result_fields)),
+    request_id = (
+        int(request_id_fields[0].value) if request_id_fields else 0
     )
-    return _message(_bytes(3, kv_client))
+    get_args_payload = kv.first_bytes(2)
+    if get_args_payload is not None:
+        args = RawMessage.decode(get_args_payload)
+        blob_id = args.first_bytes(1)
+        if blob_id is None:
+            return None
+        result_fields = []
+        value = blobs.get(blob_id)
+        if value is not None:
+            result_fields.append(_bytes(1, value))
+        kv_client = _message(
+            Field.varint(1, request_id),
+            _bytes(2, _message(*result_fields)),
+        )
+        return _message(_bytes(3, kv_client))
+    if kv.first_bytes(3) is not None:
+        kv_client = _message(
+            Field.varint(1, request_id),
+            _bytes(3, b""),
+        )
+        return _message(_bytes(3, kv_client))
+    return None
 
 
-def is_agent_conversation_turn_structure(
+def is_response_boundary_blob_write(
     server_payload: bytes, request_id: str
 ) -> bool:
     try:
@@ -2162,6 +2189,12 @@ def is_agent_conversation_turn_structure(
         return request_ids[0].value.decode() == request_id
     except UnicodeDecodeError:
         return False
+
+
+def build_user_cancelled_message() -> bytes:
+    return _message(
+        _bytes(4, _message(_bytes(3, _message(_string(1, "user_cancelled")))))
+    )
 
 
 @dataclass(frozen=True)
@@ -2522,6 +2555,139 @@ class ConnectStreamDecoder:
             raise ValueError("truncated Connect frame")
 
 
+@dataclass(frozen=True)
+class TurnUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+
+
+def parse_turn_usage(payload: bytes) -> TurnUsage:
+    update = RawMessage.decode(payload)
+    return TurnUsage(
+        input_tokens=_first_varint(update, 1),
+        output_tokens=_first_varint(update, 2),
+        cache_read_tokens=_first_varint(update, 3),
+        cache_write_tokens=_first_varint(update, 4),
+        reasoning_tokens=_first_varint(update, 5),
+    )
+
+
+def openai_usage(usage: TurnUsage) -> dict:
+    return {
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": (
+            usage.input_tokens
+            + usage.output_tokens
+            + usage.reasoning_tokens
+        ),
+        "prompt_tokens_details": {
+            "cached_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": usage.reasoning_tokens,
+        },
+    }
+
+
+def _checkpoint_timestamp(frame: CursorFrame) -> int | None:
+    if not isinstance(frame.message, CheckpointUpdate):
+        return None
+    checkpoint = RawMessage.decode(frame.message.raw.first_bytes(3) or b"")
+    value = _int(checkpoint, 26)
+    return value or None
+
+
+def build_filtered_usage_request(
+    start_date: int,
+    end_date: int,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+) -> bytes:
+    return _message(
+        Field.varint(1, 0),
+        Field.varint(2, start_date),
+        Field.varint(3, end_date),
+        Field.varint(6, page),
+        Field.varint(7, page_size),
+    )
+
+
+def parse_filtered_usage(
+    payload: bytes,
+    conversation_id: str,
+    request_started_ms: int,
+) -> TurnUsage | None:
+    response = RawMessage.decode(payload)
+    candidates = []
+    for field in response.matching(3, 2):
+        event = RawMessage.decode(field.value)
+        timestamp = _int(event, 1)
+        if (
+            _text(event, 23) != conversation_id
+            or not _int(event, 8)
+            or timestamp < request_started_ms
+        ):
+            continue
+        token_payload = event.first_bytes(9)
+        if token_payload is None:
+            continue
+        token = RawMessage.decode(token_payload)
+        uncached_input = _int(token, 1)
+        cache_read = _int(token, 4)
+        candidates.append((
+            timestamp,
+            TurnUsage(
+                input_tokens=uncached_input + cache_read,
+                output_tokens=_int(token, 2),
+                cache_read_tokens=cache_read,
+                cache_write_tokens=_int(token, 3),
+            ),
+        ))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def get_filtered_usage(
+    token: str,
+    base_url: str,
+    conversation_id: str,
+    anchor_timestamp: int,
+    request_started_ms: int,
+    *,
+    timeout: float = KEY_EXCHANGE_TIMEOUT,
+) -> TurnUsage | None:
+    payload = build_filtered_usage_request(
+        anchor_timestamp - USAGE_LOOKUP_WINDOW_MS,
+        anchor_timestamp + USAGE_LOOKUP_WINDOW_MS,
+    )
+    request = Request(
+        urljoin(base_url.rstrip("/") + "/", FILTERED_USAGE_PATH),
+        data=payload,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/proto",
+            "Accept": "application/proto",
+            "Connect-Protocol-Version": "1",
+            "User-Agent": "connect-es/1.6.1",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return None
+            return parse_filtered_usage(
+                response.read(), conversation_id, request_started_ms
+            )
+    except (HTTPError, OSError, ValueError):
+        return None
+
+
 @dataclass
 class RunResult:
     frames: list[CursorFrame]
@@ -2531,10 +2697,7 @@ class RunResult:
     checkpoint_updates: list[CursorFrame]
     eos_metadata: object | None
     eos_error: str | None
-
-
-
-
+    usage: TurnUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -2591,8 +2754,6 @@ class UserMessageConfig:
     rich_text_blob_id: bytes | None = None
     hook_additional_contexts: tuple[bytes, ...] = ()
     custom_mode_intent: bytes | None = None
-
-
 
 
 @dataclass(frozen=True)
@@ -3122,10 +3283,10 @@ class CursorClient:
         self,
         token: str,
         *,
+        model: str,
         base_url: str = DEFAULT_BASE_URL,
         client_version: str = DEFAULT_CLIENT_VERSION,
         timeout: float | None = DEFAULT_TIMEOUT,
-        model: str = DEFAULT_MODEL,
         tools=(),
         user_config: UserMessageConfig | None = None,
         run_config: RunConfig | None = None,
@@ -3170,13 +3331,19 @@ class CursorClient:
         request_id = str(uuid.uuid4())
         model = self.model if model is None else model
         tools = self.tools if tools is None else tuple(tools)
+        effective_run_config = run_config or self.run_config
+        conversation_id = (
+            effective_run_config.conversation_id or _SESSION_CONVERSATION_ID
+        )
+        request_started_ms = int(time.time() * 1000)
         input_payload = build_run_request(
             prompt,
             model,
             tools=tools,
             history=history,
             user_config=user_config or self.user_config,
-            run_config=run_config or self.run_config,
+            run_config=effective_run_config,
+            conversation_id=conversation_id,
         )
         prefetched_blobs = extract_prefetched_blobs(input_payload)
         downlink_body = ConnectFrame.from_decoded(
@@ -3190,9 +3357,13 @@ class CursorClient:
         checkpoint_updates = []
         eos_metadata = None
         eos_error = None
+        usage = None
+        response_boundary_seen = False
+        accounting_anchor_ms = request_started_ms
 
         def receive(connect: ConnectFrame) -> None:
-            nonlocal turn_ended, eos_metadata, eos_error
+            nonlocal turn_ended, eos_metadata, eos_error, usage
+            nonlocal response_boundary_seen, accounting_anchor_ms
             frame = CursorFrame.decode(
                 connect, "IN", {"connection_id": request_id}
             )
@@ -3225,22 +3396,36 @@ class CursorClient:
             if (
                 frame.classification
                 == "agent_server.interaction_update.turn_ended"
-                or (
-                    not connect.eos
-                    and is_agent_conversation_turn_structure(
-                        connect.decoded_payload, request_id
-                    )
-                )
             ):
                 turn_ended = True
+                usage = parse_turn_usage(frame.message.update_payload)
                 transport.close()
             elif (
                 frame.classification
                 == "agent_server.conversation_checkpoint_update"
             ):
                 checkpoint_updates.append(frame)
-            elif frame.classification == "agent_server.finalization":
-                transport.close()
+                timestamp = _checkpoint_timestamp(frame)
+                if timestamp is not None:
+                    accounting_anchor_ms = timestamp
+            elif (
+                not response_boundary_seen
+                and not connect.eos
+                and is_response_boundary_blob_write(
+                    connect.decoded_payload, request_id
+                )
+            ):
+                response_boundary_seen = True
+                turn_ended = True
+                if tool_calls:
+                    append(
+                        build_user_cancelled_message(),
+                        callback=cancelled,
+                    )
+                else:
+                    transport.start_grace_period(
+                        RESPONSE_USAGE_GRACE_TIMEOUT
+                    )
             if connect.eos:
                 eos_metadata = frame.eos_metadata
                 eos_error = frame.eos_error
@@ -3276,7 +3461,11 @@ class CursorClient:
                     f"BidiAppend returned HTTP {response['status']}"
                 )
 
-        def append(payload):
+        def cancelled(response):
+            appended(response)
+            transport.close()
+
+        def append(payload, callback=appended):
             nonlocal append_seqno
             append_seqno += 1
             transport.post(
@@ -3291,7 +3480,7 @@ class CursorClient:
                     "Content-Type": "application/proto",
                     "Accept": "application/proto",
                 },
-                callback=appended,
+                callback=callback,
             )
 
         def downlink_ready(status, headers):
@@ -3320,8 +3509,21 @@ class CursorClient:
                 raise SSEError("BidiAppend did not complete")
         decoder.finish()
 
-        if eos_error:
+        if eos_error and not response_boundary_seen:
             raise SSEError(eos_error)
+        if turn_ended and usage is None:
+            for attempt in range(USAGE_LOOKUP_ATTEMPTS):
+                usage = get_filtered_usage(
+                    self.token,
+                    self.base_url,
+                    conversation_id,
+                    accounting_anchor_ms,
+                    request_started_ms,
+                )
+                if usage is not None:
+                    break
+                if attempt + 1 < USAGE_LOOKUP_ATTEMPTS:
+                    time.sleep(USAGE_LOOKUP_RETRY_DELAY)
         return RunResult(
             frames,
             "".join(text_parts),
@@ -3330,6 +3532,7 @@ class CursorClient:
             checkpoint_updates,
             eos_metadata,
             eos_error,
+            usage,
         )
 
 
@@ -3337,7 +3540,7 @@ def run(
     prompt: str,
     *,
     api_key: str,
-    model: str = DEFAULT_MODEL,
+    model: str,
     tools=(),
     history=(),
     timeout: float | None = DEFAULT_TIMEOUT,
@@ -3590,6 +3793,179 @@ def _openai_tool_call(call: ToolCall) -> dict:
     }
 
 
+def _cursor_input_bytes(body: dict) -> int:
+    payload = {"messages": body.get("messages")}
+    if body.get("tools"):
+        payload["tools"] = body["tools"]
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    )
+
+
+def _detect_cursor_model_calibration(
+    api_key: str, model: str, timeout: float | None
+) -> None:
+    sample = _CURSOR_CALIBRATION_SAMPLE
+    prompts = (sample, sample + "\n\n" + sample)
+    usages = []
+    for prompt in prompts:
+        result = run(
+            prompt,
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+            run_config=RunConfig(conversation_id=str(uuid.uuid4())),
+        )
+        if result.usage is None:
+            raise ValueError(
+                f"Cursor returned no usage while calibrating {model}"
+            )
+        usages.append(result.usage.input_tokens)
+
+    added_bytes = len(("\n\n" + sample).encode("utf-8"))
+    variable_tokens = usages[1] - usages[0]
+    if variable_tokens <= 0:
+        raise ValueError(
+            f"Cursor returned invalid differential usage while calibrating {model}"
+        )
+    ratio = variable_tokens / added_bytes
+    first_bytes = len(sample.encode("utf-8"))
+    system_tokens = round(usages[0] - ratio * first_bytes)
+    if system_tokens < 0:
+        raise ValueError(
+            f"Cursor returned invalid system prompt usage while calibrating {model}"
+        )
+
+    CURSOR_MODEL_CALIBRATION[model] = {
+        "system_prompt_tokens": system_tokens,
+        "variable_tokens_per_byte": ratio,
+        "input_cost": _CURSOR_DEFAULT_INPUT_COST,
+        "cache_read_cost": _CURSOR_DEFAULT_CACHE_READ_COST,
+    }
+    print(
+        f"Detected Cursor calibration for {model}: "
+        f"system_prompt_tokens={system_tokens}, "
+        f"variable_tokens_per_byte={ratio}"
+    )
+
+
+def _cursor_model_stats(model: str) -> dict:
+    stats = _MODEL_CURSOR_STATS.get(model)
+    if stats is None:
+        stats = {
+            "conversation_id": str(uuid.uuid4()),
+            "previous_request_bytes": None,
+            "previous_reported_cost": None,
+            "accumulated_excess": 0.0,
+            "ratio_samples": [],
+        }
+        _MODEL_CURSOR_STATS[model] = stats
+    return stats
+
+
+def _cursor_tokens_per_byte(model: str, stats: dict) -> float:
+    samples = sorted(stats["ratio_samples"])
+    if not samples:
+        return CURSOR_MODEL_CALIBRATION[model]["variable_tokens_per_byte"]
+    count = max(1, (len(samples) + 2) // 3)
+    return sum(samples[:count]) / count
+
+
+def _estimated_fresh_input_tokens(
+    model: str, input_bytes: int, stats: dict
+) -> float:
+    calibration = CURSOR_MODEL_CALIBRATION[model]
+    return (
+        calibration["system_prompt_tokens"]
+        + input_bytes * _cursor_tokens_per_byte(model, stats)
+    )
+
+
+def _reported_cursor_cost_equivalent(
+    model: str, usage: TurnUsage
+) -> float:
+    calibration = CURSOR_MODEL_CALIBRATION[model]
+    cache_ratio = (
+        calibration["cache_read_cost"] / calibration["input_cost"]
+    )
+    return (
+        usage.input_tokens
+        - usage.cache_read_tokens
+        + usage.cache_read_tokens * cache_ratio
+    )
+
+
+def _should_rotate_cursor_conversation(
+    model: str, stats: dict, input_bytes: int
+) -> bool:
+    previous_bytes = stats["previous_request_bytes"]
+    previous_cost = stats["previous_reported_cost"]
+    if previous_bytes is None or previous_cost is None:
+        return False
+    ratio = _cursor_tokens_per_byte(model, stats)
+    predicted_cost = max(
+        0.0, previous_cost + ratio * (input_bytes - previous_bytes)
+    )
+    estimated_fresh = _estimated_fresh_input_tokens(
+        model, input_bytes, stats
+    )
+    predicted_excess = max(0.0, predicted_cost - estimated_fresh)
+    return (
+        stats["accumulated_excess"] + predicted_excess
+        > estimated_fresh
+    )
+
+
+def _record_cursor_usage(
+    model: str, stats: dict, input_bytes: int, usage: TurnUsage
+) -> None:
+    calibration = CURSOR_MODEL_CALIBRATION[model]
+    previous_bytes = stats["previous_request_bytes"]
+    if previous_bytes is None:
+        variable_tokens = (
+            usage.input_tokens - calibration["system_prompt_tokens"]
+        )
+        sample = variable_tokens / input_bytes if input_bytes else 0
+        copies = 3
+    else:
+        added_bytes = input_bytes - previous_bytes
+        uncached_tokens = usage.input_tokens - usage.cache_read_tokens
+        sample = (
+            uncached_tokens / added_bytes
+            if added_bytes >= _CURSOR_RATIO_MIN_BYTES else 0
+        )
+        copies = 1
+    if _CURSOR_RATIO_MIN <= sample <= _CURSOR_RATIO_MAX:
+        stats["ratio_samples"].extend([sample] * copies)
+        del stats["ratio_samples"][:-_CURSOR_RATIO_SAMPLE_LIMIT]
+
+    estimated_fresh = _estimated_fresh_input_tokens(
+        model, input_bytes, stats
+    )
+    stats["accumulated_excess"] = max(
+        0.0,
+        stats["accumulated_excess"]
+        + _reported_cursor_cost_equivalent(model, usage)
+        - estimated_fresh,
+    )
+    stats["previous_request_bytes"] = input_bytes
+    stats["previous_reported_cost"] = _reported_cursor_cost_equivalent(
+        model, usage
+    )
+
+
+def _rotate_cursor_conversation(stats: dict) -> None:
+    stats["conversation_id"] = str(uuid.uuid4())
+    stats["previous_request_bytes"] = None
+    stats["previous_reported_cost"] = None
+    stats["accumulated_excess"] = 0.0
+
+
 def chat_completions(api_key: str, body: dict) -> dict:
     """Run one non-streaming OpenAI Chat Completions-compatible request."""
     if not isinstance(body, dict):
@@ -3597,15 +3973,34 @@ def chat_completions(api_key: str, body: dict) -> dict:
     if body.get("stream"):
         raise ValueError("streaming chat completions are not supported")
     prompt, history = _openai_messages(body.get("messages"))
-    model = body.get("model") or DEFAULT_MODEL
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        raise ValueError("model is required")
+    timeout = body.get("timeout", DEFAULT_TIMEOUT)
+    if model not in CURSOR_MODEL_CALIBRATION:
+        _detect_cursor_model_calibration(api_key, model, timeout)
+    stats = _cursor_model_stats(model)
+    input_bytes = _cursor_input_bytes(body)
+    estimated_input_tokens = round(
+        _estimated_fresh_input_tokens(model, input_bytes, stats)
+    )
+    if _should_rotate_cursor_conversation(model, stats, input_bytes):
+        _rotate_cursor_conversation(stats)
+        estimated_input_tokens = round(
+            _estimated_fresh_input_tokens(model, input_bytes, stats)
+        )
+    conversation_id = stats["conversation_id"]
     result = run(
         prompt,
         api_key=api_key,
         model=model,
         tools=_openai_tools(body.get("tools")),
         history=history,
-        timeout=body.get("timeout", DEFAULT_TIMEOUT),
+        timeout=timeout,
+        run_config=RunConfig(conversation_id=conversation_id),
     )
+    if result.usage is not None:
+        _record_cursor_usage(model, stats, input_bytes, result.usage)
     tool_calls = [
         _openai_tool_call(call)
         for call in result.tool_calls
@@ -3614,7 +4009,7 @@ def chat_completions(api_key: str, body: dict) -> dict:
     message = {"role": "assistant", "content": result.text or None}
     if tool_calls:
         message["tool_calls"] = tool_calls
-    return {
+    response = {
         "id": "chatcmpl-" + uuid.uuid4().hex,
         "object": "chat.completion",
         "created": int(time.time()),
@@ -3625,5 +4020,19 @@ def chat_completions(api_key: str, body: dict) -> dict:
             "finish_reason": "tool_calls" if tool_calls else "stop",
         }],
     }
+    if result.usage is not None:
+        response["usage"] = {
+            "prompt_tokens": estimated_input_tokens,
+            "completion_tokens": result.usage.output_tokens,
+            "total_tokens": (
+                estimated_input_tokens
+                + result.usage.output_tokens
+                + result.usage.reasoning_tokens
+            ),
+            "completion_tokens_details": {
+                "reasoning_tokens": result.usage.reasoning_tokens,
+            },
+        }
+    return response
 
 

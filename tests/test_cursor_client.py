@@ -1,6 +1,7 @@
 
 import json
 import os
+import selectors
 import stat
 import subprocess
 import sys
@@ -121,6 +122,7 @@ def test_cursor_client_adapter(monkeypatch):
         "concurrency": 1,
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    monkeypatch.setattr("code_agent.utils.get_model_config", lambda name: config)
     throttled = []
     monkeypatch.setattr("code_agent.client.throttle", lambda key, tpm: throttled.append((key, tpm)))
     captured = {}
@@ -141,10 +143,18 @@ def test_cursor_client_adapter(monkeypatch):
                     }],
                 },
                 "finish_reason": "tool_calls",
-            }]
+            }],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 157,
+                "prompt_tokens_details": {"cached_tokens": 20},
+                "completion_tokens_details": {"reasoning_tokens": 7},
+            },
         }
     monkeypatch.setattr(cursor, "chat_completions", chat)
-    client = LLMClient("cursor")
+    client = LLMClient("cursor/composer-2.5")
+    history_length = len(client.usage_tracker.history)
     result = client._call([{"role": "user", "content": "hello"}])
     assert captured["api_key"] == "key"
     assert captured["body"]["model"] == "composer-2.5"
@@ -153,6 +163,27 @@ def test_cursor_client_adapter(monkeypatch):
     assert throttled == [("cursor", 17)]
     assert result["content"] == "emit('ok', release=True)"
     assert result["_stop_reason"] == "tool_calls"
+    assert client.usage_tracker.history[history_length:] == [(
+        "cursor/composer-2.5",
+        {
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 157,
+            "prompt_tokens_details": {"cached_tokens": 20},
+            "completion_tokens_details": {"reasoning_tokens": 7},
+        },
+    )]
+    assert client.usage_tracker._normalize(
+        "cursor/composer-2.5", client.usage_tracker.history[-1][1]
+    ) == {
+        "prompt_tokens": 100,
+        "cached_tokens": 20,
+        "completion_tokens": 30,
+        "reasoning_tokens": 7,
+        "cost": 0.0,
+    }
+    assert client._input_tokens_per_byte() is not None
+    del client.usage_tracker.history[history_length:]
 
 
 def test_shell_stream_native_tool_translates_to_bash():
@@ -275,32 +306,335 @@ def test_build_run_request_uses_legacy_model_details_only():
     assert not run.has(14)
 
 
+def test_build_run_request_keeps_stable_conversation_id(monkeypatch):
+    monkeypatch.setattr(cursor, "_SESSION_CONVERSATION_ID", "stable-conversation")
+
+    first = cursor.build_run_request(
+        "one", "composer-2.5", message_id="message-1"
+    )
+    second = cursor.build_run_request(
+        "two", "composer-2.5", message_id="message-2"
+    )
+    first_run = cursor.RawMessage.decode(
+        cursor.RawMessage.decode(first).first_bytes(1)
+    )
+    second_run = cursor.RawMessage.decode(
+        cursor.RawMessage.decode(second).first_bytes(1)
+    )
+
+    assert cursor._text(first_run, 5) == "stable-conversation"
+    assert cursor._text(second_run, 5) == "stable-conversation"
+    assert not first_run.has(16)
+    assert not second_run.has(16)
+
+
+def test_build_run_request_allows_explicit_conversation_ids():
+    payload = cursor.build_run_request(
+        "hi",
+        "composer-2.5",
+        conversation_id="explicit-conversation",
+        message_id="message",
+        run_config=cursor.RunConfig(
+            conversation_group_id="explicit-group"
+        ),
+    )
+    run = cursor.RawMessage.decode(
+        cursor.RawMessage.decode(payload).first_bytes(1)
+    )
+
+    assert cursor._text(run, 5) == "explicit-conversation"
+    assert cursor._text(run, 16) == "explicit-group"
+
+
+def _run_result(usage):
+    return cursor.RunResult(
+        frames=[],
+        text="ok",
+        tool_calls=[],
+        turn_ended=True,
+        checkpoint_updates=[],
+        eos_metadata=None,
+        eos_error=None,
+        usage=usage,
+    )
+
+
 def test_chat_completions_basic(monkeypatch):
     captured = {}
 
     def fake_run(prompt, **kwargs):
         captured.update(kwargs)
         captured["prompt"] = prompt
-        return cursor.RunResult(
-            frames=[],
-            text="ok",
-            tool_calls=[],
-            turn_ended=True,
-            checkpoint_updates=[],
-            eos_metadata=None,
-            eos_error=None,
-        )
+        return _run_result(cursor.TurnUsage(
+            input_tokens=12_000,
+            output_tokens=30,
+            cache_read_tokens=2_000,
+            reasoning_tokens=7,
+        ))
 
+    model = "cursor-grok-4.5-high"
     monkeypatch.setattr(cursor, "run", fake_run)
-    response = cursor.chat_completions("key", {
-        "model": "composer-2.5",
+    monkeypatch.delitem(cursor._MODEL_CURSOR_STATS, model, raising=False)
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    input_bytes = cursor._cursor_input_bytes(body)
+    expected_input = round(
+        cursor.CURSOR_MODEL_CALIBRATION[model]["system_prompt_tokens"]
+        + input_bytes
+        * cursor.CURSOR_MODEL_CALIBRATION[model]["variable_tokens_per_byte"]
+    )
+
+    response = cursor.chat_completions("key", body)
+
+    assert captured["model"] == model
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert response["usage"] == {
+        "prompt_tokens": expected_input,
+        "completion_tokens": 30,
+        "total_tokens": expected_input + 30 + 7,
+        "completion_tokens_details": {
+            "reasoning_tokens": 7,
+        },
+    }
+
+
+def test_chat_completions_requires_model():
+    with pytest.raises(ValueError, match="model is required"):
+        cursor.chat_completions("key", {
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+
+def test_unknown_model_uses_two_fresh_conversation_probes(
+    monkeypatch, capsys,
+):
+    model = "unknown-model"
+    conversation_ids = []
+    prompts = []
+    sample = cursor._CURSOR_CALIBRATION_SAMPLE
+    sample_bytes = len(sample.encode("utf-8"))
+    added_bytes = len(("\n\n" + sample).encode("utf-8"))
+    ratio = 0.25
+    system_tokens = 12_345
+
+    def fake_run(prompt, **kwargs):
+        prompts.append(prompt)
+        conversation_ids.append(kwargs["run_config"].conversation_id)
+        if len(prompts) == 1:
+            input_tokens = round(system_tokens + ratio * sample_bytes)
+        elif len(prompts) == 2:
+            input_tokens = round(
+                system_tokens + ratio * (sample_bytes + added_bytes)
+            )
+        else:
+            input_tokens = 20_000
+        return _run_result(cursor.TurnUsage(input_tokens=input_tokens))
+
+    monkeypatch.delitem(cursor.CURSOR_MODEL_CALIBRATION, model, raising=False)
+    monkeypatch.delitem(cursor._MODEL_CURSOR_STATS, model, raising=False)
+    monkeypatch.setattr(cursor, "run", fake_run)
+
+    cursor.chat_completions("key", {
+        "model": model,
         "messages": [{"role": "user", "content": "hello"}],
     })
-    assert captured["model"] == "composer-2.5"
-    assert response["choices"][0]["message"]["content"] == "ok"
+
+    assert prompts[:2] == [sample, sample + "\n\n" + sample]
+    assert len(set(conversation_ids)) == 3
+    calibration = cursor.CURSOR_MODEL_CALIBRATION[model]
+    assert calibration["system_prompt_tokens"] == pytest.approx(
+        system_tokens, abs=1
+    )
+    expected_ratio = (
+        round(system_tokens + ratio * (sample_bytes + added_bytes))
+        - round(system_tokens + ratio * sample_bytes)
+    ) / added_bytes
+    assert calibration["variable_tokens_per_byte"] == pytest.approx(
+        expected_ratio
+    )
+    assert cursor._MODEL_CURSOR_STATS[model][
+        "previous_request_bytes"
+    ] is not None
+    assert "Detected Cursor calibration for unknown-model" in capsys.readouterr().out
 
 
-def _turn_structure_frame(request_id):
+def test_unknown_model_probe_requires_usage(monkeypatch):
+    model = "unknown-without-usage"
+    monkeypatch.delitem(cursor.CURSOR_MODEL_CALIBRATION, model, raising=False)
+    monkeypatch.setattr(cursor, "run", lambda *args, **kwargs: _run_result(None))
+
+    with pytest.raises(ValueError, match="returned no usage"):
+        cursor.chat_completions("key", {
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+
+def test_cursor_ratio_uses_lower_third_and_weights_first_request():
+    model = "cursor-grok-4.5-high"
+    stats = {
+        "previous_request_bytes": None,
+        "previous_reported_cost": None,
+        "accumulated_excess": 0.0,
+        "ratio_samples": [],
+    }
+    system_tokens = cursor.CURSOR_MODEL_CALIBRATION[model][
+        "system_prompt_tokens"
+    ]
+
+    cursor._record_cursor_usage(
+        model,
+        stats,
+        10_000,
+        cursor.TurnUsage(input_tokens=system_tokens + 2_000),
+    )
+    assert stats["ratio_samples"] == [0.2, 0.2, 0.2]
+
+    for request_bytes, uncached_tokens in (
+        (12_000, 500),
+        (14_000, 600),
+        (16_000, 1_600),
+    ):
+        cursor._record_cursor_usage(
+            model,
+            stats,
+            request_bytes,
+            cursor.TurnUsage(input_tokens=uncached_tokens),
+        )
+
+    assert cursor._cursor_tokens_per_byte(model, stats) == pytest.approx(0.2)
+
+
+def test_cursor_rotates_before_request_when_accumulated_excess_is_high(
+    monkeypatch,
+):
+    model = "cursor-grok-4.5-high"
+    old_id = "old-conversation"
+    stats = {
+        "conversation_id": old_id,
+        "previous_request_bytes": 50_000,
+        "previous_reported_cost": 100_000.0,
+        "accumulated_excess": 100_000.0,
+        "ratio_samples": [0.2, 0.2, 0.2],
+    }
+    conversation_ids = []
+
+    monkeypatch.setitem(cursor._MODEL_CURSOR_STATS, model, stats)
+    monkeypatch.setattr(
+        cursor,
+        "run",
+        lambda prompt, **kwargs: (
+            conversation_ids.append(kwargs["run_config"].conversation_id)
+            or _run_result(cursor.TurnUsage(input_tokens=12_000))
+        ),
+    )
+
+    cursor.chat_completions("key", {
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert conversation_ids[0] != old_id
+    assert stats["conversation_id"] == conversation_ids[0]
+    assert stats["accumulated_excess"] >= 0
+    assert stats["previous_request_bytes"] is not None
+
+
+def test_cursor_rotates_before_shrunken_request_when_predicted_cost_is_high(
+    monkeypatch,
+):
+    model = "cursor-grok-4.5-high"
+    old_id = "inflated-conversation"
+    stats = {
+        "conversation_id": old_id,
+        "previous_request_bytes": 100_000,
+        "previous_reported_cost": 80_000.0,
+        "accumulated_excess": 10_000.0,
+        "ratio_samples": [0.2, 0.2, 0.2],
+    }
+    conversation_ids = []
+
+    monkeypatch.setitem(cursor._MODEL_CURSOR_STATS, model, stats)
+    monkeypatch.setattr(
+        cursor,
+        "run",
+        lambda prompt, **kwargs: (
+            conversation_ids.append(kwargs["run_config"].conversation_id)
+            or _run_result(cursor.TurnUsage(input_tokens=12_000))
+        ),
+    )
+
+    cursor.chat_completions("key", {
+        "model": model,
+        "messages": [{"role": "user", "content": "rewound"}],
+    })
+
+    assert conversation_ids[0] != old_id
+
+
+def test_cursor_reuses_conversation_before_threshold(monkeypatch):
+    model = "cursor-grok-4.5-high"
+    conversation_id = "stable-conversation"
+    stats = {
+        "conversation_id": conversation_id,
+        "previous_request_bytes": 1_000,
+        "previous_reported_cost": 1_000.0,
+        "accumulated_excess": 1.0,
+        "ratio_samples": [0.2, 0.2, 0.2],
+    }
+    conversation_ids = []
+
+    monkeypatch.setitem(cursor._MODEL_CURSOR_STATS, model, stats)
+    monkeypatch.setattr(
+        cursor,
+        "run",
+        lambda prompt, **kwargs: (
+            conversation_ids.append(kwargs["run_config"].conversation_id)
+            or _run_result(cursor.TurnUsage(input_tokens=11_000))
+        ),
+    )
+
+    cursor.chat_completions("key", {
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    assert conversation_ids == [conversation_id]
+
+
+def test_cursor_accumulates_reported_cost_excess():
+    model = "cursor-grok-4.5-high"
+    stats = {
+        "conversation_id": "conversation",
+        "previous_request_bytes": 10_000,
+        "previous_reported_cost": 12_000.0,
+        "accumulated_excess": 0.0,
+        "ratio_samples": [0.2, 0.2, 0.2],
+    }
+
+    cursor._record_cursor_usage(
+        model,
+        stats,
+        12_000,
+        cursor.TurnUsage(
+            input_tokens=30_000,
+            cache_read_tokens=10_000,
+        ),
+    )
+
+    expected_fresh = (
+        cursor.CURSOR_MODEL_CALIBRATION[model]["system_prompt_tokens"]
+        + 12_000 * 0.2
+    )
+    reported_cost = 20_000 + 10_000 * 0.25
+    assert stats["accumulated_excess"] == pytest.approx(
+        reported_cost - expected_fresh
+    )
+
+
+def _response_boundary_frame(request_id):
     structure = cursor.protobuf_message(
         cursor.Field.bytes(1, b"u" * 32),
         cursor.Field.bytes(2, b"s" * 32),
@@ -318,19 +652,138 @@ def _turn_structure_frame(request_id):
     )
 
 
-def test_agent_conversation_turn_structure_detection():
+def test_response_boundary_blob_write_detection():
     request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
-    frame = _turn_structure_frame(request_id)
+    frame = _response_boundary_frame(request_id)
 
-    assert cursor.is_agent_conversation_turn_structure(
+    assert cursor.is_response_boundary_blob_write(
         frame.decoded_payload, request_id
     )
-    assert not cursor.is_agent_conversation_turn_structure(
+    assert not cursor.is_response_boundary_blob_write(
         frame.decoded_payload, "other-request"
     )
 
 
-def test_cursor_turn_structure_closes_without_tool_call(monkeypatch):
+def test_build_kv_response_acknowledges_set_blob():
+    set_args = cursor.protobuf_message(
+        cursor.Field.bytes(1, b"blob-id"),
+        cursor.Field.bytes(2, b"blob-data"),
+    )
+    server = cursor.protobuf_message(
+        cursor.Field.bytes(
+            4,
+            cursor.protobuf_message(
+                cursor.Field.varint(1, 9),
+                cursor.Field.bytes(3, set_args),
+            ),
+        )
+    )
+
+    response = cursor.RawMessage.decode(
+        cursor.build_kv_response(server, {})
+    )
+    kv = cursor.RawMessage.decode(response.first_bytes(3))
+
+    assert cursor._int(kv, 1) == 9
+    assert kv.first_bytes(3) == b""
+    assert kv.first_bytes(2) is None
+
+
+def test_parse_turn_usage():
+    payload = cursor.protobuf_message(
+        cursor.Field.varint(1, 25311),
+        cursor.Field.varint(2, 220),
+        cursor.Field.varint(3, 12625),
+        cursor.Field.varint(4, 7),
+        cursor.Field.varint(5, 11),
+    )
+
+    assert cursor.parse_turn_usage(payload) == cursor.TurnUsage(
+        input_tokens=25311,
+        output_tokens=220,
+        cache_read_tokens=12625,
+        cache_write_tokens=7,
+        reasoning_tokens=11,
+    )
+
+def test_build_user_cancelled_message_matches_official_payload():
+    assert cursor.build_user_cancelled_message().hex() == (
+        "22121a100a0e757365725f63616e63656c6c6564"
+    )
+
+
+def test_parse_filtered_usage_selects_earliest_event_after_request_start():
+    conversation_id = "conversation-1"
+
+    def event(timestamp, conversation, input_tokens, output_tokens, cache_read):
+        token_usage = cursor.protobuf_message(
+            cursor.Field.varint(1, input_tokens),
+            cursor.Field.varint(2, output_tokens),
+            cursor.Field.varint(4, cache_read),
+        )
+        return cursor.protobuf_message(
+            cursor.Field.varint(1, timestamp),
+            cursor.Field.varint(8, 1),
+            cursor.Field.bytes(9, token_usage),
+            cursor.Field.bytes(23, conversation.encode()),
+        )
+
+    response = cursor.protobuf_message(
+        cursor.Field.bytes(
+            3, event(10_090, conversation_id, 100, 20, 30)
+        ),
+        cursor.Field.bytes(
+            3, event(10_050, conversation_id, 200, 40, 50)
+        ),
+        cursor.Field.bytes(
+            3, event(9_990, conversation_id, 700, 70, 60)
+        ),
+        cursor.Field.bytes(
+            3, event(10_100, "other-conversation", 900, 90, 80)
+        ),
+    )
+
+    assert cursor.parse_filtered_usage(
+        response, conversation_id, 10_000
+    ) == cursor.TurnUsage(
+        input_tokens=250,
+        output_tokens=40,
+        cache_read_tokens=50,
+    )
+
+
+def test_closed_post_ignores_stale_selector_event():
+    request = object.__new__(cursor._PostRequest)
+    request.finished = False
+    request.sock = None
+    request.connected = True
+    request.tls_handshake_done = True
+
+    request.run(selectors.EVENT_READ | selectors.EVENT_WRITE)
+
+
+def test_sse_grace_period_closes_transport(monkeypatch):
+    client = object.__new__(cursor.SSEClient)
+    client.closed = False
+    client.timeout = None
+    client._heartbeat_deadline = None
+    client._grace_deadline = None
+    client.selector = type(
+        "Selector",
+        (),
+        {"close": lambda self: None, "unregister": lambda self, sock: None},
+    )()
+    client.sock = type("Socket", (), {"close": lambda self: None})()
+    client._posts = set()
+    client.start_grace_period(0)
+    client.run_once = lambda timeout=None: pytest.fail("expired timer should not poll")
+
+    client.run_forever()
+
+    assert client.closed is True
+
+
+def test_cursor_text_boundary_starts_usage_grace(monkeypatch):
     request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
     closed = []
 
@@ -352,6 +805,9 @@ def test_cursor_turn_structure_closes_without_tool_call(monkeypatch):
         def reset_heartbeat_timeout(self):
             pass
 
+        def start_grace_period(self, timeout):
+            self.grace_timeout = timeout
+
         def close(self):
             if not self.closed:
                 self.closed = True
@@ -363,22 +819,90 @@ def test_cursor_turn_structure_closes_without_tool_call(monkeypatch):
                 cursor.AnswerText.create("done").encode()
             )
             self.stream_callback(answer.encode())
-            self.stream_callback(_turn_structure_frame(request_id).encode())
-            assert self.closed
+            assert not hasattr(self, "grace_timeout")
+            self.stream_callback(_response_boundary_frame(request_id).encode())
+            assert self.grace_timeout == cursor.RESPONSE_USAGE_GRACE_TIMEOUT
+            self.close()
 
     monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
     monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
-    result = cursor.CursorClient("token").run("hello")
+    monkeypatch.setattr(
+        cursor,
+        "get_filtered_usage",
+        lambda *args, **kwargs: cursor.TurnUsage(input_tokens=7),
+    )
+    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
 
     assert result.text == "done"
     assert result.tool_calls == []
     assert result.turn_ended is True
+    assert result.usage == cursor.TurnUsage(input_tokens=7)
     assert closed == [True]
 
 
-def test_cursor_turn_structure_collects_tools_and_closes(monkeypatch):
+def test_cursor_turn_ended_closes_and_records_usage(monkeypatch):
     request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
     closed = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def start_grace_period(self, timeout):
+            pass
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                closed.append(True)
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            self.stream_callback(_response_boundary_frame(request_id).encode())
+            update = cursor.InteractionUpdate.create(
+                "turn_ended",
+                cursor.protobuf_message(
+                    cursor.Field.varint(1, 25311),
+                    cursor.Field.varint(2, 220),
+                    cursor.Field.varint(3, 12625),
+                ),
+            )
+            self.stream_callback(
+                cursor.ConnectFrame.from_decoded(update.encode()).encode()
+            )
+            assert self.closed
+
+    monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
+
+    assert result.turn_ended is True
+    assert result.usage == cursor.TurnUsage(
+        input_tokens=25311,
+        output_tokens=220,
+        cache_read_tokens=12625,
+    )
+    assert closed == [True]
+
+
+def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
+    request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
+    closed = []
+    posted_payloads = []
 
     def tool_frame(call_id, code):
         arguments = cursor.protobuf_message(
@@ -415,9 +939,16 @@ def test_cursor_turn_structure_collects_tools_and_closes(monkeypatch):
             self.close()
 
         def post(self, url, body=b"", headers=None, callback=None):
+            bidi = cursor.RawMessage.decode(body)
+            payload = bidi.first_bytes(4)
+            if payload is not None:
+                posted_payloads.append(payload)
             callback({"status": 200, "headers": {}, "body": b""})
 
         def reset_heartbeat_timeout(self):
+            pass
+
+        def start_grace_period(self, timeout):
             pass
 
         def close(self):
@@ -430,57 +961,22 @@ def test_cursor_turn_structure_collects_tools_and_closes(monkeypatch):
             for payload in (
                 tool_frame("call-1", "emit('one')"),
                 tool_frame("call-2", "emit('two')"),
-                _turn_structure_frame(request_id).encode(),
+                _response_boundary_frame(request_id).encode(),
             ):
                 self.stream_callback(payload)
             assert self.closed
 
     monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
     monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
-    result = cursor.CursorClient("token").run("hello")
+    monkeypatch.setattr(
+        cursor,
+        "get_filtered_usage",
+        lambda *args, **kwargs: cursor.TurnUsage(output_tokens=9),
+    )
+    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
 
     assert [call.id for call in result.tool_calls] == ["call-1", "call-2"]
     assert result.turn_ended is True
     assert closed == [True]
-
-
-
-def test_cursor_turn_ended_still_closes_immediately(monkeypatch):
-    closed = []
-
-    class FakeSSEClient:
-        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
-            self.stream_callback = stream_callback
-            self.headers_callback = headers_callback
-            self.closed = False
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            self.close()
-
-        def post(self, url, body=b"", headers=None, callback=None):
-            callback({"status": 200, "headers": {}, "body": b""})
-
-        def reset_heartbeat_timeout(self):
-            pass
-
-        def close(self):
-            if not self.closed:
-                self.closed = True
-                closed.append(True)
-
-        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
-            self.headers_callback(200, {})
-            frame = cursor.ConnectFrame.from_decoded(
-                cursor.InteractionUpdate.create("turn_ended").encode()
-            )
-            self.stream_callback(frame.encode())
-            assert self.closed
-
-    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
-    result = cursor.CursorClient("token").run("hello")
-
-    assert result.turn_ended is True
-    assert closed == [True]
+    assert result.usage == cursor.TurnUsage(output_tokens=9)
+    assert cursor.build_user_cancelled_message() in posted_payloads
