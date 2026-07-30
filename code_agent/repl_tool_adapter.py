@@ -110,29 +110,24 @@ def _strip_leading_input_echo(output, human_input):
 
 def _split_repl_output_and_input(message, preceding_human_input=None):
     segments = message.get("_render_segments") or []
-    if segments:
-        stdout = "".join(
-            segment.get("content", "")
-            for segment in segments
-            if segment.get("type") != "input"
-        )
-        inputs = [
-            segment.get("content", "")
-            for segment in segments
-            if segment.get("type") == "input" and segment.get("content")
-        ]
-        if stdout or inputs:
-            return _strip_leading_input_echo(stdout, preceding_human_input), inputs
-
+    inputs = [
+        segment.get("content", "")
+        for segment in segments
+        if segment.get("type") == "input" and segment.get("content")
+    ]
     human = message.get("_user_content")
-    if human is not None:
-        stdout = message.get("_stdout", message.get("content", ""))
-        suffix = human + "\n"
-        if stdout.endswith(suffix):
-            stdout = stdout[:-len(suffix)].rstrip("\n") + ("\n" if stdout[:-len(suffix)] else "")
-        return _strip_leading_input_echo(stdout, preceding_human_input), [human]
-    stdout = message.get("_stdout", message.get("content", ""))
-    return _strip_leading_input_echo(stdout, preceding_human_input), []
+    if human is not None and not inputs:
+        inputs = [human]
+
+    output = message.get("content", "")
+    for value in reversed(inputs):
+        suffix = value + "\n"
+        if output.endswith(suffix):
+            before = output[:-len(suffix)]
+            output = before.rstrip("\n") + ("\n" if before else "")
+    return _strip_leading_input_echo(
+        output, preceding_human_input
+    ), inputs
 
 
 def project_openai_repl_messages(messages):

@@ -171,6 +171,61 @@ def test_projection_splits_appended_human_input():
     assert result[2] == {"role": "user", "content": "next task"}
 
 
+def test_projection_uses_preview_content_instead_of_raw_render_output():
+    preview = (
+        "[PreviewRef: session://preview/abc123]\n"
+        "(1 line, 200000 chars)\n"
+        "large output...\n"
+        "[/PreviewRef]\n"
+    )
+    messages = [
+        {"role": "assistant", "content": "print(large_value)"},
+        {
+            "role": "user",
+            "content": preview,
+            "_stdout": "x" * 200_000,
+            "_render_segments": [
+                {"type": "stdout", "content": "x" * 200_000},
+            ],
+        },
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert result[1] == {
+        "role": "tool",
+        "tool_call_id": "repl_000001",
+        "content": preview,
+    }
+
+
+def test_projection_uses_preview_content_and_recovers_human_input():
+    preview = (
+        "[PreviewRef: session://preview/abc123]\n"
+        "(1 line, 200000 chars)\n"
+        "large output...\n"
+        "[/PreviewRef]\n"
+    )
+    messages = [
+        {"role": "assistant", "content": "emit('done', release=True)"},
+        {
+            "role": "user",
+            "content": preview + "next task\n",
+            "_stdout": "x" * 200_000 + "next task\n",
+            "_user_content": "next task",
+            "_render_segments": [
+                {"type": "stdout", "content": "x" * 200_000},
+                {"type": "input", "content": "next task"},
+            ],
+        },
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert result[1]["content"] == preview
+    assert result[2] == {"role": "user", "content": "next task"}
+
+
 def test_projection_preserves_synthetic_release_output_before_first_real_input():
     final_output = (
         '>>> emit("Today is Friday, July 17, 2026.", release=True)\n'
