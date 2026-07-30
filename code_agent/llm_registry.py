@@ -168,18 +168,21 @@ register_model(
     "composer-2.5",
     model="composer-2.5",
     tool_mode="repl_execute",
+    context_window=200_000,
 )
 register_model(
     "cursor",
     "grok-4.5",
     model="cursor-grok-4.5-high",
     tool_mode="repl_execute",
+    context_window=256_000,
 )
 register_model(
     "cursor",
     "kimi-k3",
     model="kimi-k3-high",
     tool_mode="repl_execute",
+    context_window=200_000,
 )
 
 
