@@ -208,7 +208,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         return new_session_id
     code_agent_coalesce_min_savings_chars = _get_config_value("code_agent_coalesce_min_savings_chars", 1000)
     code_agent_coalesce_keep_last_execution_interactions = _get_config_value("code_agent_coalesce_keep_last_execution_interactions", 1)
-    code_agent_rollup_summary_max_chars = _get_config_value("code_agent_rollup_summary_max_chars", 4000)
 
     def _coalesce_context(
         self,
@@ -403,7 +402,11 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
     @REPLAgent.tool
     def rollup(self, start_turn: int, end_turn: int, summary: str):
         """Replace an eligible interval of completed turns with a persisted preview summary."""
-        from code_agent.code_agent_coalesce import Preview
+        from code_agent.code_agent_coalesce import (
+            Preview,
+            render_projected_span,
+            select_projected_span,
+        )
         from code_agent.turn_rollups import (
             completed_turns,
             derive_agent_rollup_context,
@@ -416,7 +419,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             raise TypeError("rollup summary must be a string.")
         if not summary.strip():
             raise ValueError("rollup summary must not be blank.")
-        max_chars = int(self.code_agent_rollup_summary_max_chars)
         if (
             "session://preview/" in summary
             or "[PreviewRef:" in summary
@@ -425,11 +427,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             or "[/ExpandedPreviewRef]" in summary
         ):
             raise ValueError("rollup summary must not contain PreviewRef syntax or preview URIs.")
-        if len(summary) > max_chars:
-            raise ValueError(
-                f"rollup summary exceeds the {max_chars}-character maximum."
-            )
-
         store = getattr(self, "_session_store", None)
         session_id = getattr(self, "_session_id", None)
         state = getattr(self, "_persisted_preview_state", None)
@@ -452,6 +449,19 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             start_turn,
             end_turn,
         )
+        span = select_projected_span(
+            authoritative_messages,
+            source_start_seq=source_start_seq,
+            source_end_seq=source_end_seq,
+        )
+        replaced_content = render_projected_span(
+            authoritative_messages[span.start_index:span.end_index]
+        )
+        if len(summary) >= len(replaced_content):
+            raise ValueError(
+                "rollup summary must be shorter than the content it replaces."
+            )
+
         create_from_projection = getattr(
             self,
             "_create_persisted_preview_from_projection",
@@ -1802,8 +1812,9 @@ context. When context pressure is high, consider rolling up eligible historical
 units that are no longer needed in detail. Exact content remains available by
 expanding the resulting PreviewRef with view(session://preview/...).
 
-A rollup summary must preserve information with value beyond the immediate
-implementation details, including when present:
+A rollup summary must be shorter than the content it replaces and preserve
+information with value beyond the immediate implementation details, including
+when present:
 - the user's intent, requested outcome, preferences, constraints, and working style
 - lessons learned, including failed or reverted approaches and why
 - observations or discoveries that could affect later work

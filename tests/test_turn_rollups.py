@@ -1908,11 +1908,18 @@ def _rollup_snapshot(agent, store, session_id):
     )
 
 
-def _mock_rollup_agent(units, max_chars=20):
+def _mock_rollup_agent(units, content_size=100):
     state = PersistedPreviewState.empty()
-    messages = []
+    messages = [
+        {
+            "role": "user",
+            "content": "x" * content_size,
+            "_source_start_seq": unit.source_start_seq,
+            "_source_end_seq": unit.source_end_seq,
+        }
+        for unit in units
+    ]
     return SimpleNamespace(
-        code_agent_rollup_summary_max_chars=max_chars,
         _session_store=SimpleNamespace(get_events=lambda session_id: [{"seq": 1}]),
         _session_id="session",
         _persisted_preview_state=state,
@@ -2160,7 +2167,6 @@ def test_rollup_requires_boundaries_from_one_advertised_group(monkeypatch):
         (None, "must be a string"),
         (123, "must be a string"),
         ("   \n", "must not be blank"),
-        ("123456", "5-character maximum"),
         ("[PreviewRef: anything]", "must not contain PreviewRef"),
         ("[/PreviewRef]", "must not contain PreviewRef"),
         ("[ExpandedPreviewRef: anything]", "must not contain PreviewRef"),
@@ -2170,14 +2176,14 @@ def test_rollup_requires_boundaries_from_one_advertised_group(monkeypatch):
 def test_rollup_summary_validation_is_objective_and_nonmutating(summary, error):
     from code_agent.agent import CodeAgentBase
 
-    agent = SimpleNamespace(code_agent_rollup_summary_max_chars=5)
+    agent = SimpleNamespace()
     before = copy.deepcopy(agent.__dict__)
     with pytest.raises((TypeError, ValueError), match=error):
         CodeAgentBase.rollup(agent, 1, 2, summary)
     assert agent.__dict__ == before
 
 
-def test_rollup_summary_accepts_boundary_length(monkeypatch):
+def test_rollup_summary_has_no_fixed_character_limit(monkeypatch):
     from code_agent.agent import CodeAgentBase
     import code_agent.turn_rollups as turn_rollups
 
@@ -2189,7 +2195,7 @@ def test_rollup_summary_accepts_boundary_length(monkeypatch):
         RollupUnit(turn.turn_id, turn.turn_id, turn.source_start_seq, turn.source_end_seq, (turn.turn_id,))
         for turn in turns
     ]
-    agent = _mock_rollup_agent(boundaries, max_chars=5)
+    agent = _mock_rollup_agent(boundaries, content_size=6000)
     agent.create_persisted_preview = lambda *args, **kwargs: ("key", 8)
     _mock_boundary_context(
         monkeypatch,
@@ -2199,7 +2205,33 @@ def test_rollup_summary_accepts_boundary_length(monkeypatch):
         [boundaries],
     )
 
-    assert "preview key" in CodeAgentBase.rollup(agent, 2, 7, "12345")
+    assert "preview key" in CodeAgentBase.rollup(agent, 2, 7, "x" * 5000)
+
+
+def test_rollup_summary_must_be_shorter_than_replaced_content(monkeypatch):
+    from code_agent.agent import CodeAgentBase
+    import code_agent.turn_rollups as turn_rollups
+
+    turns = [
+        CompletedTurn(2, 10, 12, False),
+        CompletedTurn(7, 20, 22, False),
+    ]
+    boundaries = [
+        RollupUnit(turn.turn_id, turn.turn_id, turn.source_start_seq, turn.source_end_seq, (turn.turn_id,))
+        for turn in turns
+    ]
+    agent = _mock_rollup_agent(boundaries, content_size=10)
+    agent.create_persisted_preview = lambda *args, **kwargs: ("key", 8)
+    _mock_boundary_context(
+        monkeypatch,
+        turn_rollups,
+        agent,
+        turns,
+        [boundaries],
+    )
+
+    with pytest.raises(ValueError, match="shorter than the content it replaces"):
+        CodeAgentBase.rollup(agent, 2, 7, "x" * 100)
 
 
 def test_rollup_rebuilds_shared_context_on_every_call(monkeypatch):
