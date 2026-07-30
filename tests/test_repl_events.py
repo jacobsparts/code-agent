@@ -111,6 +111,30 @@ def test_dead_tool_repl_worker_restart_is_normal_repl_output():
     finally:
         repl.close()
 
+def test_worker_interrupt_is_reported_in_statement_event():
+    import threading
+
+    agent = REPLMixin()
+    repl = ToolREPL(echo=False)
+    repl.inject_builtins()
+    timer = threading.Timer(0.1, repl._transport.interrupt)
+    try:
+        timer.start()
+        output, pure_syntax_error, events, _ = agent._execute_with_tool_handling(
+            repl,
+            "while True:\n    pass",
+        )
+    finally:
+        timer.cancel()
+        repl.close()
+
+    assert pure_syntax_error is False
+    assert output.endswith("\nKeyboardInterrupt\n")
+    assert events[-1] == ReplEvent(
+        kind="statement_finished",
+        data={"had_error": True, "interrupted": True},
+    )
+
 
 def test_statement_output_spills_over_limit(monkeypatch):
     monkeypatch.setattr("code_agent.repl_agent._MAX_REPL_OUTPUT_CHARS", 10)

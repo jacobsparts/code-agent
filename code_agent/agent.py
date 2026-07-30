@@ -791,7 +791,7 @@ def _code_agent_send_rg_available():
                 elif msg_type in {"output", "print", "error"}:
                     error_output.append(msg_data)
                 elif msg_type == "done":
-                    seq_id, had_error = msg_data
+                    seq_id, had_error, _ = msg_data
                     if seq_id != current_seq:
                         continue
                     repl._running = False

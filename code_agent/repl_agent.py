@@ -362,6 +362,7 @@ def _tool_worker_main(
             sys.stderr = _OutputWriter(statement_output, old_stderr)
 
             had_error = False
+            was_interrupted = False
             try:
                 try:
                     with _noninteractive_stdin():
@@ -389,6 +390,7 @@ def _tool_worker_main(
                     sys.stderr.write(f"SyntaxError: {e.msg}\n")
             except KeyboardInterrupt:
                 had_error = True
+                was_interrupted = True
                 sys.stderr.write("\nKeyboardInterrupt\n")
             except Exception as e:
                 had_error = True
@@ -406,7 +408,7 @@ def _tool_worker_main(
                 sys.stderr = old_stderr
                 statement_output.finish()
 
-            output_queue.put(("done", (seq_id, had_error)))
+            output_queue.put(("done", (seq_id, had_error, was_interrupted)))
             command_active = False
             interrupt_in_progress = False
 
@@ -522,8 +524,8 @@ class ToolREPL(SubREPL):
             try:
                 msg_type, msg_data = self._output_queue.get(timeout=5.0)
                 if msg_type == "done":
-                    # msg_data is (seq_id, had_error) - injection uses seq_id=None
-                    seq_id, had_error = msg_data
+                    # Injection uses seq_id=None and cannot be user-interrupted.
+                    seq_id, had_error, _ = msg_data
                     self._running = False
                     if had_error:
                         detail = "\n".join(error_output) if error_output else "(no output captured)"
@@ -1242,6 +1244,12 @@ Call help(function_name) for parameter descriptions.
                     return value
                 return self._final_result
 
+            if any(
+                event.kind == "statement_finished" and event.data.get("interrupted")
+                for event in events
+            ):
+                raise _InterruptedError(output)
+
         raise Exception(f"{type(self).__name__} did not complete within {max_turns} turns")
 
     def _format_syntax_error(self, e: SyntaxError) -> str:
@@ -1402,6 +1410,7 @@ Call help(function_name) for parameter descriptions.
                 current_seq = repl._cmd_seq
                 repl._cmd_queue.put((current_seq, exec_stmt))
                 statement_had_error = False
+                statement_was_interrupted = False
                 completed_early = False
 
                 while True:
@@ -1414,9 +1423,10 @@ Call help(function_name) for parameter descriptions.
                                     try:
                                         msg_type, msg_data = repl._output_queue.get(timeout=0.1)
                                         if msg_type == "done":
-                                            seq_id, had_error = msg_data
+                                            seq_id, had_error, was_interrupted = msg_data
                                             if seq_id == current_seq:
                                                 statement_had_error = had_error
+                                                statement_was_interrupted = was_interrupted
                                                 break
                                             continue
                                         publish_worker(msg_type, msg_data)
@@ -1429,10 +1439,11 @@ Call help(function_name) for parameter descriptions.
                         try:
                             msg_type, msg_data = repl._output_queue.get(timeout=0.05)
                             if msg_type == "done":
-                                seq_id, had_error = msg_data
+                                seq_id, had_error, was_interrupted = msg_data
                                 if seq_id == current_seq:
                                     repl._running = False
                                     statement_had_error = had_error
+                                    statement_was_interrupted = was_interrupted
                                     break
                                 continue
                             publish_worker(msg_type, msg_data)
@@ -1444,7 +1455,10 @@ Call help(function_name) for parameter descriptions.
 
                 publish(ReplEvent(
                     kind="statement_finished",
-                    data={"had_error": statement_had_error},
+                    data={
+                        "had_error": statement_had_error,
+                        "interrupted": statement_was_interrupted,
+                    },
                 ))
                 if hasattr(self, "on_statement_events"):
                     self.on_statement_events(list(statement_events))

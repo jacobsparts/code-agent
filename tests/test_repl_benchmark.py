@@ -263,7 +263,7 @@ def test_stdio_subprocess_transport_tool_repl_emit_ack():
     assert acked is True
     assert ("output", ("progress", "hi\n")) in seen
     assert ("request", {"tool": "__emit__", "args": {"value": "hi", "release": False}, "request_id": 1}) in seen
-    assert seen[-1] == ("output", ("done", (1, False)))
+    assert seen[-1] == ("output", ("done", (1, False, False)))
 
 
 def test_tool_repl_validation_silences_parent_warning_and_captures_execution_warning(monkeypatch):
@@ -321,7 +321,7 @@ def test_tool_repl_worker_imports_from_current_directory(tmp_path, monkeypatch):
         repl.close()
 
     assert "".join(data for kind, data in items if kind == "output") == "123\n"
-    assert items[-1] == ("done", (1, False))
+    assert items[-1] == ("done", (1, False, False))
 
 
 def test_ssh_transport_isolated_from_terminal_process_group():
