@@ -61,9 +61,7 @@ def normalize_openai_repl_response(message):
     parts = []
     calls = []
     if content:
-        #parts.append(f"emit({content!r})")
-        for row in content.split("\n"):
-            parts.append(f"# {row}")
+        parts.append(f"emit({content!r})")
 
     for call in tool_calls:
         function = call.get("function")
