@@ -2271,12 +2271,6 @@ If you don't know how to proceed:
         stripped = chunk.strip()
         if (
             kind == "output"
-            and direct_call == "observe"
-            and stripped == "'[Continuing...]'"
-        ):
-            return
-        if (
-            kind == "output"
             and direct_call in {"edit", "line_patch"}
             and getattr(self, "_statement_had_diff", False)
             and (
@@ -3274,7 +3268,6 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         self._pending_observations.append(text)
         if transition:
             self._pending_observation_transition = True
-        return "[Continuing...]"
 
     @REPLAgent.tool(inject=True)
     def think(self, content: str = "All relevant observations and reasoning"):
@@ -3284,7 +3277,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         through a problem. Write down your observations, hypotheses,
         open questions, and options you're considering.
         """
-        return "[Continuing...]"
+        pass
 
     # preview() is intentionally not exposed: large output is auto-previewed.
 
