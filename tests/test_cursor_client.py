@@ -817,6 +817,160 @@ def test_sse_grace_period_closes_transport(monkeypatch):
     assert client.closed is True
 
 
+def test_sse_post_blob_timeout_raises_without_polling(monkeypatch):
+    client = object.__new__(cursor.SSEClient)
+    client.closed = False
+    client.timeout = None
+    client._heartbeat_deadline = None
+    client._grace_deadline = None
+    client._post_blob_deadline = 10.0
+    client.run_once = lambda timeout=None: pytest.fail(
+        "expired post-blob timer should not poll"
+    )
+    monkeypatch.setattr(cursor.time, "monotonic", lambda: 10.0)
+
+    with pytest.raises(
+        cursor.SSEError, match="no model progress after blob hydration"
+    ):
+        client.run_forever()
+
+
+def test_generation_progress_classification():
+    assert cursor.is_generation_progress(cursor.AnswerText.create("x"))
+    assert not cursor.is_generation_progress(cursor.AnswerText.create(""))
+    assert cursor.is_generation_progress(
+        cursor.InteractionUpdate.create("thinking_delta", b"x")
+    )
+    assert cursor.is_generation_progress(
+        cursor.InteractionUpdate.create("tool_call_completed")
+    )
+    assert not cursor.is_generation_progress(
+        cursor.InteractionUpdate.create("heartbeat")
+    )
+    assert not cursor.is_generation_progress(
+        cursor.InteractionUpdate.create("turn_ended")
+    )
+
+
+
+def _get_blob_frame(request_id, blob_id=b"b" * 32):
+    args = cursor.protobuf_message(cursor.Field.bytes(1, blob_id))
+    kv = cursor.protobuf_message(
+        cursor.Field.varint(1, request_id),
+        cursor.Field.bytes(2, args),
+    )
+    return cursor.ConnectFrame.from_decoded(
+        cursor.protobuf_message(cursor.Field.bytes(4, kv))
+    ).encode()
+
+
+def test_latest_blob_response_completion_arms_timeout(monkeypatch):
+    armed = []
+    cleared = []
+    blob_callbacks = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+            self.posts = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            self.posts += 1
+            if self.posts == 1:
+                callback({"status": 200, "headers": {}, "body": b""})
+            else:
+                blob_callbacks.append(callback)
+
+        def arm_post_blob_timeout(self, timeout):
+            armed.append(timeout)
+
+        def clear_post_blob_timeout(self):
+            cleared.append(True)
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            self.stream_callback(_get_blob_frame(1))
+            self.stream_callback(_get_blob_frame(2, b"c" * 32))
+            assert len(blob_callbacks) == 2
+            blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
+            assert armed == []
+            blob_callbacks[1]({"status": 200, "headers": {}, "body": b""})
+            assert armed == [cursor.POST_BLOB_PROGRESS_TIMEOUT]
+            self.close()
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    cursor.CursorClient("token", model="composer-2.5").run("hello")
+
+    assert len(cleared) == 2
+
+
+def test_generation_progress_invalidates_pending_blob_response(monkeypatch):
+    armed = []
+    blob_callbacks = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+            self.posts = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            self.posts += 1
+            if self.posts == 1:
+                callback({"status": 200, "headers": {}, "body": b""})
+            else:
+                blob_callbacks.append(callback)
+
+        def arm_post_blob_timeout(self, timeout):
+            armed.append(timeout)
+
+        def clear_post_blob_timeout(self):
+            pass
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            self.stream_callback(_get_blob_frame(1))
+            answer = cursor.ConnectFrame.from_decoded(
+                cursor.AnswerText.create("started").encode()
+            )
+            self.stream_callback(answer.encode())
+            blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
+            assert armed == []
+            self.close()
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
+
+    assert result.text == "started"
+
+
 def test_cursor_text_boundary_starts_usage_grace(monkeypatch):
     request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
     closed = []

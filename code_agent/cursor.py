@@ -46,6 +46,7 @@ DEFAULT_CLIENT_VERSION = "cli-2026.07.08-0c04a8a"
 DEFAULT_TIMEOUT = 30 * 60
 KEY_EXCHANGE_TIMEOUT = 30
 HEARTBEAT_TIMEOUT = 30
+POST_BLOB_PROGRESS_TIMEOUT = 10
 RESPONSE_USAGE_GRACE_TIMEOUT = 3
 USAGE_LOOKUP_ATTEMPTS = 4
 USAGE_LOOKUP_RETRY_DELAY = 1
@@ -1666,6 +1667,7 @@ class SSEClient:
         self.retry = None
         self._posts = set()
         self._grace_deadline = None
+        self._post_blob_deadline = None
 
         self._parts = urlsplit(url)
         if self._parts.scheme not in ("http", "https"):
@@ -2027,6 +2029,12 @@ class SSEClient:
     def start_grace_period(self, timeout):
         self._grace_deadline = time.monotonic() + timeout
 
+    def arm_post_blob_timeout(self, timeout):
+        self._post_blob_deadline = time.monotonic() + timeout
+
+    def clear_post_blob_timeout(self):
+        self._post_blob_deadline = None
+
     def run_forever(
         self, timeout=None, *, heartbeat_timeout=None,
     ):
@@ -2054,6 +2062,13 @@ class SSEClient:
                     self._grace_deadline = None
                     self.close()
                     break
+                waits.append(remaining)
+            if getattr(self, "_post_blob_deadline", None) is not None:
+                remaining = self._post_blob_deadline - now
+                if remaining <= 0:
+                    raise SSEError(
+                        "no model progress after blob hydration"
+                    )
                 waits.append(remaining)
             wait = min(waits) if waits else None
             if not self.run_once(wait):
@@ -2109,6 +2124,25 @@ def extract_prefetched_blobs(client_payload: bytes) -> dict[bytes, bytes]:
         if blob_id is not None and value is not None:
             blobs[blob_id] = value
     return blobs
+
+
+def is_generation_progress(message: CursorMessage | None) -> bool:
+    if isinstance(message, AnswerText):
+        return bool(message.text)
+    if isinstance(message, (NativeExec, LiveMCPCall, CompletedMCPUpdate)):
+        return True
+    if not isinstance(message, InteractionUpdate):
+        return False
+    return message.subtype in {
+        "text_delta",
+        "tool_call_started",
+        "tool_call_completed",
+        "thinking_delta",
+        "thinking_completed",
+        "partial_tool_call",
+        "token_delta",
+        "tool_call_delta",
+    }
 
 
 def build_kv_response(server_payload: bytes, blobs) -> bytes | None:
@@ -3349,15 +3383,24 @@ class CursorClient:
         usage = None
         response_boundary_seen = False
         accounting_anchor_ms = request_started_ms
+        blob_response_generation = 0
 
         def receive(connect: ConnectFrame) -> None:
             nonlocal turn_ended, eos_metadata, eos_error, usage
             nonlocal response_boundary_seen, accounting_anchor_ms
+            nonlocal blob_response_generation
             frame = CursorFrame.decode(
                 connect, "IN", {"connection_id": request_id}
             )
             frames.append(frame)
             self.handle_frame(frame)
+            if is_generation_progress(frame.message):
+                blob_response_generation += 1
+                clear_timeout = getattr(
+                    transport, "clear_post_blob_timeout", None
+                )
+                if clear_timeout is not None:
+                    clear_timeout()
             if isinstance(frame.message, AnswerText):
                 text_parts.append(frame.message.text)
             if (
@@ -3370,7 +3413,30 @@ class CursorClient:
                     connect.decoded_payload, prefetched_blobs
                 )
                 if kv_response is not None:
-                    append(kv_response)
+                    if (
+                        isinstance(frame.message, KVServerMessage)
+                        and frame.message.subtype == "get_blob_args"
+                    ):
+                        blob_response_generation += 1
+                        generation = blob_response_generation
+                        clear_timeout = getattr(
+                            transport, "clear_post_blob_timeout", None
+                        )
+                        if clear_timeout is not None:
+                            clear_timeout()
+
+                        def blob_appended(response, generation=generation):
+                            appended(response)
+                            if generation == blob_response_generation:
+                                arm_timeout = getattr(
+                                    transport, "arm_post_blob_timeout", None
+                                )
+                                if arm_timeout is not None:
+                                    arm_timeout(POST_BLOB_PROGRESS_TIMEOUT)
+
+                        append(kv_response, callback=blob_appended)
+                    else:
+                        append(kv_response)
                 call = decode_tool_call(connect.decoded_payload)
                 if call is not None:
                     identity = (
