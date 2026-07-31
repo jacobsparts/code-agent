@@ -254,6 +254,131 @@ class LLMClient:
             finally:
                 conn.close()
 
+    def _call_responses(self, messages, tools):
+        config = dict(self.model_config.get('config', {}))
+        if 'reasoning_effort' in config:
+            config['reasoning'] = {'effort': config.pop('reasoning_effort')}
+        if 'max_tokens' in config:
+            config['max_output_tokens'] = config.pop('max_tokens')
+        input_items = []
+        for message in messages:
+            role = message.get('role')
+            if role == 'tool':
+                input_items.append({
+                    'type': 'function_call_output',
+                    'call_id': message.get('tool_call_id'),
+                    'output': message.get('content', ''),
+                })
+                continue
+            content = message.get('content')
+            if isinstance(content, str):
+                content = [{'type': 'text', 'text': content}]
+            elif not isinstance(content, list):
+                content = []
+            blocks = []
+            for block in content:
+                if not isinstance(block, dict) or block.get('type') == 'reasoning':
+                    continue
+                kind = block.get('type')
+                if kind == 'text':
+                    blocks.append({
+                        'type': 'output_text' if role == 'assistant' else 'input_text',
+                        'text': block.get('text', ''),
+                    })
+                elif kind == 'image_url':
+                    image_url = block.get('image_url')
+                    if isinstance(image_url, dict):
+                        image_url = image_url.get('url')
+                    blocks.append({'type': 'input_image', 'image_url': image_url})
+                elif kind == 'output_text' and role != 'assistant':
+                    blocks.append({'type': 'input_text', 'text': block.get('text', '')})
+                else:
+                    blocks.append(dict(block))
+            if blocks:
+                input_items.append({'role': role, 'content': blocks})
+            for call in message.get('tool_calls') or []:
+                function = call.get('function') or {}
+                input_items.append({
+                    'type': 'function_call',
+                    'call_id': call.get('id'),
+                    'name': function.get('name'),
+                    'arguments': function.get('arguments', ''),
+                })
+        response_tools = []
+        for tool in ([REPL_EXECUTE_TOOL] if self.tool_mode == 'repl_execute' else tools or []):
+            response_tools.append({'type': 'function', **tool.get('function', tool)})
+        req = {'model': self.model_config['model'], 'input': input_items, **config}
+        if response_tools:
+            req['tools'] = response_tools
+        if self.model_config['port'] == 443:
+            conn = http.client.HTTPSConnection(self.model_config['host'], timeout=self.timeout)
+            conn.connect()
+        else:
+            conn = http.client.HTTPConnection(
+                self.model_config['host'], self.model_config['port'], timeout=self.timeout
+            )
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f"Bearer {self.model_config['api_key']}",
+        }
+        try:
+            throttle(self.model_config['host'], self.model_config.get('tpm', 5))
+            conn.request(
+                'POST',
+                self.model_config.get('request_path', self.model_config['path']),
+                json.dumps(req),
+                headers,
+            )
+            response = conn.getresponse()
+            response_data = response.read().decode()
+            if response.status == 400:
+                raise BadRequestError(response_data.strip())
+            if response.status != 200:
+                raise Exception(f"API Error {response.status}: {response_data}")
+            response_json = json.loads(response_data)
+            output = response_json.get('output')
+            if not isinstance(output, list):
+                raise Exception(f"output missing from response: {response_json}")
+            text = []
+            calls = []
+            for item in output:
+                if item.get('type') == 'message':
+                    text.extend(
+                        block['text'] for block in item.get('content', [])
+                        if block.get('type') in ('output_text', 'text') and block.get('text')
+                    )
+                elif item.get('type') == 'output_text' and item.get('text'):
+                    text.append(item['text'])
+                elif item.get('type') == 'function_call':
+                    calls.append({
+                        'id': item.get('call_id') or item.get('id'),
+                        'type': 'function',
+                        'function': {
+                            'name': item.get('name'),
+                            'arguments': item.get('arguments', ''),
+                        },
+                    })
+            if not text and isinstance(response_json.get('output_text'), str):
+                text.append(response_json['output_text'])
+            message = {'role': 'assistant', 'content': ''.join(text)}
+            if calls:
+                message['tool_calls'] = calls
+            if self.tool_mode == 'repl_execute':
+                message = normalize_openai_repl_response(message)
+            if usage := response_json.get('usage'):
+                self.usage_tracker.log(self.model_name, usage)
+                self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+            incomplete = response_json.get('incomplete_details') or {}
+            message['_stop_reason'] = incomplete.get('reason')
+            if message['_stop_reason'] is None:
+                message['_stop_reason'] = (
+                    'stop' if response_json.get('status') == 'completed'
+                    else response_json.get('status')
+                )
+            return message
+        finally:
+            conn.close()
+
     def _call_cursor(self, messages, tools):
         if self.tool_mode != "repl_execute":
             raise TypeError("Cursor transport requires tool_mode='repl_execute'")
@@ -523,6 +648,8 @@ class LLMClient:
         self._validate_context_budget(self._input_bytes(messages, size_tools))
         if self.model_config['api_type'] == "completions":
             return self._call_completions(messages, tools)
+        elif self.model_config['api_type'] == "responses":
+            return self._call_responses(messages, tools)
         elif self.model_config['api_type'] == "messages":
             return self._call_messages(messages, tools)
         elif self.model_config['api_type'] == "cursor":

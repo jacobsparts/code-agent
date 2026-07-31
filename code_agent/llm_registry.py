@@ -120,15 +120,15 @@ get_model_config = registry.get_model_config
 resolve_model_name = registry.resolve_model_name
 list_models = registry.list_models
 
-# --- OpenAI ---
+# --- OpenAI Responses ---
 register_provider("openai",
     host="api.openai.com",
-    path="/v1/chat/completions",
+    path="/v1/responses",
     tpm=100,
     concurrency=30,
     timeout=300,
     tools=True,
-    api_type="completions",
+    api_type="responses",
 )
 
 for conf, efforts in (
@@ -138,7 +138,7 @@ for conf, efforts in (
     ({'model': 'gpt-5.4-mini', 'input_cost': 0.75, 'cached_cost': 0.075, 'output_cost': 4.5}, ('high',)),
     ({'model': 'gpt-5.4-nano', 'input_cost': 0.2, 'cached_cost': 0.02, 'output_cost': 1.25}, ('high',)),
     ({'model': 'gpt-5.5', 'input_cost': 5.0, 'cached_cost': 0.5, 'output_cost': 30.0}, ('none', 'medium', 'high')),
-    ({'model': 'gpt-5.6-luna', 'input_cost': 1.0, 'cached_cost': 0.1, 'output_cost': 6.0}, ('high','xhigh','max')),
+    ({'model': 'gpt-5.6-luna', 'input_cost': 1.0, 'cached_cost': 0.1, 'output_cost': 6.0}, ('high','xhigh')),
     ({'model': 'gpt-5.6-sol', 'input_cost': 5.0, 'cached_cost': 0.5, 'output_cost': 30.0}, ('medium', 'high', 'xhigh', 'max')),
 ):
     for effort in efforts:
