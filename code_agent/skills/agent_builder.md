@@ -43,7 +43,7 @@ Select the appropriate model automatically from this set when building agents:
 | `opencode/mimo-v2.5-pro` | Default for simple tasks. Fast, cheap, good general-purpose model, especially data retrieval tasks. No vision support. |
 | `opencode/minimax-m3` | Everyday reasoning model. More intelligent than `opencode/mimo-v2.5-pro`. Vision support. |
 | `fireworks/glm-5.2` | High-intelligence model for non-deterministic goal-oriented workflows, data analysis, and communication-heavy tasks. No vision support. |
-| `gpt-5.5-medium` | High-intelligence model, concise and direct. Best REPL performance and a good orchestrator. Vision support. |
+| `gpt-5.6-sol-medium` | High-intelligence model, concise and direct. Best REPL performance and a good orchestrator. Vision support. |
 
 Default choices:
 - Simple retrieval, extraction, formatting, routing: `opencode/mimo-v2.5-pro`.
