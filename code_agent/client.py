@@ -323,14 +323,23 @@ class LLMClient:
         }
         try:
             throttle(self.model_config['host'], self.model_config.get('tpm', 5))
+            request_path = self.model_config.get('request_path', self.model_config['path'])
+            body = json.dumps(req)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("----------- TO LLM -----------")
+                logger.debug(f"POST {request_path} {headers}")
+                logger.debug(body)
             conn.request(
                 'POST',
-                self.model_config.get('request_path', self.model_config['path']),
-                json.dumps(req),
+                request_path,
+                body,
                 headers,
             )
             response = conn.getresponse()
             response_data = response.read().decode()
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("---------- FROM LLM ----------")
+                logger.info(response_data)
             if response.status == 400:
                 raise BadRequestError(response_data.strip())
             if response.status != 200:
