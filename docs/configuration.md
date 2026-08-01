@@ -43,7 +43,7 @@ The following functions are injected into the config's namespace before it runs:
 | `timeout` | Request timeout in seconds |
 | `tpm` | Requests per minute limit |
 | `concurrency` | Max concurrent requests |
-| `tools` | Whether this provider supports native tool calls (not used by Code Agent, but tracked) |
+| `tools` | Whether this provider supports native tool calls |
 
 ### `register_model` parameters
 
