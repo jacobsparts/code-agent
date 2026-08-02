@@ -21,7 +21,6 @@ class ProviderConfig:
     api_type: str = "completions"
     token_transform: object = None    # callable(usage_dict) -> usage_dict
     cost_transform: object = None     # callable(prompt, cached, completion, reasoning, in_cost, cached_cost, out_cost, rsn_cost) -> (in_cost, cached_cost, out_cost, rsn_cost)
-    response_transform: object = None # callable(resp_msg, tools) -> resp_msg
     response_parser: object = None    # callable(response_json) -> (message, stop_reason, usage)
 
 @dataclass
@@ -277,31 +276,6 @@ register_model("xai","grok-4.5",
     context_window=500_000,
     config={"reasoning_effort": "high"},
 )
-
-# --- OpenRouter ---
-register_provider("openrouter",
-    host="openrouter.ai",
-    path="/api/v1/chat/completions",
-    timeout=300,
-    tools=None,
-    api_type="completions",
-)
-#register_model("openrouter","kimi-k2.6",
-#    model="moonshotai/kimi-k2.6",
-#    config={
-#        'provider': {'order': ['cloudflare'], 'allow_fallbacks': False},
-#        'reasoning': {'enabled': True},
-#        "temperature": 1.0,
-#        "top_p": 1,
-#        "top_k": 40,
-#        "max_tokens": 1024*64,
-#    },
-#    input_cost=0.95,
-#    cached_cost=0.16,
-#    output_cost=4.0,
-#    tools=False,
-#)
-
 
 def cloudflare_response_parser(response_json):
     result = response_json.get('result', response_json)
