@@ -12,6 +12,8 @@ class Conversation:
 
     def _with_cache_breakpoints(self, messages):
         """Annotate projected messages; update continuity for the next call."""
+        if self.llm_client is None:
+            return messages
         model_name = getattr(self.llm_client, "model_name", None)
         if model_name != self._prompt_cache_model:
             self._prompt_cache = []
@@ -107,15 +109,13 @@ class Conversation:
                     result[i] = out
                     break
 
-        return result
+        return self._with_cache_breakpoints(result)
 
     def _append_message(self, message):
         self.messages.append(message)
 
     def add_assistant_response(self):
-        resp_msg = self.llm_client.text_call(
-            self._with_cache_breakpoints(self._messages())
-        )
+        resp_msg = self.llm_client.text_call(self._messages())
         self.messages.append(resp_msg)
         return resp_msg
 
