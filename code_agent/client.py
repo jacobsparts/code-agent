@@ -80,10 +80,15 @@ class LLMClient:
 
 
     def _input_bytes(self, messages, tools=None):
+        messages = self._public_messages(messages)
         payload = {"messages": messages}
         if tools:
             payload["tools"] = tools
         return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=self._json_size_default).encode("utf-8"))
+
+    @staticmethod
+    def _public_messages(messages):
+        return [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages]
 
     @staticmethod
     def _json_size_default(value):
@@ -135,6 +140,7 @@ class LLMClient:
                 f"{CONTEXT_OUTPUT_HEADROOM:,} exceeds context_window "
                 f"{context_window:,} for {self.model_name}"
             )
+
     def _call_completions(self, messages, tools):
         """
         Call OpenAI Completions API.
@@ -145,16 +151,27 @@ class LLMClient:
             tools: Optional tool specifications.
         """
         # OpenAI Completions API-compatible format
+        prepared = []
         for m in messages:
-            if m.pop('audio', None):
+            out = dict(m)
+            if out.pop('audio', None):
                 raise BadRequestError("Audio input is not supported by OpenAI completions API")
-            if images := m.pop('images', None):
-                m['content'] = [
-                    *([{"type": "text", "text": m['content']}] if m['content'] else []),
+            breakpoint = out.pop('_prompt_cache_breakpoint', None)
+            if images := out.pop('images', None):
+                out['content'] = [
+                    *([{"type": "text", "text": out['content']}] if out['content'] else []),
                     *[{"type": "image_url", "image_url": {
                         "url": f"data:{MEDIA_TYPES[img[:3]]};base64,{base64.b64encode(img).decode()}"
                     }} for img in images]
                 ]
+            elif breakpoint and isinstance(out.get('content'), str):
+                out['content'] = [{
+                    "type": "text",
+                    "text": out['content'],
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }]
+            prepared.append(out)
+        messages = self._public_messages(prepared)
 
         context_window = self.model_config.get('context_window')
         extra_config = dict(self.model_config.get('config', {}))
@@ -391,6 +408,7 @@ class LLMClient:
     def _call_cursor(self, messages, tools):
         if self.tool_mode != "repl_execute":
             raise TypeError("Cursor transport requires tool_mode='repl_execute'")
+        messages = self._public_messages(messages)
         req = {
             "model": self.model_config["model"],
             "messages": messages,
@@ -423,6 +441,7 @@ class LLMClient:
             tools: Optional tool specifications.
         """
         # Anthropic Messages API-compatible format
+        messages = self._public_messages(messages)
         for m in messages:
             if m.pop('audio', None):
                 raise BadRequestError("Audio input is not supported by Anthropic Messages API")
@@ -651,8 +670,6 @@ class LLMClient:
             if not self.native:
                 messages = [self.prepare_message(msg) for msg in messages]
             messages = self._strip_tool_metadata(messages)
-        # Strip internal metadata keys (underscore-prefixed) before sending to API
-        messages = [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages]
         size_tools = [REPL_EXECUTE_TOOL] if self.tool_mode == "repl_execute" else tools
         self._validate_context_budget(self._input_bytes(messages, size_tools))
         if self.model_config['api_type'] == "completions":
