@@ -2160,6 +2160,46 @@ If you don't know how to proceed:
             except Exception:
                 pass
 
+    def _terminal_output_hook(self, value, release: bool) -> None:
+        if not release:
+            text = str(value).rstrip("\n")
+            for line in text.split("\n"):
+                print(f"\x1b[92m{line}\x1b[0m", flush=True)
+                self._capture_display_line(line)
+            return
+        if self.repl_display:
+            self.console.clear_line()
+        response = str(value) if value is not None else ""
+        formatted = self.format_response(response) if self.response_formatting else response
+        if formatted:
+            self._user_header_pending = bool(self.response_formatting) and not self.agent_mode
+            if self.response_formatting:
+                print(self._section_header("Output", "═", TEXT))
+            print(formatted)
+
+    _output_hook = _terminal_output_hook
+
+    @property
+    def output_hook(self):
+        return self._output_hook
+
+    @output_hook.setter
+    def output_hook(self, hook):
+        self._output_hook = hook
+        self.repl_display = False
+
+    def _handle_tool_request(self, repl, req: dict) -> None:
+        is_emit = req.get("tool") == "__emit__"
+        release = bool((req.get("args") or {}).get("release", False))
+        result = super()._handle_tool_request(repl, req)
+        if (
+            is_emit
+            and not release
+            and self.output_hook != self._terminal_output_hook
+        ):
+            self.output_hook(self._final_result, False)
+        return result
+
     def on_repl_event(self, event: ReplEvent) -> None:
         kind = event.kind
         chunk = event.text
@@ -2243,10 +2283,8 @@ If you don't know how to proceed:
             return
 
         if kind == "progress":
-            text = chunk.rstrip('\n')
-            for line in text.split('\n'):
-                print(f"\x1b[92m{line}\x1b[0m", flush=True)
-                self._capture_display_line(line)
+            if self.output_hook == self._terminal_output_hook:
+                self.output_hook(chunk.rstrip("\n"), False)
             return
 
         if kind in {
@@ -2721,6 +2759,46 @@ Return only the replacement user prompt text.
         ]
         self._last_was_repl_output = True
 
+    def _reset_interaction_state(self) -> None:
+        self._repl_printed_header = False
+        self._repl_has_output = False
+        self._turn_number = 1
+        self._turn_output_started = False
+        self._header_pending = False
+        self._statement_direct_call = None
+        self._statement_source = ""
+        self._statement_echo = ""
+        self._statement_echo_displayed = False
+        self._statement_had_diff = False
+        self._statement_print_uses_variable = False
+        self._reset_display_capture()
+
+    def run_interaction(
+        self,
+        content: str,
+        *,
+        max_turns: int | None = None,
+    ):
+        self._ensure_setup()
+        self._ensure_live_session()
+        self._flush_pending_session_events()
+        if max_turns is None:
+            max_turns = getattr(self, "max_turns", 10)
+
+        self.usermsg(content, _user_content=content)
+        self._reset_interaction_state()
+        if self.repl_display:
+            thinking = getattr(self, "thinking_message", "Thinking...")
+            print()
+            print(f"{DIM}{thinking} (turn 1){RESET}", end="", flush=True)
+        elif self.agent_mode and self.output_hook == self._terminal_output_hook:
+            print()
+
+        response = self.run_loop(max_turns=max_turns)
+        self._coalesce_context()
+        self.output_hook(response, True)
+        return response
+
     def cli_run(
         self,
         max_turns: int | None = None,
@@ -2760,7 +2838,6 @@ Return only the replacement user prompt text.
 
 
         prompt_str = getattr(self, 'cli_prompt', '> ')
-        thinking = getattr(self, 'thinking_message', 'Thinking...')
 
         key_help = "Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Ctrl+C = interrupt | Ctrl+D = quit"
         if not self.agent_mode:
@@ -2812,6 +2889,7 @@ Return only the replacement user prompt text.
             preload_input = ""
             pending_initial_prompt = initial_prompt
             user_header_pending = False
+            self._user_header_pending = False
             flush_input_before_prompt = False
             while True:
                 rewind_shortcut = False
@@ -3138,30 +3216,12 @@ Return only the replacement user prompt text.
                         print(f"\n{DIM}Error: {type(e).__name__}: {e}{RESET}", file=sys.stderr)
                     synth = False
 
-                self.usermsg(user_input, _user_content=user_input)
-
-                # Reset state for new user interaction
-                self._repl_printed_header = False
-                self._repl_has_output = False
-                self._turn_number = 1
-                self._turn_output_started = False
-                self._header_pending = False
-                self._statement_direct_call = None
-                self._statement_source = ""
-                self._statement_echo = ""
-                self._statement_echo_displayed = False
-                self._statement_had_diff = False
-                self._statement_print_uses_variable = False
-                self._reset_display_capture()
-                if self.repl_display:
-                    print()  # Blank line after user input
-                    print(f"{DIM}{thinking} (turn 1){RESET}", end="", flush=True)
-                elif self.agent_mode:
-                    print()  # Keep agent-mode output from overwriting the submitted prompt line
-
                 flush_input_before_prompt = True
                 try:
-                    response = self.run_loop(max_turns=max_turns)
+                    response = self.run_interaction(
+                        user_input,
+                        max_turns=max_turns,
+                    )
                 except KeyboardInterrupt:
                     self.console.clear_line()
                     print()
@@ -3175,22 +3235,7 @@ Return only the replacement user prompt text.
                     print(f"\n{DIM}Error: {type(e).__name__}: {e}{RESET}", file=sys.stderr)
                     continue
 
-                self._coalesce_context()
-
-                if self.repl_display:
-                    self.console.clear_line()  # Clear thinking message
-
-                # The next section header delineates the end of Python output.
-
-                # Display response
-                response_str = str(response) if response is not None else ""
-                formatted = self.format_response(response_str) if self.response_formatting else response_str
-                if formatted:
-                    user_header_pending = bool(self.response_formatting) and not self.agent_mode
-                    if self.response_formatting:
-                        output_header = self._section_header("Output", "═", TEXT)
-                        print(output_header)
-                    print(formatted)
+                user_header_pending = self._user_header_pending
         finally:
             altmode.uninstall()
             # Save conversation on crash
