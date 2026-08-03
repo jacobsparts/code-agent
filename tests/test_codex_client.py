@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import uuid
 from io import BytesIO
 
@@ -23,20 +24,36 @@ def _jwt(payload):
     return f"x.{encoded}.x"
 
 
-def _auth_file(path):
-    path.write_text(json.dumps({
+def _credential(
+    *,
+    access_token=None,
+    refresh_token="refresh",
+    account_id="account-from-token",
+    rate_limits=None,
+):
+    credential = {
         "auth_mode": "chatgpt",
         "tokens": {
-            "access_token": _jwt({
+            "access_token": access_token or _jwt({
                 "exp": 4_000_000_000,
                 "https://api.openai.com/auth": {
-                    "chatgpt_account_id": "account-from-token"
+                    "chatgpt_account_id": account_id
                 },
             }),
             "id_token": "id",
-            "refresh_token": "refresh",
+            "refresh_token": refresh_token,
+            "account_id": account_id,
         },
         "last_refresh": "2026-01-01T00:00:00+00:00",
+    }
+    if rate_limits is not None:
+        credential["rate_limits"] = rate_limits
+    return credential
+
+
+def _auth_file(path, credentials=None):
+    path.write_text(json.dumps({
+        "credentials": credentials or [_credential()],
     }))
     return path
 
@@ -72,9 +89,122 @@ def test_auth_save_is_private_and_atomic(tmp_path):
     auth = codex.CodexAuth(str(path))
     auth.data["tokens"]["access_token"] = "new"
     auth._save()
-    assert json.loads(path.read_text())["tokens"]["access_token"] == "new"
+    assert json.loads(path.read_text())["credentials"][0]["tokens"]["access_token"] == "new"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not (tmp_path / "auth.json.tmp").exists()
+
+
+def test_auth_read_blocks_on_exclusive_lock(tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    codex.fcntl.flock(lock_fd, codex.fcntl.LOCK_EX)
+    started = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def load():
+        started.set()
+        try:
+            codex.CodexAuth(str(path))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=load)
+    thread.start()
+    assert started.wait(1)
+    assert not finished.wait(0.1)
+
+    codex.fcntl.flock(lock_fd, codex.fcntl.LOCK_UN)
+    os.close(lock_fd)
+    thread.join(1)
+
+    assert finished.is_set()
+    assert errors == []
+
+
+def test_auth_write_blocks_on_shared_lock(tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    auth = codex.CodexAuth(str(path))
+    auth.data["tokens"]["access_token"] = "new"
+    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    codex.fcntl.flock(lock_fd, codex.fcntl.LOCK_SH)
+    started = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def save():
+        started.set()
+        try:
+            auth._save()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=save)
+    thread.start()
+    assert started.wait(1)
+    assert not finished.wait(0.1)
+
+    codex.fcntl.flock(lock_fd, codex.fcntl.LOCK_UN)
+    os.close(lock_fd)
+    thread.join(1)
+
+    assert finished.is_set()
+    assert errors == []
+    assert json.loads(path.read_text())["credentials"][0]["tokens"]["access_token"] == "new"
+
+
+def test_concurrent_refresh_uses_updated_credentials(monkeypatch, tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    first = codex.CodexAuth(str(path))
+    second = codex.CodexAuth(str(path))
+    barrier = threading.Barrier(2)
+    refresh_requests = []
+    errors = []
+
+    class RefreshResponse(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def urlopen(request, timeout=None):
+        refresh_requests.append(json.loads(request.data))
+        return RefreshResponse(json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+        }).encode())
+
+    def refresh(auth):
+        try:
+            barrier.wait()
+            auth.refresh()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", urlopen)
+    threads = [
+        threading.Thread(target=refresh, args=(first,)),
+        threading.Thread(target=refresh, args=(second,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(refresh_requests) == 1
+    assert refresh_requests[0]["refresh_token"] == "refresh"
+    assert first.access_token == "new-access"
+    assert second.access_token == "new-access"
+    saved = json.loads(path.read_text())
+    assert saved["credentials"][0]["tokens"]["access_token"] == "new-access"
+    assert saved["credentials"][0]["tokens"]["refresh_token"] == "new-refresh"
 
 
 def test_parse_sse_supports_multiline_and_usage():
@@ -542,6 +672,107 @@ def test_parse_http_response_streams_sse_without_content_type():
     assert response["output"] == []
 
 
+def test_http_rate_limit_headers_are_saved_before_stream_read(tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    auth = codex.CodexAuth(str(path))
+    payload = (
+        b'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    class RateLimitResponse(_FakeResponse):
+        def __init__(self):
+            super().__init__(payload)
+            self.headers.update({
+                "x-codex-primary-used-percent": "12.5",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-primary-reset-at": "1704069000",
+                "x-codex-secondary-used-percent": "30",
+                "x-codex-secondary-window-minutes": "10080",
+                "x-codex-secondary-reset-at": "1704673800",
+                "x-codex-credits-has-credits": "true",
+                "x-codex-credits-unlimited": "false",
+                "x-codex-credits-balance": "4.25",
+            })
+
+        def readline(self, size=-1):
+            saved = json.loads(path.read_text())
+            assert saved["credentials"][0]["rate_limits"]["limits"]["codex_primary"][
+                "used_percent"
+            ] == 12.5
+            return super().readline(size)
+
+    codex._parse_http_response(RateLimitResponse(), auth=auth)
+
+    saved = json.loads(path.read_text())["credentials"][0]["rate_limits"]
+    assert isinstance(saved["fetched_at"], int)
+    assert saved["limits"] == {
+        "codex_primary": {
+            "used_percent": 12.5,
+            "reset_at": 1704069000,
+        },
+        "codex_secondary": {
+            "used_percent": 30.0,
+            "reset_at": 1704673800,
+        },
+    }
+
+
+def test_sse_rate_limit_event_is_saved_immediately(tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    auth = codex.CodexAuth(str(path))
+    rate_limits = {
+        "type": "codex.rate_limits",
+        "plan_type": "plus",
+        "rate_limits": {
+            "primary": {
+                "used_percent": 18.0,
+                "window_minutes": 300,
+                "reset_at": 1704069000,
+            },
+        },
+    }
+    payload = (
+        f"data: {json.dumps(rate_limits)}\n\n"
+        'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'
+        "data: [DONE]\n\n"
+    ).encode()
+
+    codex._parse_http_response(_FakeResponse(payload), auth=auth)
+
+    saved = json.loads(path.read_text())["credentials"][0]["rate_limits"]
+    assert isinstance(saved["fetched_at"], int)
+    assert saved["limits"] == {
+        "codex_primary": {
+            "used_percent": 18.0,
+            "reset_at": 1704069000,
+        },
+    }
+
+
+def test_saving_rate_limits_preserves_concurrently_refreshed_tokens(tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    stale = codex.CodexAuth(str(path))
+    current = codex.CodexAuth(str(path))
+    current.data["tokens"]["access_token"] = "new-access"
+    current.data["tokens"]["refresh_token"] = "new-refresh"
+    current._save()
+
+    stale.save_rate_limits({
+        "type": "codex.rate_limits",
+        "rate_limits": {
+            "primary": {"used_percent": 25, "reset_at": 1704069000},
+        },
+    })
+
+    saved = json.loads(path.read_text())
+    assert saved["credentials"][0]["tokens"]["access_token"] == "new-access"
+    assert saved["credentials"][0]["tokens"]["refresh_token"] == "new-refresh"
+    assert saved["credentials"][0]["rate_limits"]["limits"] == {
+        "codex_primary": {"used_percent": 25.0, "reset_at": 1704069000},
+    }
+
+
 
 class _FakeSock:
     def __init__(self):
@@ -708,3 +939,233 @@ def test_request_maps_first_byte_timeout_to_stall(monkeypatch, tmp_path):
     assert err.stage == "first_byte"
     assert err.idle_timeout == 11
     assert err.last_event_type is None
+
+
+def _quota(fetched_at, *windows):
+    return {
+        "fetched_at": fetched_at,
+        "limits": {
+            name: {"used_percent": used, "reset_at": reset}
+            for name, used, reset in windows
+        },
+    }
+
+
+def test_auth_requires_credentials_list(tmp_path):
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(_credential()))
+
+    with pytest.raises(codex.CodexError, match="credentials list"):
+        codex.CodexAuth(str(path))
+
+
+def test_single_credential_skips_quota_preflight(monkeypatch, tmp_path):
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
+
+    monkeypatch.setattr(
+        auth,
+        "_usage_request_unlocked",
+        lambda *args, **kwargs: pytest.fail("single credential ran quota preflight"),
+    )
+
+    assert auth.select_credential() == 0
+
+
+def test_multi_credential_selection_uses_pool_reset_remaining_and_index(tmp_path):
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="zero",
+            rate_limits=_quota(now, ("codex_primary", 50, 200)),
+        ),
+        _credential(
+            account_id="one",
+            rate_limits=_quota(now, ("codex_primary", 60, 100)),
+        ),
+        _credential(
+            account_id="two",
+            rate_limits=_quota(now, ("codex_primary", 70, 100)),
+        ),
+    ]
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+
+    assert auth.select_credential() == 2
+    assert auth.index == 2
+    assert auth.account_id == "two"
+
+    credentials[1]["rate_limits"] = _quota(now, ("codex_primary", 70, 100))
+    credentials[2]["rate_limits"] = _quota(now, ("codex_primary", 70, 100))
+    _auth_file(tmp_path / "auth.json", credentials)
+    auth = codex.CodexAuth(str(tmp_path / "auth.json"))
+
+    assert auth.select_credential() == 1
+
+
+def test_normal_pool_is_preferred_over_earlier_reset_reserve(tmp_path):
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="reserve",
+            rate_limits=_quota(now, ("codex_primary", 96, 100)),
+        ),
+        _credential(
+            account_id="normal",
+            rate_limits=_quota(now, ("codex_primary", 94, 200)),
+        ),
+    ]
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+
+    assert auth.select_credential() == 1
+
+
+def test_longer_horizon_limit_suppresses_earlier_reset(tmp_path):
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="suppressed",
+            rate_limits=_quota(
+                now,
+                ("codex_primary", 50, 100),
+                ("codex_secondary", 90, 300),
+            ),
+        ),
+        _credential(
+            account_id="earlier-effective-reset",
+            rate_limits=_quota(now, ("codex_primary", 80, 200)),
+        ),
+    ]
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+
+    assert codex._effective_quota(credentials[0]) == (300, 10.0)
+    assert auth.select_credential() == 1
+
+
+def test_stale_quotas_are_refreshed_and_failed_refresh_is_unusable(
+    monkeypatch, tmp_path
+):
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="stale",
+            rate_limits=_quota(now - 3601, ("codex_primary", 10, 50)),
+        ),
+        _credential(
+            account_id="fresh",
+            rate_limits=_quota(now, ("codex_primary", 20, 100)),
+        ),
+    ]
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+    calls = []
+
+    def refresh(index, timeout=60):
+        calls.append(index)
+        raise codex.CodexError("unavailable")
+
+    monkeypatch.setattr(auth, "_usage_request_unlocked", refresh)
+
+    assert auth.select_credential() == 1
+    assert calls == [0]
+
+
+def test_all_exhausted_forces_full_quota_recheck(monkeypatch, tmp_path):
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="zero",
+            rate_limits=_quota(now, ("codex_primary", 100, 100)),
+        ),
+        _credential(
+            account_id="one",
+            rate_limits=_quota(now, ("codex_primary", 100, 200)),
+        ),
+    ]
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+    calls = []
+
+    def refresh(index, timeout=60):
+        calls.append(index)
+        snapshot = _quota(
+            int(codex.time.time()),
+            ("codex_primary", 80 if index == 1 else 100, 300 + index),
+        )
+        auth.root["credentials"][index]["rate_limits"] = snapshot
+        return snapshot
+
+    monkeypatch.setattr(auth, "_usage_request_unlocked", refresh)
+
+    assert auth.select_credential() == 1
+    assert calls == [0, 1]
+
+
+def test_usage_payload_is_reduced_to_selection_fields():
+    snapshot = codex._quota_snapshot_from_usage({
+        "plan_type": "plus",
+        "rate_limit": {
+            "allowed": True,
+            "primary_window": {
+                "used_percent": 12,
+                "limit_window_seconds": 18000,
+                "reset_after_seconds": 60,
+                "reset_at": 100,
+            },
+            "secondary_window": {
+                "used_percent": 30,
+                "reset_at": 200,
+            },
+        },
+        "additional_rate_limits": [{
+            "limit_name": "Luna",
+            "metered_feature": "luna",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 40,
+                    "reset_at": 300,
+                },
+            },
+        }],
+    }, fetched_at=50)
+
+    assert snapshot == {
+        "fetched_at": 50,
+        "limits": {
+            "codex_primary": {"used_percent": 12.0, "reset_at": 100},
+            "codex_secondary": {"used_percent": 30.0, "reset_at": 200},
+            "luna_primary": {"used_percent": 40.0, "reset_at": 300},
+        },
+    }
+
+
+def test_http_429_expires_selected_quota(monkeypatch, tmp_path):
+    import urllib.error
+
+    now = int(codex.time.time())
+    credential = _credential(
+        rate_limits=_quota(now, ("codex_primary", 20, now + 100)),
+    )
+    path = _auth_file(tmp_path / "auth.json", [credential])
+    auth = codex.CodexAuth(str(path))
+
+    def fail(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "rate limited",
+            {},
+            BytesIO(b'{"error":"rate_limit"}'),
+        )
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", fail)
+
+    with pytest.raises(codex.CodexError, match="HTTP 429"):
+        codex._request(
+            auth,
+            {
+                "model": "gpt-5.6-luna",
+                "input": [{"role": "user", "content": []}],
+                "stream": True,
+            },
+            codex.StreamTimeouts(),
+        )
+
+    saved = json.loads(path.read_text())
+    assert saved["credentials"][0]["rate_limits"]["fetched_at"] == 0

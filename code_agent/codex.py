@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import base64
 import copy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import fcntl
 import json
 import logging
 import os
 import socket
 from io import BytesIO
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -21,6 +24,7 @@ logger = logging.getLogger("code_agent")
 CRED_FILE = os.path.expanduser("~/.code-agent/codex-auth.json")
 REFRESH_URL = "https://auth.openai.com/oauth/token"
 RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLIENT_VERSION = "0.146.0"
 MODEL = "gpt-5.6-luna"
@@ -150,42 +154,181 @@ def jwt_exp(token: str) -> datetime | None:
         return None
 
 
+def _credential_needs_refresh(credential: dict) -> bool:
+    token = credential["tokens"]["access_token"]
+    expiration = jwt_exp(token)
+    now = datetime.now(timezone.utc)
+    if expiration is not None:
+        return expiration <= now + timedelta(minutes=REFRESH_WINDOW_MINUTES)
+    value = credential.get("last_refresh")
+    if isinstance(value, str):
+        try:
+            refreshed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if refreshed.tzinfo is None:
+                refreshed = refreshed.replace(tzinfo=timezone.utc)
+            return refreshed < now - timedelta(days=MAX_REFRESH_AGE_DAYS)
+        except ValueError:
+            pass
+    return False
+
+
+def _quota_snapshot_from_event(event: dict, fetched_at: int | None = None) -> dict:
+    limits = {}
+    details = event.get("rate_limits")
+    if isinstance(details, dict):
+        prefix = event.get("metered_limit_name") or event.get("limit_name") or "codex"
+        for window_name in ("primary", "secondary"):
+            window = details.get(window_name)
+            if not isinstance(window, dict):
+                continue
+            used_percent = window.get("used_percent")
+            reset_at = window.get("reset_at")
+            if isinstance(used_percent, (int, float)) and isinstance(reset_at, (int, float)):
+                limits[f"{prefix}_{window_name}"] = {
+                    "used_percent": float(used_percent),
+                    "reset_at": int(reset_at),
+                }
+    return {
+        "fetched_at": int(time.time()) if fetched_at is None else int(fetched_at),
+        "limits": limits,
+    }
+
+
+def _add_usage_windows(limits: dict, prefix: str, details) -> None:
+    if not isinstance(details, dict):
+        return
+    for window_name in ("primary_window", "secondary_window"):
+        window = details.get(window_name)
+        if not isinstance(window, dict):
+            continue
+        used_percent = window.get("used_percent")
+        reset_at = window.get("reset_at")
+        if isinstance(used_percent, (int, float)) and isinstance(reset_at, (int, float)):
+            suffix = window_name.removesuffix("_window")
+            limits[f"{prefix}_{suffix}"] = {
+                "used_percent": float(used_percent),
+                "reset_at": int(reset_at),
+            }
+
+
+def _quota_snapshot_from_usage(payload: dict, fetched_at: int | None = None) -> dict:
+    limits = {}
+    _add_usage_windows(limits, "codex", payload.get("rate_limit"))
+    _add_usage_windows(limits, "code_review", payload.get("code_review_rate_limit"))
+    additional = payload.get("additional_rate_limits")
+    if isinstance(additional, list):
+        for index, item in enumerate(additional):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("metered_feature") or item.get("limit_name") or f"additional_{index}"
+            _add_usage_windows(limits, str(name), item.get("rate_limit"))
+    return {
+        "fetched_at": int(time.time()) if fetched_at is None else int(fetched_at),
+        "limits": limits,
+    }
+
+
+def _effective_quota(credential: dict):
+    quota = credential.get("rate_limits")
+    limits = quota.get("limits") if isinstance(quota, dict) else None
+    if not isinstance(limits, dict):
+        return None
+    windows = []
+    for limit in limits.values():
+        if not isinstance(limit, dict):
+            continue
+        used_percent = limit.get("used_percent")
+        reset_at = limit.get("reset_at")
+        if not isinstance(used_percent, (int, float)) or not isinstance(reset_at, (int, float)):
+            continue
+        windows.append((int(reset_at), 100.0 - float(used_percent)))
+    windows.sort()
+    for index, window in enumerate(windows):
+        _, remaining = window
+        if not any(later_remaining <= remaining for _, later_remaining in windows[index + 1:]):
+            return window
+    return None
+
+
 class CodexAuth:
     def __init__(self, path: str = CRED_FILE):
         self.path = os.path.expanduser(path)
-        self.data = self._load()
+        self.lock_path = self.path + ".lock"
+        self.root = self._load()
+        self.index = 0
+        self.data = self.root["credentials"][0]
 
-    def _load(self) -> dict:
-        try:
-            with open(self.path, encoding="utf-8") as stream:
-                data = json.load(stream)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"No Codex credentials at {self.path}. Copy the official "
-                "~/.codex/auth.json file or create the equivalent token schema."
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise CodexError(f"Could not read Codex credentials at {self.path}: {exc}") from exc
-        tokens = data.get("tokens") if isinstance(data, dict) else None
-        if not isinstance(tokens, dict):
-            raise CodexError("Codex credentials are missing the tokens object")
-        for name in ("access_token", "refresh_token"):
-            if not isinstance(tokens.get(name), str) or not tokens[name]:
-                raise CodexError(f"Codex credentials are missing {name}")
-        return data
-
-    def _save(self) -> None:
+    def _prepare_directory(self) -> str:
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, mode=0o700, exist_ok=True)
         try:
             os.chmod(directory, 0o700)
         except OSError:
             pass
+        return directory
+
+    @contextmanager
+    def _lock(self, operation: int):
+        self._prepare_directory()
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        locked = False
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, operation)
+            locked = True
+            yield
+        finally:
+            if locked:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _validate_root(self, root) -> dict:
+        credentials = root.get("credentials") if isinstance(root, dict) else None
+        if not isinstance(credentials, list) or not credentials:
+            raise CodexError("Codex credential file must contain a non-empty credentials list")
+        for index, credential in enumerate(credentials):
+            tokens = credential.get("tokens") if isinstance(credential, dict) else None
+            if not isinstance(tokens, dict):
+                raise CodexError(f"Codex credential {index} is missing the tokens object")
+            for name in ("access_token", "refresh_token"):
+                if not isinstance(tokens.get(name), str) or not tokens[name]:
+                    raise CodexError(f"Codex credential {index} is missing {name}")
+        return root
+
+    def _load_unlocked(self) -> dict:
+        try:
+            with open(self.path, encoding="utf-8") as stream:
+                root = json.load(stream)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"No Codex credentials at {self.path}. Create a credential file "
+                "containing a credentials list."
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CodexError(f"Could not read Codex credentials at {self.path}: {exc}") from exc
+        return self._validate_root(root)
+
+    def _load(self) -> dict:
+        try:
+            with self._lock(fcntl.LOCK_SH):
+                return self._load_unlocked()
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise CodexError(f"Could not read Codex credentials at {self.path}: {exc}") from exc
+
+    def _select_loaded(self, root: dict, index: int) -> None:
+        self.root = root
+        self.index = index
+        self.data = root["credentials"][index]
+
+    def _save_unlocked(self) -> None:
+        directory = self._prepare_directory()
         fd, temporary = tempfile.mkstemp(prefix=".codex-auth-", dir=directory)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(self.data, stream, indent=2)
+                json.dump(self.root, stream, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -202,6 +345,20 @@ class CodexAuth:
                 pass
             raise
 
+    def _save(self) -> None:
+        with self._lock(fcntl.LOCK_EX):
+            self._save_unlocked()
+
+    def save_rate_limits(self, rate_limits: dict) -> None:
+        snapshot = _quota_snapshot_from_event(rate_limits)
+        if not snapshot["limits"]:
+            return
+        with self._lock(fcntl.LOCK_EX):
+            root = self._load_unlocked()
+            root["credentials"][self.index]["rate_limits"] = snapshot
+            self._select_loaded(root, self.index)
+            self._save_unlocked()
+
     @property
     def access_token(self) -> str:
         return self.data["tokens"]["access_token"]
@@ -215,28 +372,16 @@ class CodexAuth:
         return auth.get("chatgpt_account_id", "") if isinstance(auth, dict) else ""
 
     def needs_refresh(self) -> bool:
-        expiration = jwt_exp(self.access_token)
-        now = datetime.now(timezone.utc)
-        if expiration is not None:
-            return expiration <= now + timedelta(minutes=REFRESH_WINDOW_MINUTES)
-        value = self.data.get("last_refresh")
-        if isinstance(value, str):
-            try:
-                refreshed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                if refreshed.tzinfo is None:
-                    refreshed = refreshed.replace(tzinfo=timezone.utc)
-                return refreshed < now - timedelta(days=MAX_REFRESH_AGE_DAYS)
-            except ValueError:
-                pass
-        return False
+        return _credential_needs_refresh(self.data)
 
-    def refresh(self, timeout: float = 60) -> None:
+    def _refresh_credential_unlocked(self, index: int, timeout: float = 60) -> None:
+        credential = self.root["credentials"][index]
         request = urllib.request.Request(
             REFRESH_URL,
             data=json.dumps({
                 "client_id": CLIENT_ID,
                 "grant_type": "refresh_token",
-                "refresh_token": self.data["tokens"]["refresh_token"],
+                "refresh_token": credential["tokens"]["refresh_token"],
             }).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -252,18 +397,139 @@ class CodexAuth:
         access_token = payload.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise CodexError("Token refresh returned no access_token")
-        tokens = self.data["tokens"]
+        tokens = credential["tokens"]
         tokens["access_token"] = access_token
         for name in ("refresh_token", "id_token"):
             if isinstance(payload.get(name), str) and payload[name]:
                 tokens[name] = payload[name]
-        self.data["last_refresh"] = datetime.now(timezone.utc).isoformat()
-        self._save()
+        credential["last_refresh"] = datetime.now(timezone.utc).isoformat()
+
+    def refresh(self, timeout: float = 60) -> None:
+        observed_access_token = self.access_token
+        with self._lock(fcntl.LOCK_EX):
+            root = self._load_unlocked()
+            self._select_loaded(root, self.index)
+            if self.access_token != observed_access_token:
+                return
+            self._refresh_credential_unlocked(self.index, timeout)
+            self._save_unlocked()
 
     def ensure_valid(self) -> None:
         if self.needs_refresh():
             self.refresh()
 
+    def _usage_request_unlocked(self, index: int, timeout: float = 60) -> dict:
+        for attempt in range(2):
+            credential = self.root["credentials"][index]
+            if _credential_needs_refresh(credential):
+                self._refresh_credential_unlocked(index, timeout)
+            account_id = credential["tokens"].get("account_id")
+            if not account_id:
+                claims = _jwt_payload(credential["tokens"]["access_token"])
+                auth = claims.get("https://api.openai.com/auth", {})
+                if isinstance(auth, dict):
+                    account_id = auth.get("chatgpt_account_id")
+            headers = {
+                "Authorization": "Bearer " + credential["tokens"]["access_token"],
+                "Content-Type": "application/json",
+                "User-Agent": f"codex_cli_rs/{CLIENT_VERSION}",
+            }
+            if account_id:
+                headers["ChatGPT-Account-ID"] = account_id
+            request = urllib.request.Request(USAGE_URL, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.load(response)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401 and attempt == 0:
+                    self._refresh_credential_unlocked(index, timeout)
+                    continue
+                detail = exc.read().decode("utf-8", "replace")
+                raise CodexError(f"Quota preflight failed: HTTP {exc.code}: {detail}") from exc
+            except (OSError, ValueError) as exc:
+                raise CodexError(f"Quota preflight failed: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise CodexError("Quota preflight returned a non-object response")
+            snapshot = _quota_snapshot_from_usage(payload)
+            if not snapshot["limits"]:
+                raise CodexError("Quota preflight returned no usable rate limits")
+            credential["rate_limits"] = snapshot
+            return snapshot
+        raise CodexError("Quota preflight failed after token refresh")
+
+    @staticmethod
+    def _quota_stale(credential: dict, now: int) -> bool:
+        quota = credential.get("rate_limits")
+        fetched_at = quota.get("fetched_at") if isinstance(quota, dict) else None
+        return not isinstance(fetched_at, (int, float)) or fetched_at < now - 3600
+
+    def _choose_credential(self, usable: set[int]):
+        normal = []
+        reserve = []
+        for index, credential in enumerate(self.root["credentials"]):
+            if index not in usable:
+                continue
+            effective = _effective_quota(credential)
+            if effective is None:
+                continue
+            reset_at, remaining = effective
+            key = (reset_at, remaining, index)
+            if remaining > 5:
+                normal.append((key, index))
+            elif remaining > 0:
+                reserve.append((key, index))
+        pool = normal or reserve
+        return min(pool)[1] if pool else None
+
+    def select_credential(self, timeout: float = 60) -> int:
+        with self._lock(fcntl.LOCK_EX):
+            root = self._load_unlocked()
+            self._select_loaded(root, 0)
+            credentials = root["credentials"]
+            if len(credentials) == 1:
+                return 0
+
+            now = int(time.time())
+            usable = set(range(len(credentials)))
+            errors = []
+            for index, credential in enumerate(credentials):
+                if not self._quota_stale(credential, now):
+                    continue
+                try:
+                    self._usage_request_unlocked(index, timeout)
+                except CodexError as exc:
+                    usable.discard(index)
+                    errors.append(f"credential {index}: {exc}")
+
+            selected = self._choose_credential(usable)
+            if selected is None:
+                usable.clear()
+                errors.clear()
+                for index in range(len(credentials)):
+                    try:
+                        self._usage_request_unlocked(index, timeout)
+                        usable.add(index)
+                    except CodexError as exc:
+                        errors.append(f"credential {index}: {exc}")
+                selected = self._choose_credential(usable)
+
+            self._save_unlocked()
+            if selected is None:
+                detail = "; ".join(errors)
+                suffix = f": {detail}" if detail else ""
+                raise CodexError(f"No Codex credential has positive quota{suffix}")
+            self._select_loaded(self.root, selected)
+            return selected
+
+    def expire_rate_limits(self) -> None:
+        with self._lock(fcntl.LOCK_EX):
+            root = self._load_unlocked()
+            credential = root["credentials"][self.index]
+            quota = credential.get("rate_limits")
+            if isinstance(quota, dict):
+                quota["fetched_at"] = 0
+            self._select_loaded(root, self.index)
+            self._save_unlocked()
 
 def _event_result(events: list[dict]) -> dict:
     response = None
@@ -384,7 +650,88 @@ def _log_sse_event(event: dict) -> None:
         logger.info(json.dumps(event, separators=(",", ":")))
 
 
-def parse_sse(stream, timeouts: StreamTimeouts | None = None) -> dict:
+def _header_value(headers, name: str) -> str | None:
+    value = headers.get(name) if headers is not None else None
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _header_float(headers, name: str) -> float | None:
+    value = _header_value(headers, name)
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except ValueError:
+        return None
+    return result if result == result and abs(result) != float("inf") else None
+
+
+def _header_int(headers, name: str) -> int | None:
+    value = _header_value(headers, name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _header_bool(headers, name: str) -> bool | None:
+    value = _header_value(headers, name)
+    if value is None:
+        return None
+    if value.lower() in {"true", "1"}:
+        return True
+    if value.lower() in {"false", "0"}:
+        return False
+    return None
+
+
+def _rate_limits_from_headers(headers) -> dict | None:
+    windows = {}
+    for name in ("primary", "secondary"):
+        used_percent = _header_float(headers, f"x-codex-{name}-used-percent")
+        if used_percent is None:
+            continue
+        window = {"used_percent": used_percent}
+        window_minutes = _header_int(headers, f"x-codex-{name}-window-minutes")
+        reset_at = _header_int(headers, f"x-codex-{name}-reset-at")
+        if window_minutes is not None:
+            window["window_minutes"] = window_minutes
+        if reset_at is not None:
+            window["reset_at"] = reset_at
+        windows[name] = window
+
+    has_credits = _header_bool(headers, "x-codex-credits-has-credits")
+    unlimited = _header_bool(headers, "x-codex-credits-unlimited")
+    credits = None
+    if has_credits is not None and unlimited is not None:
+        credits = {
+            "has_credits": has_credits,
+            "unlimited": unlimited,
+        }
+        balance = _header_value(headers, "x-codex-credits-balance")
+        if balance is not None:
+            credits["balance"] = balance
+
+    if not windows and credits is None:
+        return None
+    event = {"type": "codex.rate_limits"}
+    if windows:
+        event["rate_limits"] = windows
+    if credits is not None:
+        event["credits"] = credits
+    return event
+
+
+def parse_sse(
+    stream,
+    timeouts: StreamTimeouts | None = None,
+    on_rate_limits=None,
+) -> dict:
     events = []
     data_lines = []
     log_events = logger.isEnabledFor(logging.INFO)
@@ -446,6 +793,8 @@ def parse_sse(stream, timeouts: StreamTimeouts | None = None) -> dict:
             if isinstance(event, dict):
                 if log_events:
                     _log_sse_event(event)
+                if event.get("type") == "codex.rate_limits" and on_rate_limits is not None:
+                    on_rate_limits(event)
                 events.append(event)
                 note_event(event)
         if data_lines:
@@ -458,6 +807,8 @@ def parse_sse(stream, timeouts: StreamTimeouts | None = None) -> dict:
                 if isinstance(event, dict):
                     if log_events:
                         _log_sse_event(event)
+                    if event.get("type") == "codex.rate_limits" and on_rate_limits is not None:
+                        on_rate_limits(event)
                     events.append(event)
                     note_event(event)
     except (TimeoutError, socket.timeout) as exc:
@@ -510,13 +861,25 @@ def _parse_response_body(content_type: str, payload: bytes) -> dict:
     raise CodexError(f"Unexpected Codex Content-Type: {content_type!r}")
 
 
-def _parse_http_response(response, timeouts: StreamTimeouts | None = None) -> dict:
+def _parse_http_response(
+    response,
+    timeouts: StreamTimeouts | None = None,
+    auth: CodexAuth | None = None,
+) -> dict:
     content_type = ""
-    if getattr(response, "headers", None):
-        content_type = response.headers.get("Content-Type", "") or ""
+    headers = getattr(response, "headers", None)
+    if headers:
+        content_type = headers.get("Content-Type", "") or ""
+        rate_limits = _rate_limits_from_headers(headers)
+        if rate_limits is not None and auth is not None:
+            auth.save_rate_limits(rate_limits)
     lowered = content_type.lower()
     if "text/event-stream" in lowered:
-        return parse_sse(response, timeouts=timeouts)
+        return parse_sse(
+            response,
+            timeouts=timeouts,
+            on_rate_limits=auth.save_rate_limits if auth is not None else None,
+        )
     if "json" in lowered:
         payload = response.read()
         result = _parse_json_payload(payload)
@@ -538,7 +901,11 @@ def _parse_http_response(response, timeouts: StreamTimeouts | None = None) -> di
             logger.info("---------- FROM LLM ----------")
             logger.info(payload.decode("utf-8", "replace"))
         return result
-    return parse_sse(_PrefixedStream(first, response), timeouts=timeouts)
+    return parse_sse(
+        _PrefixedStream(first, response),
+        timeouts=timeouts,
+        on_rate_limits=auth.save_rate_limits if auth is not None else None,
+    )
 
 
 class _PrefixedStream:
@@ -592,6 +959,7 @@ def _normalize_stream_timeouts(
 
 
 def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts) -> dict:
+    auth.select_credential(timeout=timeouts.first_byte)
     encoded = json.dumps(body, separators=(",", ":")).encode()
     for attempt in range(2):
         auth.ensure_valid()
@@ -608,7 +976,7 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts) -> dict:
             logger.debug(encoded.decode("utf-8"))
         try:
             with urllib.request.urlopen(request, timeout=timeouts.first_byte) as response:
-                return _parse_http_response(response, timeouts=timeouts)
+                return _parse_http_response(response, timeouts=timeouts, auth=auth)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
             if logger.isEnabledFor(logging.INFO):
@@ -617,6 +985,8 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts) -> dict:
             if exc.code == 401 and attempt == 0:
                 auth.refresh()
                 continue
+            if exc.code == 429:
+                auth.expire_rate_limits()
             raise CodexError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
         except CodexStallError:
             raise

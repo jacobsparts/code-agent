@@ -20,22 +20,39 @@ cp .env.example .env
 ## Codex transport
 
 The built-in Codex transport uses ChatGPT OAuth credentials rather than an API
-key. Copy the credential file created by the official Codex client:
+key. Create `~/.code-agent/codex-auth.json` with a non-empty credential list:
 
-```bash
-mkdir -p ~/.code-agent
-cp ~/.codex/auth.json ~/.code-agent/codex-auth.json
-chmod 600 ~/.code-agent/codex-auth.json
+```json
+{
+  "credentials": [
+    {
+      "auth_mode": "chatgpt",
+      "tokens": {
+        "access_token": "...",
+        "refresh_token": "...",
+        "id_token": "...",
+        "account_id": "..."
+      },
+      "last_refresh": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
 ```
 
-Then select the registered model:
+The token fields for each entry can be copied from an official Codex
+`auth.json`. Add more entries to route requests across multiple ChatGPT
+accounts.
 
 ```bash
+chmod 600 ~/.code-agent/codex-auth.json
 coda --model codex/gpt-5.6-luna
 ```
 
 The transport refreshes expiring access tokens and atomically saves refreshed
-credentials with owner-only permissions.
+credentials with owner-only permissions. With multiple credentials it refreshes
+quota snapshots older than one hour through the Codex usage endpoint and
+selects an account according to remaining quota and reset time. A single
+credential skips quota preflight.
 
 ## `~/.code-agent/config.py`
 
