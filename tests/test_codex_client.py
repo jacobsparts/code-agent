@@ -3,6 +3,7 @@ import os
 import stat
 import subprocess
 import sys
+import uuid
 from io import BytesIO
 
 import pytest
@@ -180,11 +181,60 @@ def test_responses_adds_transport_defaults(monkeypatch, tmp_path):
     assert response is native_response
     assert captured["timeout"] == 17
     assert captured["body"]["input"] == request_body["input"]
+    assert captured["body"]["instructions"] == ""
     assert captured["body"]["tools"] == request_body["tools"]
     assert captured["body"]["stream"] is True
     assert captured["body"]["store"] is False
+    assert captured["body"]["tool_choice"] == "auto"
     assert captured["body"]["parallel_tool_calls"] is True
+    assert captured["body"]["prompt_cache_key"] == codex.SESSION_ID
     assert captured["body"]["include"] == ["reasoning.encrypted_content"]
+
+
+def test_responses_maps_system_to_developer_without_mutating_request(monkeypatch, tmp_path):
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
+    captured = {}
+
+    def request(auth_arg, body, timeout):
+        captured["body"] = body
+        return {"status": "completed", "output": []}
+
+    monkeypatch.setattr(codex, "_request", request)
+    request_body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "contract"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "task"}],
+            },
+        ],
+    }
+
+    codex.responses(request_body, auth=auth)
+
+    assert captured["body"]["instructions"] == ""
+    assert [item["role"] for item in captured["body"]["input"]] == [
+        "developer",
+        "user",
+    ]
+    assert request_body["input"][0]["role"] == "system"
+
+
+def test_headers_reuse_process_session_id(tmp_path):
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
+
+    first = codex._headers(auth)
+    second = codex._headers(auth)
+
+    assert first["Session_id"] == codex.SESSION_ID
+    assert second["Session_id"] == codex.SESSION_ID
+    assert uuid.UUID(codex.SESSION_ID).version == 7
 
 
 def test_responses_request_adds_explicit_cache_breakpoints(monkeypatch):

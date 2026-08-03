@@ -24,6 +24,22 @@ REFRESH_WINDOW_MINUTES = 5
 MAX_REFRESH_AGE_DAYS = 8
 
 
+def _uuid7() -> str:
+    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    random_bits = int.from_bytes(os.urandom(10), "big")
+    value = (
+        (timestamp_ms & ((1 << 48) - 1)) << 80
+        | 0x7 << 76
+        | ((random_bits >> 62) & 0xFFF) << 64
+        | 0b10 << 62
+        | (random_bits & ((1 << 62) - 1))
+    )
+    return str(uuid.UUID(int=value))
+
+
+SESSION_ID = _uuid7()
+
+
 class CodexError(Exception):
     pass
 
@@ -323,7 +339,7 @@ def _headers(auth: CodexAuth) -> dict[str, str]:
         "Openai-Beta": "responses=experimental",
         "Originator": "codex_cli_rs",
         "User-Agent": f"codex_cli_rs/{CLIENT_VERSION}",
-        "Session_id": str(uuid.uuid4()),
+        "Session_id": SESSION_ID,
         "Version": CLIENT_VERSION,
         "Accept": "text/event-stream",
     }
@@ -399,9 +415,12 @@ def responses(
     request_body = dict(body)
     request_body.pop("prompt_cache_options", None)
     request_body["input"] = copy.deepcopy(body["input"])
+    request_body.setdefault("instructions", "")
     for item in request_body["input"]:
         if not isinstance(item, dict):
             continue
+        if item.get("role") == "system":
+            item["role"] = "developer"
         content = item.get("content")
         if isinstance(content, list):
             for block in content:
@@ -409,6 +428,8 @@ def responses(
                     block.pop("prompt_cache_breakpoint", None)
     request_body["stream"] = True
     request_body.setdefault("store", False)
+    request_body["tool_choice"] = "auto"
     request_body.setdefault("parallel_tool_calls", True)
+    request_body.setdefault("prompt_cache_key", SESSION_ID)
     request_body.setdefault("include", ["reasoning.encrypted_content"])
     return _request(auth or CodexAuth(), request_body, timeout)
