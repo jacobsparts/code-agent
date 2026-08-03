@@ -14,7 +14,7 @@ from collections import defaultdict
 from .utils import throttle, UsageTracker
 from .llm_registry import get_model_config
 from .conversation import Conversation
-from . import cursor
+from . import codex, cursor
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, normalize_openai_repl_response, project_openai_repl_messages
 
@@ -271,15 +271,17 @@ class LLMClient:
             finally:
                 conn.close()
 
-    def _call_responses(self, messages, tools):
+    def _responses_request(self, messages, tools):
         config = dict(self.model_config.get('config', {}))
         if 'reasoning_effort' in config:
             config['reasoning'] = {'effort': config.pop('reasoning_effort')}
         if 'max_tokens' in config:
             config['max_output_tokens'] = config.pop('max_tokens')
         input_items = []
+        has_cache_breakpoint = False
         for message in messages:
             role = message.get('role')
+            cache_breakpoint = bool(message.get('_prompt_cache_breakpoint'))
             if role == 'tool':
                 input_items.append({
                     'type': 'function_call_output',
@@ -311,6 +313,12 @@ class LLMClient:
                     blocks.append({'type': 'input_text', 'text': block.get('text', '')})
                 else:
                     blocks.append(dict(block))
+            if cache_breakpoint and blocks:
+                blocks[-1] = {
+                    **blocks[-1],
+                    'prompt_cache_breakpoint': {'mode': 'explicit'},
+                }
+                has_cache_breakpoint = True
             if blocks:
                 input_items.append({'role': role, 'content': blocks})
             for call in message.get('tool_calls') or []:
@@ -325,8 +333,57 @@ class LLMClient:
         for tool in ([REPL_EXECUTE_TOOL] if self.tool_mode == 'repl_execute' else tools or []):
             response_tools.append({'type': 'function', **tool.get('function', tool)})
         req = {'model': self.model_config['model'], 'input': input_items, **config}
+        if has_cache_breakpoint:
+            req.setdefault('prompt_cache_options', {'mode': 'explicit'})
         if response_tools:
             req['tools'] = response_tools
+        return req
+
+    def _parse_responses_result(self, response_json):
+        output = response_json.get('output')
+        if not isinstance(output, list):
+            raise Exception(f"output missing from response: {response_json}")
+        text = []
+        calls = []
+        for item in output:
+            if item.get('type') == 'message':
+                text.extend(
+                    block['text'] for block in item.get('content', [])
+                    if block.get('type') in ('output_text', 'text') and block.get('text')
+                )
+            elif item.get('type') == 'output_text' and item.get('text'):
+                text.append(item['text'])
+            elif item.get('type') == 'function_call':
+                calls.append({
+                    'id': item.get('call_id') or item.get('id'),
+                    'type': 'function',
+                    'function': {
+                        'name': item.get('name'),
+                        'arguments': item.get('arguments', ''),
+                    },
+                })
+        if not text and isinstance(response_json.get('output_text'), str):
+            text.append(response_json['output_text'])
+        message = {'role': 'assistant', 'content': ''.join(text)}
+        if calls:
+            message['tool_calls'] = calls
+        if self.tool_mode == 'repl_execute':
+            message = normalize_openai_repl_response(message)
+        if usage := response_json.get('usage'):
+            self.usage_tracker.log(self.model_name, usage)
+            self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+        incomplete = response_json.get('incomplete_details') or {}
+        message['_stop_reason'] = incomplete.get('reason')
+        if message['_stop_reason'] is None:
+            message['_stop_reason'] = (
+                'tool_calls' if calls
+                else 'stop' if response_json.get('status') == 'completed'
+                else response_json.get('status')
+            )
+        return message
+
+    def _call_responses(self, messages, tools):
+        req = self._responses_request(messages, tools)
         if self.model_config['port'] == 443:
             conn = http.client.HTTPSConnection(self.model_config['host'], timeout=self.timeout)
             conn.connect()
@@ -346,12 +403,7 @@ class LLMClient:
                 logger.debug("----------- TO LLM -----------")
                 logger.debug(f"POST {request_path} {headers}")
                 logger.debug(body)
-            conn.request(
-                'POST',
-                request_path,
-                body,
-                headers,
-            )
+            conn.request('POST', request_path, body, headers)
             response = conn.getresponse()
             response_data = response.read().decode()
             if logger.isEnabledFor(logging.INFO):
@@ -361,47 +413,7 @@ class LLMClient:
                 raise BadRequestError(response_data.strip())
             if response.status != 200:
                 raise Exception(f"API Error {response.status}: {response_data}")
-            response_json = json.loads(response_data)
-            output = response_json.get('output')
-            if not isinstance(output, list):
-                raise Exception(f"output missing from response: {response_json}")
-            text = []
-            calls = []
-            for item in output:
-                if item.get('type') == 'message':
-                    text.extend(
-                        block['text'] for block in item.get('content', [])
-                        if block.get('type') in ('output_text', 'text') and block.get('text')
-                    )
-                elif item.get('type') == 'output_text' and item.get('text'):
-                    text.append(item['text'])
-                elif item.get('type') == 'function_call':
-                    calls.append({
-                        'id': item.get('call_id') or item.get('id'),
-                        'type': 'function',
-                        'function': {
-                            'name': item.get('name'),
-                            'arguments': item.get('arguments', ''),
-                        },
-                    })
-            if not text and isinstance(response_json.get('output_text'), str):
-                text.append(response_json['output_text'])
-            message = {'role': 'assistant', 'content': ''.join(text)}
-            if calls:
-                message['tool_calls'] = calls
-            if self.tool_mode == 'repl_execute':
-                message = normalize_openai_repl_response(message)
-            if usage := response_json.get('usage'):
-                self.usage_tracker.log(self.model_name, usage)
-                self._update_input_tokens_per_byte(self._current_input_bytes, usage)
-            incomplete = response_json.get('incomplete_details') or {}
-            message['_stop_reason'] = incomplete.get('reason')
-            if message['_stop_reason'] is None:
-                message['_stop_reason'] = (
-                    'stop' if response_json.get('status') == 'completed'
-                    else response_json.get('status')
-                )
-            return message
+            return self._parse_responses_result(json.loads(response_data))
         finally:
             conn.close()
 
@@ -430,6 +442,16 @@ class LLMClient:
             self._update_input_tokens_per_byte(self._current_input_bytes, usage)
         message["_stop_reason"] = stop_reason
         return message
+
+    def _call_codex(self, messages, tools):
+        req = self._responses_request(messages, tools)
+        throttle(
+            self.model_config["provider"],
+            self.model_config.get("tpm", 5),
+        )
+        return self._parse_responses_result(
+            codex.responses(req, timeout=self.timeout)
+        )
 
     def _call_messages(self, messages, tools):
         """
@@ -680,6 +702,8 @@ class LLMClient:
             return self._call_messages(messages, tools)
         elif self.model_config['api_type'] == "cursor":
             return self._call_cursor(messages, tools)
+        elif self.model_config['api_type'] == "codex":
+            return self._call_codex(messages, tools)
         elif self.model_config['api_type'] == "gemini":
             return self._call_gemini(messages, tools)
         else:

@@ -796,6 +796,70 @@ def test_closed_post_ignores_stale_selector_event():
     request.run(selectors.EVENT_READ | selectors.EVENT_WRITE)
 
 
+def test_post_request_does_not_force_connection_close():
+    request = object.__new__(cursor._PostRequest)
+    request.parts = cursor.urlsplit("https://api.example.test/append")
+    request.port = 443
+    request.body = b"payload"
+    request.headers = {}
+    request.client = type("Client", (), {"headers": {}})()
+    request.outgoing = bytearray()
+
+    request._prepare_request()
+
+    headers = bytes(request.outgoing).split(b"\r\n\r\n", 1)[0]
+    assert b"Connection: close" not in headers
+
+
+def test_post_response_returns_persistent_socket_to_pool():
+    returned = []
+    responses = []
+    sock = type(
+        "Socket",
+        (),
+        {"close": lambda self: pytest.fail("socket should be reused")},
+    )()
+    selector = type(
+        "Selector",
+        (),
+        {"unregister": lambda self, value: None},
+    )()
+    client = type(
+        "Client",
+        (),
+        {
+            "_posts": set(),
+            "_return_post_connection": (
+                lambda self, parts, value: returned.append((parts, value))
+            ),
+        },
+    )()
+    request = object.__new__(cursor._PostRequest)
+    request.finished = False
+    request.response_headers = {"content-length": "0"}
+    request.chunked = False
+    request.content_remaining = 0
+    request.sock = sock
+    request.selector = selector
+    request.client = client
+    request.parts = cursor.urlsplit("https://api.example.test/append")
+    request.status = 200
+    request.response_body = bytearray()
+    request.callback = responses.append
+    client._posts.add(request)
+
+    request._complete()
+
+    assert returned == [(request.parts, sock)]
+    assert request.sock is None
+    assert request not in client._posts
+    assert responses == [{
+        "status": 200,
+        "headers": {"content-length": "0"},
+        "body": b"",
+    }]
+
+
 def test_sse_grace_period_closes_transport(monkeypatch):
     client = object.__new__(cursor.SSEClient)
     client.closed = False
@@ -905,9 +969,10 @@ def test_latest_blob_response_completion_arms_timeout(monkeypatch):
             self.headers_callback(200, {})
             self.stream_callback(_get_blob_frame(1))
             self.stream_callback(_get_blob_frame(2, b"c" * 32))
-            assert len(blob_callbacks) == 2
+            assert len(blob_callbacks) == 1
             blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
             assert armed == []
+            assert len(blob_callbacks) == 2
             blob_callbacks[1]({"status": 200, "headers": {}, "body": b""})
             assert armed == [cursor.POST_BLOB_PROGRESS_TIMEOUT]
             self.close()

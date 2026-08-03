@@ -54,6 +54,7 @@ class UsageTracker:
         openai_cached_tokens = self._coalesce_paths(usage, [
             'native_tokens_cached',
             ('prompt_tokens_details', 'cached_tokens'),
+            ('input_tokens_details', 'cached_tokens'),
         ])
         # Anthropic-style: cache tokens are separate from input_tokens (already excluded)
         anthropic_cached_tokens = usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)

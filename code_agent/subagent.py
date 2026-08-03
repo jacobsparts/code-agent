@@ -15,6 +15,7 @@ Spawn isolated Code Agent instances as subprocesses with socket communication.
 
     # Follow-up in same session
     response = agent.send("Now add tests")
+    agent.close()
 
 ## Long-running Tasks
 
@@ -53,12 +54,23 @@ text, for example: `<SubagentResponse status='running', turns=3, progress_update
     for r in responses:
         r.wait()
         print(r.result)
+    for agent in agents:
+        agent.close()
+
+Keep every agent in `agents` until its task is complete. Close each agent
+explicitly when it is no longer needed.
 
 ## Session Continuity
 
     agent = Subagent()
     agent.send("Read main.py and understand the structure")
     agent.send("Now add error handling to the parse function")  # Follows up
+    agent.close()
+
+Keep an explicit reference to each subagent for its whole lifetime. Call
+`close()` as soon as its work and any follow-ups are complete. `__del__`
+provides best-effort cleanup if a reference is accidentally lost, but should
+not be used as the normal lifecycle mechanism.
 
 ## Model Configuration
 
@@ -75,7 +87,7 @@ are serialized into the response text when available.
 
 ## Attributes
 
-    Subagent: .id, .cwd, .model, .done, .result, .send(), .wait(), .kill()
+    Subagent: .id, .cwd, .model, .done, .result, .send(), .wait(), .kill(), .close()
     SubagentResponse: .done, .result, .progress, .turns, .is_error, .error, .wait()
 """
 
@@ -88,6 +100,7 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 from typing import Any, Optional
 
 try:
@@ -254,9 +267,11 @@ def worker_main(port, authkey, model, max_turns):
             self.max_turns = default_max_turns
             self._turn_count = 0
             super().__init__()
+            self.output_hook = self._subagent_output_hook
 
         # Disable CLI display hooks, but report turns to the parent.
         def on_repl_execute(self, code):
+            super().on_repl_execute(code)
             self._turn_count += 1
             _send_msg(self._host_sock, ("turn", self._turn_count))
 
@@ -269,42 +284,12 @@ def worker_main(port, authkey, model, max_turns):
         def on_statement_events(self, events):
             pass
 
-        def _handle_tool_request(self, repl, req):
-            """Send emit progress/results via socket; delegate other tools normally."""
-            tool_name = req.get('tool')
-            if tool_name != '__emit__':
-                return super()._handle_tool_request(repl, req)
-
-            request_id = req.get('request_id')
-            args = req.get('args', {})
-
-            def _deserialize(x):
-                if isinstance(x, dict) and "__b64__" in x:
-                    import base64
-                    return base64.b64decode(x["__b64__"])
-                if isinstance(x, list):
-                    return [_deserialize(i) for i in x]
-                if isinstance(x, dict):
-                    return {k: _deserialize(v) for k, v in x.items()}
-                return x
-
-            args = {k: _deserialize(v) for k, v in args.items()}
-            self._publish_tool_event("tool_called", "emit", args=args)
-
-            try:
-                value = args.get('value')
-                release = args.get('release', False)
-                self._final_result = value
-
-                if release:
-                    self.complete = True
-                    _send_msg(self._host_sock, ("result", str(value) if value is not None else ""))
-                else:
-                    _send_msg(self._host_sock, ("progress", str(value) if value is not None else ""))
-                self._publish_tool_event("tool_returned", "emit", result=None)
-            finally:
-                if request_id is not None:
-                    repl.send_ack(request_id)
+        def _subagent_output_hook(self, value, release):
+            message = str(value) if value is not None else ""
+            _send_msg(
+                self._host_sock,
+                ("result" if release else "progress", message),
+            )
 
     # Create agent
     agent = SubagentWorker(sock, model, max_turns)
@@ -324,23 +309,15 @@ def worker_main(port, authkey, model, max_turns):
                 agent._turn_count = 0
 
                 try:
-                    agent.usermsg(prompt)
-                    result = agent.run_loop(max_turns=task_max_turns)
-
-                    # If loop exited without emit(release=True), send result
-                    if not agent.complete:
-                        result_str = str(result) if result is not None else ""
-                        _send_msg(sock, ("result", result_str))
-
-                    # Reset for next task
-                    agent.complete = False
-                    agent._final_result = None
-
+                    agent.run_interaction(prompt, max_turns=task_max_turns)
                 except KeyboardInterrupt:
                     _send_msg(sock, ("error", "Task interrupted"))
                 except Exception as e:
                     import traceback
                     _send_msg(sock, ("error", f"{type(e).__name__}: {e}\\n{traceback.format_exc()}"))
+                finally:
+                    agent.complete = False
+                    agent._final_result = None
 
             elif cmd_type == "shutdown":
                 break
@@ -383,19 +360,25 @@ class SubagentResponse:
     """
 
     def __init__(self, agent: 'Subagent'):
-        self._agent = agent
+        self._agent_ref = weakref.ref(agent)
         self._result: Optional[str] = None
         self._error: Optional[str] = None
         self._done = False
         self._progress: list[str] = []
         self._turns = 0
 
+    def _agent(self) -> 'Subagent':
+        agent = self._agent_ref()
+        if agent is None:
+            raise RuntimeError("Subagent has been closed")
+        return agent
+
     @property
     def done(self) -> bool:
         """Check if the task has completed."""
         if self._done:
             return True
-        self._agent._poll()
+        self._agent()._poll()
         return self._done
 
     @property
@@ -408,13 +391,15 @@ class SubagentResponse:
     @property
     def progress(self) -> list[str]:
         """Progress updates received so far."""
-        self._agent._poll()
+        if not self._done:
+            self._agent()._poll()
         return list(self._progress)
 
     @property
     def turns(self) -> int:
         """Number of REPL turns started for this task."""
-        self._agent._poll()
+        if not self._done:
+            self._agent()._poll()
         return self._turns
 
     @property
@@ -460,7 +445,7 @@ class SubagentResponse:
 
     def __repr__(self) -> str:
         if not self._done:
-            self._agent._poll()
+            self._agent()._poll()
         status = "running"
         if self._done:
             status = "error" if self._error is not None else "complete"
@@ -474,8 +459,8 @@ class SubagentResponse:
 # Subagent
 # ---------------------------------------------------------------------------
 
-# Global registry of subagents
-_subagents: dict[str, 'Subagent'] = {}
+# Weak registry for inspection; callers must keep explicit references.
+_subagents = weakref.WeakValueDictionary()
 
 
 class Subagent:
@@ -496,6 +481,7 @@ class Subagent:
 
         # Follow-up in same session
         response = agent.send("Now add tests")
+        agent.close()
     """
 
     # Default model set by parent agent via /subagents command.  If unset,
@@ -828,16 +814,10 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
         if self.id in _subagents:
             del _subagents[self.id]
 
-    def __enter__(self) -> 'Subagent':
-        return self
-
-    def __exit__(self, *args) -> None:
-        self.close()
-
     def __del__(self):
         try:
-            self._cleanup()
-        except:
+            self.close()
+        except Exception:
             pass
 
     def __repr__(self) -> str:

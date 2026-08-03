@@ -110,7 +110,7 @@ history and bloating the window.
 - **Auto-attached project context** — `CLAUDE.md` / `AGENTS.md` are loaded automatically at startup, with recursive `@file` reference resolution
 - **MCP support** — external MCP tools exposed as plain Python functions in the REPL
 - **Skills** — attach reusable markdown instruction files as context memory
-- **Provider-agnostic** — Anthropic, OpenAI, Google, OpenRouter, any OpenAI-compatible endpoint
+- **Provider-agnostic** — Anthropic, OpenAI, Google, and any compatible endpoint
 
 ---
 
@@ -150,7 +150,7 @@ coda
 
 Copy `.env.example` to `.env` to persist your API key and preferred model.
 
-Supports Anthropic, OpenAI, Google, X.AI, OpenRouter, and any OpenAI-compatible endpoint.
+Supports Anthropic, OpenAI, Google, X.AI, and any compatible endpoint.
 Custom providers and models (local Ollama, corporate proxies, etc.) are registered in
 `~/.code-agent/config.py`. See [docs/configuration.md](docs/configuration.md).
 

@@ -16,6 +16,7 @@ ExecServerMessage oneof enumeration in EXEC_SERVER_TOOL_FIELDS.
 from __future__ import annotations
 
 import ast
+from collections import deque
 from dataclasses import dataclass, field
 import errno
 import fcntl
@@ -46,7 +47,7 @@ DEFAULT_CLIENT_VERSION = "cli-2026.07.08-0c04a8a"
 DEFAULT_TIMEOUT = 30 * 60
 KEY_EXCHANGE_TIMEOUT = 30
 HEARTBEAT_TIMEOUT = 30
-POST_BLOB_PROGRESS_TIMEOUT = 10
+POST_BLOB_PROGRESS_TIMEOUT = 30
 RESPONSE_USAGE_GRACE_TIMEOUT = 3
 USAGE_LOOKUP_ATTEMPTS = 4
 USAGE_LOOKUP_RETRY_DELAY = 1
@@ -98,6 +99,24 @@ FILTERED_USAGE_PATH = "aiserver.v1.DashboardService/GetFilteredUsageEvents"
 _SESSION_CONVERSATION_ID = str(uuid.uuid4())
 
 DEBUG = True
+
+
+def _debug_bidi_event(event: str, **details) -> None:
+    if not DEBUG:
+        return
+    record = {
+        "timestamp_ns": time.time_ns(),
+        "monotonic_ns": time.monotonic_ns(),
+        "event": event,
+        **details,
+    }
+    path = f"/tmp/coda-cursor-bidi-{_SESSION_CONVERSATION_ID[:8]}.jsonl"
+    try:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
 
 # === Protobuf wire codec ===
 
@@ -1374,7 +1393,19 @@ class _PostRequest:
         self.content_remaining = None
         self.chunk_remaining = None
         self.finished = False
-        self._connect()
+        pooled = self.client._take_post_connection(self.parts)
+        if pooled is None:
+            self._connect()
+        else:
+            self.sock = pooled
+            self.connected = True
+            self.tls_handshake_done = True
+            self.selector.register(
+                self.sock,
+                selectors.EVENT_READ | selectors.EVENT_WRITE,
+                self,
+            )
+            self._prepare_request()
 
     def _connect(self):
         addresses = socket.getaddrinfo(
@@ -1452,7 +1483,6 @@ class _PostRequest:
             "Host": host,
             "Content-Length": str(len(self.body)),
             "Content-Type": "application/octet-stream",
-            "Connection": "close",
             "User-Agent": "stdlib-sse-client/1.0",
         }
         headers.update(self.client.headers)
@@ -1584,7 +1614,21 @@ class _PostRequest:
         if self.finished:
             return
         self.finished = True
-        self.close()
+        reusable = (
+            self.response_headers.get("connection", "").lower() != "close"
+            and not self.chunked
+            and self.content_remaining == 0
+        )
+        if reusable:
+            sock = self.sock
+            try:
+                self.selector.unregister(sock)
+            except (KeyError, ValueError):
+                pass
+            self.sock = None
+            self.client._return_post_connection(self.parts, sock)
+        else:
+            self.close()
         self.client._posts.discard(self)
         if self.callback is not None:
             self.callback({
@@ -1666,8 +1710,10 @@ class SSEClient:
         self.last_event_id = None
         self.retry = None
         self._posts = set()
+        self._idle_post_connections = {}
         self._grace_deadline = None
         self._post_blob_deadline = None
+        self._post_blob_debug = {}
 
         self._parts = urlsplit(url)
         if self._parts.scheme not in ("http", "https"):
@@ -1989,6 +2035,35 @@ class SSEClient:
             event["retry"] = retry
         self.callback(event)
 
+    @staticmethod
+    def _post_connection_key(parts):
+        return (
+            parts.scheme,
+            parts.hostname,
+            parts.port or (443 if parts.scheme == "https" else 80),
+        )
+
+    def _take_post_connection(self, parts):
+        connections = self._idle_post_connections.get(
+            self._post_connection_key(parts)
+        )
+        if not connections:
+            return None
+        sock = connections.pop()
+        if not connections:
+            del self._idle_post_connections[
+                self._post_connection_key(parts)
+            ]
+        return sock
+
+    def _return_post_connection(self, parts, sock):
+        if self.closed:
+            sock.close()
+            return
+        self._idle_post_connections.setdefault(
+            self._post_connection_key(parts), []
+        ).append(sock)
+
     def post(self, url, body=b"", headers=None, callback=None):
         """Start a POST request driven by the same selector as the SSE stream."""
         if self.closed:
@@ -2031,9 +2106,19 @@ class SSEClient:
 
     def arm_post_blob_timeout(self, timeout):
         self._post_blob_deadline = time.monotonic() + timeout
+        details = getattr(self, "_post_blob_debug", {})
+        _debug_bidi_event(
+            "post_blob_timeout_armed", timeout=timeout, **details
+        )
 
     def clear_post_blob_timeout(self):
+        details = getattr(self, "_post_blob_debug", {})
+        if self._post_blob_deadline is not None:
+            _debug_bidi_event(
+                "post_blob_timeout_cleared", **details
+            )
         self._post_blob_deadline = None
+        self._post_blob_debug = {}
 
     def run_forever(
         self, timeout=None, *, heartbeat_timeout=None,
@@ -2066,6 +2151,10 @@ class SSEClient:
             if getattr(self, "_post_blob_deadline", None) is not None:
                 remaining = self._post_blob_deadline - now
                 if remaining <= 0:
+                    _debug_bidi_event(
+                        "post_blob_timeout_expired",
+                        **getattr(self, "_post_blob_debug", {}),
+                    )
                     raise SSEError(
                         "no model progress after blob hydration"
                     )
@@ -2086,6 +2175,13 @@ class SSEClient:
         for request in tuple(self._posts):
             request.close()
         self._posts.clear()
+        idle_connections = getattr(
+            self, "_idle_post_connections", {}
+        )
+        for connections in idle_connections.values():
+            for sock in connections:
+                sock.close()
+        idle_connections.clear()
         self.selector.close()
 
     def __enter__(self):
@@ -3359,6 +3455,12 @@ class CursorClient:
             effective_run_config.conversation_id or _SESSION_CONVERSATION_ID
         )
         request_started_ms = int(time.time() * 1000)
+        _debug_bidi_event(
+            "request_started",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            model=model,
+        )
         input_payload = build_run_request(
             prompt,
             model,
@@ -3394,6 +3496,15 @@ class CursorClient:
             )
             frames.append(frame)
             self.handle_frame(frame)
+            if DEBUG:
+                _debug_bidi_event(
+                    "downlink_frame",
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    classification=frame.classification,
+                    flags=connect.flags,
+                    decoded_payload_hex=connect.decoded_payload.hex(),
+                )
             if is_generation_progress(frame.message):
                 blob_response_generation += 1
                 clear_timeout = getattr(
@@ -3432,7 +3543,14 @@ class CursorClient:
                                     transport, "arm_post_blob_timeout", None
                                 )
                                 if arm_timeout is not None:
-                                    arm_timeout(POST_BLOB_PROGRESS_TIMEOUT)
+                                    transport._post_blob_debug = {
+                                        "request_id": request_id,
+                                        "conversation_id": conversation_id,
+                                        "append_seqno": generation,
+                                    }
+                                    arm_timeout(
+                                        POST_BLOB_PROGRESS_TIMEOUT
+                                    )
 
                         append(kv_response, callback=blob_appended)
                     else:
@@ -3508,6 +3626,8 @@ class CursorClient:
         append_result = []
         append_started = False
         append_seqno = -1
+        append_queue = deque()
+        append_in_flight = False
 
         def appended(response):
             append_result.append(response)
@@ -3520,26 +3640,88 @@ class CursorClient:
             appended(response)
             transport.close()
 
-        def append(payload, callback=appended):
-            nonlocal append_seqno
-            append_seqno += 1
+        def pump_append_queue():
+            nonlocal append_in_flight
+            if append_in_flight or not append_queue or transport.closed:
+                return
+            (
+                seqno,
+                payload,
+                wrapped_payload,
+                classification,
+                callback,
+            ) = append_queue.popleft()
+            append_in_flight = True
+            _debug_bidi_event(
+                "bidi_append_started",
+                request_id=request_id,
+                conversation_id=conversation_id,
+                append_seqno=seqno,
+                classification=classification,
+                payload_hex=payload.hex(),
+                wrapped_payload_hex=wrapped_payload.hex(),
+            )
+
+            def completed(response):
+                nonlocal append_in_flight
+                _debug_bidi_event(
+                    "bidi_append_completed",
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    append_seqno=seqno,
+                    classification=classification,
+                    status=response["status"],
+                    headers=response["headers"],
+                    body_hex=response["body"].hex(),
+                )
+                append_in_flight = False
+                callback(response)
+                pump_append_queue()
+
             transport.post(
                 append_url,
-                build_bidi_append(
-                    request_id,
-                    payload,
-                    append_seqno=append_seqno,
-                ),
+                wrapped_payload,
                 headers={
                     **request_headers,
                     "Content-Type": "application/proto",
                     "Accept": "application/proto",
                 },
-                callback=callback,
+                callback=completed,
             )
+
+        def append(payload, callback=appended):
+            nonlocal append_seqno
+            append_seqno += 1
+            seqno = append_seqno
+            wrapped_payload = build_bidi_append(
+                request_id,
+                payload,
+                append_seqno=seqno,
+            )
+            try:
+                classification = decode_cursor_payload(
+                    payload, "OUT"
+                ).classification
+            except ValueError:
+                classification = "decode_error"
+            append_queue.append((
+                seqno,
+                payload,
+                wrapped_payload,
+                classification,
+                callback,
+            ))
+            pump_append_queue()
 
         def downlink_ready(status, headers):
             nonlocal append_started
+            _debug_bidi_event(
+                "downlink_ready",
+                request_id=request_id,
+                conversation_id=conversation_id,
+                status=status,
+                headers=headers,
+            )
             if append_started:
                 return
             append_started = True
@@ -3579,6 +3761,14 @@ class CursorClient:
                     break
                 if attempt + 1 < USAGE_LOOKUP_ATTEMPTS:
                     time.sleep(USAGE_LOOKUP_RETRY_DELAY)
+        _debug_bidi_event(
+            "request_completed",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            frame_count=len(frames),
+            turn_ended=turn_ended,
+            eos_error=eos_error,
+        )
         return RunResult(
             frames,
             "".join(text_parts),

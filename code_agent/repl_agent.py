@@ -1035,7 +1035,9 @@ Call help(function_name) for parameter descriptions.
             if hasattr(self, '_on_assistant_message_committed'):
                 self._on_assistant_message_committed(self.conversation.messages[-1])
             self._coalesce_context()
-            return self.llm_client.text_call(self.conversation._messages())
+            return self.llm_client.text_call(
+                self.conversation._messages()
+            )
 
 
 
@@ -1082,12 +1084,12 @@ Call help(function_name) for parameter descriptions.
                                 self.on_retry("native_repl", native_retry)
                             _emit_event("native_repl_retry", attempt=native_retry)
                             messages = self.conversation._messages() + [{
-                                "role": "user",
-                                "content": repl_retry_hint(
-                                    getattr(self.llm_client, "tool_mode", None),
-                                    exc,
-                                ),
-                            }]
+                                    "role": "user",
+                                    "content": repl_retry_hint(
+                                        getattr(self.llm_client, "tool_mode", None),
+                                        exc,
+                                    ),
+                                }]
                             continue
                     except KeyboardInterrupt:
                         # User interrupted LLM call - subprocess may also have received SIGINT
@@ -1176,9 +1178,9 @@ Call help(function_name) for parameter descriptions.
                         "Return only valid Python code."
                     )
                     messages = self.conversation._messages() + [
-                        {"role": "assistant", "content": content},
-                        {"role": "user", "content": f"{output}\n{hint}"}
-                    ]
+                            {"role": "assistant", "content": content},
+                            {"role": "user", "content": f"{output}\n{hint}"}
+                        ]
                 else:
                     # All retries exhausted
                     print(f"\n*** CRASH: Model failed to produce valid Python after {max_syntax_retries} retries ***", file=sys.stderr)

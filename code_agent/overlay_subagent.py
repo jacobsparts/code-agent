@@ -10,6 +10,7 @@ import difflib
 import io
 import os
 import stat
+import weakref
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -1264,26 +1265,245 @@ def assert_overlay_quiescent(
         )
 
 
-def seal_overlay_worker(config: Mapping[str, Any]) -> dict[str, list[str]]:
-    runtime_id = str(config["runtime_id"])
-    home = Path(config["home"])
-    lower_view = Path(config["lower_view"])
-    upper_dir = Path(config["upper_dir"])
-    work_dir = Path(config["work_dir"])
-    project_cwd = Path(config["project_cwd"])
-    lower_sources = [Path(path) for path in config["lower_sources"]]
-
-    os.chdir("/")
-    unmount_overlay(home, runtime_id)
-    unmount_overlay(lower_view, runtime_id)
-    mount_lower_view(lower_sources, lower_view, runtime_id)
-    mount_overlay(lower_sources, upper_dir, work_dir, home, runtime_id)
-    os.chdir(project_cwd)
-    return {"lower_sources": [str(path) for path in lower_sources]}
 
 
-def _overlay_emit_code() -> str:
-    return r"""
+class _WorkerOverlayOwner:
+    def __init__(
+        self,
+        runtime_config,
+        model,
+        max_turns,
+        spawn_worker,
+        stop_worker,
+        infrastructure_pids,
+    ):
+        self.project_root = Path(runtime_config["project_cwd"])
+        self.model = model
+        self.max_turns = max_turns
+        self.snapshot_byte_limit = runtime_config["snapshot_byte_limit"]
+        self.snapshot_inode_limit = runtime_config["snapshot_inode_limit"]
+        self.snapshot_timeout = runtime_config["snapshot_timeout"]
+        self.snapshot_min_free_bytes = runtime_config["snapshot_min_free_bytes"]
+        self.lower_view_dir = Path(runtime_config["lower_view"])
+        self.lower_sources = [
+            Path(path) for path in runtime_config["lower_sources"]
+        ]
+        self.upper_dir = Path(runtime_config["upper_dir"])
+        self.work_dir = Path(runtime_config["work_dir"])
+        self.runtime_dir = self.upper_dir.parent
+        self.runtime_config = runtime_config
+        self._spawn_worker = spawn_worker
+        self._stop_worker = stop_worker
+        self._infrastructure_pids = infrastructure_pids
+        self._children = []
+        self._seal_generation = 0
+        self._closed = False
+
+    def _create_child(
+        self,
+        cwd,
+        model,
+        max_turns,
+        snapshot_byte_limit,
+        snapshot_inode_limit,
+        snapshot_timeout,
+        snapshot_min_free_bytes,
+        recursive,
+    ):
+        return OverlaySubagent(
+            cwd=cwd or str(self.project_root),
+            model=model or self.model,
+            max_turns=max_turns,
+            _parent_overlay=self,
+            snapshot_byte_limit=snapshot_byte_limit,
+            snapshot_inode_limit=snapshot_inode_limit,
+            snapshot_timeout=snapshot_timeout,
+            snapshot_min_free_bytes=snapshot_min_free_bytes,
+            recursive=recursive,
+        )
+
+    def _seal(self):
+        import shutil
+
+        managed_child_pids = [
+            child._transport._proc.pid
+            for child in self._children
+            if child._transport._proc is not None
+            and child._transport._proc.poll() is None
+        ]
+        assert_overlay_quiescent(
+            managed_child_pids=managed_child_pids,
+            infrastructure_pids=self._infrastructure_pids,
+            runtime_id=str(self.runtime_config["runtime_id"]),
+        )
+        generation = self._seal_generation + 1
+        sealed_upper = self.runtime_dir / f"sealed-child-{generation}"
+        sealed_upper.mkdir()
+        try:
+            validate_snapshot_capacity(
+                self.upper_dir,
+                self.runtime_dir,
+                byte_limit=self.snapshot_byte_limit,
+                inode_limit=self.snapshot_inode_limit,
+                min_free_bytes=self.snapshot_min_free_bytes,
+                runtime_id=str(self.runtime_config["runtime_id"]),
+            )
+            clone_overlay_layer(
+                self.upper_dir,
+                sealed_upper,
+                str(self.runtime_config["runtime_id"]),
+                timeout=self.snapshot_timeout,
+            )
+        except Exception:
+            shutil.rmtree(sealed_upper, ignore_errors=True)
+            raise
+
+        self._seal_generation = generation
+        return [sealed_upper, *self.lower_sources]
+
+    def _spawn_child_worker(self, child, bootstrap):
+        pid = self._spawn_worker(
+            bootstrap,
+            str(child.project_root),
+            child.runtime_config["session_db"],
+        )
+        child._transport._proc = _InheritedProcess(pid)
+
+    def _release_child_worker(self, pid):
+        if not self._closed:
+            self._stop_worker(pid)
+
+    def close(self):
+        if self._closed:
+            return
+        for child in reversed(list(self._children)):
+            child.close()
+        self._children.clear()
+        self._closed = True
+
+
+def _overlay_repl_code(recursive: bool) -> str:
+    code = r"""
+def _overlay_request(action, **kwargs):
+    global _request_id
+    _request_id += 1
+    req_id = _request_id
+    import json as _json
+    _send_tool_request(_json.dumps({
+        "tool": "__overlay_child__",
+        "args": {"action": action, **kwargs},
+        "request_id": req_id,
+    }))
+    return _wait_for_ack(req_id)
+
+
+class OverlayChildResponse:
+    def __init__(self, handle):
+        self._handle = handle
+
+    def _status(self):
+        return _overlay_request("response_status", response=self._handle)
+
+    @property
+    def result(self):
+        return self._status()["result"]
+
+    @property
+    def files(self):
+        return self._status()["files"]
+
+    @property
+    def progress(self):
+        return self._status()["progress"]
+
+    @property
+    def turns(self):
+        return self._status()["turns"]
+
+    @property
+    def done(self):
+        return self._status()["done"]
+
+    @property
+    def is_error(self):
+        return self._status()["is_error"]
+
+    @property
+    def error(self):
+        return self._status()["error"]
+
+    @property
+    def submission_error(self):
+        return self._status()["submission_error"]
+
+    def wait(self, timeout=None):
+        _overlay_request("response_wait", response=self._handle, timeout=timeout)
+        return self
+
+    def diff(self, paths=None):
+        return _overlay_request("response_diff", response=self._handle, paths=paths)
+
+    def apply(self, paths=None):
+        return _overlay_request("response_apply", response=self._handle, paths=paths)
+
+
+class OverlaySubagent:
+    def __init__(
+        self,
+        cwd=None,
+        model=None,
+        max_turns=50,
+        snapshot_byte_limit=1073741824,
+        snapshot_inode_limit=250000,
+        snapshot_timeout=120.0,
+        snapshot_min_free_bytes=536870912,
+        recursive=False,
+    ):
+        if not __OVERLAY_RECURSIVE__:
+            raise RuntimeError(
+                "recursive overlay subagents require OverlaySubagent(recursive=True)"
+            )
+        self._handle = _overlay_request(
+            "child_create",
+            cwd=cwd,
+            model=model,
+            max_turns=max_turns,
+            snapshot_byte_limit=snapshot_byte_limit,
+            snapshot_inode_limit=snapshot_inode_limit,
+            snapshot_timeout=snapshot_timeout,
+            snapshot_min_free_bytes=snapshot_min_free_bytes,
+            recursive=recursive,
+        )
+        self._closed = False
+
+    def send(self, prompt, *, bg=False, max_turns=None, timeout=None):
+        response = _overlay_request(
+            "child_send",
+            child=self._handle,
+            prompt=prompt,
+            bg=bg,
+            max_turns=max_turns,
+            timeout=timeout,
+        )
+        return OverlayChildResponse(response)
+
+    def close(self):
+        if self._closed:
+            return
+        _overlay_request("child_close", child=self._handle)
+        self._closed = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+import code_agent.overlay_subagent as _overlay_subagent_module
+_overlay_subagent_module.OverlaySubagent = OverlaySubagent
+
+
 def emit(value, release=False, files=None):
     if files is not None and not release:
         raise ValueError("files may only be provided with release=True")
@@ -1300,6 +1520,7 @@ def emit(value, release=False, files=None):
     }))
     _wait_for_ack(req_id)
 """
+    return code.replace("__OVERLAY_RECURSIVE__", repr(recursive), 1)
 
 
 def _build_overlay_worker_code() -> str:
@@ -1313,6 +1534,7 @@ def _build_overlay_worker_code() -> str:
     code = code.replace(
         "    # Connect to host",
         """    import os
+    import subprocess
     from code_agent.overlay_subagent import (
         set_parent_death_signal,
         setup_overlay_worker,
@@ -1320,6 +1542,7 @@ def _build_overlay_worker_code() -> str:
     )
 
     overlay_children = {}
+    overlay_owner = None
 
     def _stop_overlay_child(pid):
         entry = overlay_children.pop(pid, None)
@@ -1342,8 +1565,37 @@ def _build_overlay_worker_code() -> str:
         return True
 
     def _shutdown_overlay_children():
+        if overlay_owner is not None:
+            overlay_owner.close()
         for pid in reversed(list(overlay_children)):
             _stop_overlay_child(pid)
+
+    def _spawn_overlay_child(bootstrap, cwd, session_db):
+        liveness_read_fd, liveness_write_fd = os.pipe()
+        env = os.environ.copy()
+        env["OVERLAY_LIVENESS_FD"] = str(liveness_read_fd)
+        env["OVERLAY_OWNER_PID"] = str(os.getpid())
+        env["CODE_AGENT_SESSION_DB"] = session_db
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+                pass_fds=(liveness_read_fd,),
+                env=env,
+            )
+        except Exception:
+            os.close(liveness_read_fd)
+            os.close(liveness_write_fd)
+            raise
+        os.close(liveness_read_fd)
+        child.stdin.write(bootstrap.encode())
+        child.stdin.close()
+        overlay_children[child.pid] = (child, liveness_write_fd)
+        return child.pid
 
     _overlay_liveness_fd = int(os.environ["OVERLAY_LIVENESS_FD"])
     _overlay_owner_pid = int(os.environ["OVERLAY_OWNER_PID"])
@@ -1361,6 +1613,25 @@ def _build_overlay_worker_code() -> str:
         configure_death_signal=False,
     )
 
+    # ToolREPL uses multiprocessing fork. Fork clears PDEATHSIG and removes the
+    # monitor thread, so re-arm both protections in every ToolREPL child.
+    import code_agent.repl_agent as _overlay_repl_agent
+    _ordinary_tool_worker_main = _overlay_repl_agent._tool_worker_main
+
+    def _overlay_tool_worker_main(*args, **kwargs):
+        tool_owner_pid = os.getppid()
+        set_parent_death_signal(tool_owner_pid, _overlay_runtime_id)
+        start_parent_liveness_monitor(
+            _overlay_liveness_fd,
+            tool_owner_pid,
+            lambda: None,
+            runtime_id=_overlay_runtime_id,
+            configure_death_signal=False,
+        )
+        return _ordinary_tool_worker_main(*args, **kwargs)
+
+    _overlay_repl_agent._tool_worker_main = _overlay_tool_worker_main
+
     # Connect to host""",
         1,
     )
@@ -1368,80 +1639,239 @@ def _build_overlay_worker_code() -> str:
         "    from code_agent.agent import CodeAgent",
         """    from code_agent.agent import CodeAgent
     from code_agent.overlay_subagent import (
-        _overlay_emit_code,
+        _WorkerOverlayOwner,
+        _overlay_repl_code,
         assert_overlay_quiescent,
         direct_child_pids,
         materialize_submitted_files,
-        seal_overlay_worker,
         submitted_files_to_payload,
     )""",
         1,
     )
     code = code.replace(
         """            super().__init__()
-
-        # Disable CLI display hooks""",
+            self.output_hook = self._subagent_output_hook""",
         """            self._overlay_runtime_config = runtime_config
             self._overlay_emit_injected = False
+            self._overlay_submitted_files = None
+            self._overlay_owner = None
+            self._overlay_children = {}
+            self._overlay_responses = {}
+            self._overlay_next_handle = 0
             super().__init__()
-
-        def _get_tool_repl(self):
+            self.output_hook = self._overlay_output_hook""",
+        1,
+    )
+    code = code.replace(
+        """    # Create agent
+    agent = SubagentWorker(sock, model, max_turns)
+""",
+        """    # Create agent
+    agent = SubagentWorker(sock, model, max_turns)
+    if runtime_config["recursive"]:
+        ok, message = agent.attach_skill("overlay_subagent_worker")
+        if not ok:
+            raise RuntimeError(message)
+""",
+        1,
+    )
+    worker_adapter_start = "        # Disable CLI display hooks, but report turns to the parent."
+    worker_adapter_end = "    # Create agent"
+    adapter_start = code.index(worker_adapter_start)
+    adapter_end = code.index(worker_adapter_end, adapter_start)
+    new_worker_adapter = """        def _get_tool_repl(self):
             repl = super()._get_tool_repl()
             if not self._overlay_emit_injected:
-                repl._inject_code(_overlay_emit_code())
+                repl._inject_code(
+                    _overlay_repl_code(self._overlay_runtime_config["recursive"])
+                )
                 self._overlay_emit_injected = True
             worker = getattr(repl, "_worker", None)
             if worker is not None and worker.pid is not None:
                 overlay_infrastructure_pids.add(worker.pid)
             return repl
 
-        # Disable CLI display hooks""",
-        1,
-    )
-    old_emit = """                value = args.get('value')
-                release = args.get('release', False)
-                self._final_result = value
+        @staticmethod
+        def _deserialize_overlay_value(value):
+            if isinstance(value, dict) and "__b64__" in value:
+                import base64
+                return base64.b64decode(value["__b64__"])
+            if isinstance(value, list):
+                return [SubagentWorker._deserialize_overlay_value(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    key: SubagentWorker._deserialize_overlay_value(item)
+                    for key, item in value.items()
+                }
+            return value
 
-                if release:
-                    self.complete = True
-                    _send_msg(self._host_sock, ("result", str(value) if value is not None else ""))
-                else:
-                    _send_msg(self._host_sock, ("progress", str(value) if value is not None else ""))
-"""
-    new_emit = """                value = args.get('value')
-                release = args.get('release', False)
-                files = args.get('files')
-                self._final_result = value
+        def _overlay_output_hook(self, value, release):
+            if not release:
+                _send_msg(
+                    self._host_sock,
+                    ("progress", str(value) if value is not None else ""),
+                )
+                return
 
-                if release:
-                    self.complete = True
-                    payload = None
-                    submission_error = None
-                    if files is not None:
-                        try:
-                            artifacts = materialize_submitted_files(
-                                files,
-                                project_root=runtime_config["project_cwd"],
-                                lower_root=runtime_config["lower_project_root"],
-                            )
-                            payload = submitted_files_to_payload(artifacts)
-                        except Exception as exc:
-                            submission_error = f"{type(exc).__name__}: {exc}"
-                    _send_msg(self._host_sock, ("result", {
-                        "value": str(value) if value is not None else "",
-                        "files": payload,
-                        "submission_error": submission_error,
-                    }))
-                else:
-                    _send_msg(self._host_sock, ("progress", str(value) if value is not None else ""))
+            files = self._overlay_submitted_files
+            self._overlay_submitted_files = None
+            payload = None
+            submission_error = None
+            if files is not None:
+                try:
+                    artifacts = materialize_submitted_files(
+                        files,
+                        project_root=self._overlay_runtime_config["project_cwd"],
+                        lower_root=self._overlay_runtime_config["lower_project_root"],
+                    )
+                    payload = submitted_files_to_payload(artifacts)
+                except Exception as exc:
+                    submission_error = f"{type(exc).__name__}: {exc}"
+            _send_msg(
+                self._host_sock,
+                ("result", {
+                    "value": str(value) if value is not None else "",
+                    "files": payload,
+                    "submission_error": submission_error,
+                }),
+            )
+
+        def on_repl_execute(self, code):
+            super().on_repl_execute(code)
+            self._turn_count += 1
+            _send_msg(self._host_sock, ("turn", self._turn_count))
+
+        def _new_overlay_handle(self, prefix):
+            self._overlay_next_handle += 1
+            return f"{prefix}-{self._overlay_next_handle}"
+
+        def _overlay_response_status(self, response):
+            return {
+                "result": response.result if response.done else "",
+                "files": sorted(response.files) if response.done else [],
+                "progress": response.progress,
+                "turns": response.turns,
+                "done": response.done,
+                "is_error": response.is_error if response.done else False,
+                "error": response.error if response.done else None,
+                "submission_error": (
+                    response.submission_error if response.done else None
+                ),
+            }
+
+        def _handle_overlay_child_request(self, args):
+            action = args.get("action")
+            if action == "child_create":
+                child = self._overlay_owner._create_child(
+                    cwd=args.get("cwd"),
+                    model=args.get("model"),
+                    max_turns=args["max_turns"],
+                    snapshot_byte_limit=args["snapshot_byte_limit"],
+                    snapshot_inode_limit=args["snapshot_inode_limit"],
+                    snapshot_timeout=args["snapshot_timeout"],
+                    snapshot_min_free_bytes=args["snapshot_min_free_bytes"],
+                    recursive=args["recursive"],
+                )
+                handle = self._new_overlay_handle("child")
+                self._overlay_children[handle] = child
+                return handle
+            if action == "child_send":
+                child = self._overlay_children[args["child"]]
+                response = child.send(
+                    args.get("prompt", ""),
+                    bg=bool(args.get("bg", False)),
+                    max_turns=args.get("max_turns"),
+                    timeout=args.get("timeout"),
+                )
+                handle = self._new_overlay_handle("response")
+                self._overlay_responses[handle] = response
+                return handle
+            if action == "child_close":
+                handle = args["child"]
+                child = self._overlay_children.pop(handle)
+                child.close()
+                return None
+            response = self._overlay_responses[args["response"]]
+            if action == "response_status":
+                return self._overlay_response_status(response)
+            if action == "response_wait":
+                response.wait(args.get("timeout"))
+                return self._overlay_response_status(response)
+            if action == "response_diff":
+                return response.diff(paths=args.get("paths"))
+            if action == "response_apply":
+                response.apply(paths=args.get("paths"))
+                return None
+            raise ValueError(f"unknown overlay child action: {action!r}")
+
+        def _handle_tool_request(self, repl, req):
+            if req.get("tool") == "__overlay_child__":
+                request_id = req.get("request_id")
+                args = self._deserialize_overlay_value(req.get("args", {}))
+                try:
+                    result = self._handle_overlay_child_request(args)
+                    repl.send_reply(request_id, result=result)
+                except Exception as exc:
+                    repl.send_reply(
+                        request_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                finally:
+                    if request_id is not None:
+                        repl.send_ack(request_id)
+                return
+            if req.get("tool") == "__emit__":
+                args = req.get("args", {})
+                release = bool(args.get("release", False))
+                self._overlay_submitted_files = (
+                    self._deserialize_overlay_value(args.get("files"))
+                    if release
+                    else None
+                )
+            return super()._handle_tool_request(repl, req)
+
 """
-    if old_emit not in code:
-        raise RuntimeError("ordinary subagent emit implementation changed")
-    code = code.replace(old_emit, new_emit, 1)
+    code = code[:adapter_start] + new_worker_adapter + code[adapter_end:]
+    task_start_marker = '            if cmd_type == "task":'
+    task_end_marker = '            elif cmd_type == "shutdown":'
+    task_start = code.index(task_start_marker)
+    task_end = code.index(task_end_marker, task_start)
+    new_task = """            if cmd_type == "task":
+                prompt = cmd_data.get("prompt", "")
+                task_max_turns = cmd_data.get("max_turns", max_turns)
+                agent._turn_count = 0
+                agent._overlay_submitted_files = None
+
+                try:
+                    agent.run_interaction(prompt, max_turns=task_max_turns)
+                except KeyboardInterrupt:
+                    _send_msg(sock, ("error", "Task interrupted"))
+                except Exception as e:
+                    import traceback
+                    _send_msg(sock, ("error", f"{type(e).__name__}: {e}\\n{traceback.format_exc()}"))
+                finally:
+                    agent.complete = False
+                    agent._final_result = None
+
+"""
+    code = code[:task_start] + new_task + code[task_end:]
     code = code.replace(
         """    # Main loop - receive tasks
 """,
         """    overlay_infrastructure_pids = set(direct_child_pids())
+    overlay_owner = _WorkerOverlayOwner(
+        runtime_config,
+        model,
+        max_turns,
+        lambda bootstrap, cwd, session_db: _spawn_overlay_child(
+            bootstrap,
+            cwd,
+            session_db,
+        ),
+        _stop_overlay_child,
+        overlay_infrastructure_pids,
+    )
+    agent._overlay_owner = overlay_owner
     # Main loop - receive tasks
 """,
         1,
@@ -1450,56 +1880,7 @@ def _build_overlay_worker_code() -> str:
         """            elif cmd_type == "shutdown":
                 break
 """,
-        """            elif cmd_type == "seal":
-                try:
-                    assert_overlay_quiescent(
-                        overlay_children.keys(),
-                        overlay_infrastructure_pids,
-                        str(runtime_config["runtime_id"]),
-                    )
-                    sealed = seal_overlay_worker(cmd_data)
-                    _send_msg(sock, ("sealed", sealed))
-                except Exception as exc:
-                    import traceback
-                    _send_msg(sock, ("seal_error", f"{type(exc).__name__}: {exc}\\n{traceback.format_exc()}"))
-
-            elif cmd_type == "spawn":
-                try:
-                    import subprocess
-                    liveness_read_fd, liveness_write_fd = os.pipe()
-                    env = os.environ.copy()
-                    env["OVERLAY_LIVENESS_FD"] = str(liveness_read_fd)
-                    env["OVERLAY_OWNER_PID"] = str(os.getpid())
-                    env["CODE_AGENT_SESSION_DB"] = cmd_data["session_db"]
-                    try:
-                        child = subprocess.Popen(
-                            [sys.executable, "-"],
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            cwd=cmd_data["cwd"],
-                            start_new_session=True,
-                            pass_fds=(liveness_read_fd,),
-                            env=env,
-                        )
-                    except Exception:
-                        os.close(liveness_read_fd)
-                        os.close(liveness_write_fd)
-                        raise
-                    os.close(liveness_read_fd)
-                    child.stdin.write(cmd_data["bootstrap"].encode())
-                    child.stdin.close()
-                    overlay_children[child.pid] = (child, liveness_write_fd)
-                    _send_msg(sock, ("spawned", child.pid))
-                except Exception as exc:
-                    import traceback
-                    _send_msg(sock, ("spawn_error", f"{type(exc).__name__}: {exc}\\n{traceback.format_exc()}"))
-
-            elif cmd_type == "close_child":
-                pid = int(cmd_data["pid"])
-                _send_msg(sock, ("child_closed", _stop_overlay_child(pid)))
-
-            elif cmd_type == "shutdown":
+        """            elif cmd_type == "shutdown":
                 _shutdown_overlay_children()
                 break
 """,
@@ -1513,7 +1894,7 @@ OVERLAY_WORKER_CODE = _build_overlay_worker_code()
 
 class OverlaySubagentResponse:
     def __init__(self, agent: "OverlaySubagent"):
-        self._agent = agent
+        self._agent_ref = weakref.ref(agent)
         self._result = ""
         self._files: Mapping[str, SubmittedFile] = MappingProxyType({})
         self._progress: list[str] = []
@@ -1563,9 +1944,15 @@ class OverlaySubagentResponse:
         self._refresh()
         return self._submission_error
 
+    def _agent(self) -> "OverlaySubagent":
+        agent = self._agent_ref()
+        if agent is None:
+            raise RuntimeError("OverlaySubagent has been closed")
+        return agent
+
     def _refresh(self) -> None:
         if not self._done:
-            self._agent._poll()
+            self._agent()._poll()
 
     def diff(self, paths: Optional[Iterable[str]] = None) -> str:
         return response_diff(self.files, paths=paths)
@@ -1575,7 +1962,7 @@ class OverlaySubagentResponse:
         paths: Optional[Iterable[str]] = None,
         root: Optional[Path] = None,
     ) -> None:
-        destination = root if root is not None else self._agent.project_root
+        destination = root if root is not None else self._agent().project_root
         apply_submitted_files(self.files, paths=paths, root=destination)
 
     def wait(self, timeout: Optional[float] = None) -> "OverlaySubagentResponse":
@@ -1697,11 +2084,12 @@ class OverlaySubagent:
         cwd: Optional[str] = None,
         model: Optional[str] = None,
         max_turns: int = 50,
-        parent_overlay: Optional["OverlaySubagent"] = None,
+        _parent_overlay: Optional["OverlaySubagent"] = None,
         snapshot_byte_limit: Optional[int] = DEFAULT_SNAPSHOT_BYTE_LIMIT,
         snapshot_inode_limit: Optional[int] = DEFAULT_SNAPSHOT_INODE_LIMIT,
         snapshot_timeout: Optional[float] = DEFAULT_SNAPSHOT_TIMEOUT,
         snapshot_min_free_bytes: int = DEFAULT_SNAPSHOT_MIN_FREE_BYTES,
+        recursive: bool = False,
     ):
         import tempfile
         import uuid
@@ -1712,11 +2100,12 @@ class OverlaySubagent:
         self.project_root = Path(cwd or Path.cwd()).resolve()
         self.model = model or Subagent.default_model
         self.max_turns = max_turns
-        self.parent_overlay = parent_overlay
+        self._parent_overlay = _parent_overlay
         self.snapshot_byte_limit = snapshot_byte_limit
         self.snapshot_inode_limit = snapshot_inode_limit
         self.snapshot_timeout = snapshot_timeout
         self.snapshot_min_free_bytes = snapshot_min_free_bytes
+        self.recursive = recursive
         self._children: list[OverlaySubagent] = []
         self._current_response: Optional[OverlaySubagentResponse] = None
         self._seal_generation = 0
@@ -1747,11 +2136,11 @@ class OverlaySubagent:
         ):
             path.mkdir()
 
-        if parent_overlay is None:
+        if _parent_overlay is None:
             self.lower_sources = [self.lower_home_dir]
         else:
             try:
-                self.lower_sources = parent_overlay._seal()
+                self.lower_sources = _parent_overlay._seal()
             except Exception:
                 import shutil
                 shutil.rmtree(self.runtime_dir, ignore_errors=True)
@@ -1761,29 +2150,34 @@ class OverlaySubagent:
             "runtime_id": self.id,
             "home": str(self.home),
             "lower_sources": [str(path) for path in self.lower_sources],
-            "bind_initial_lower": parent_overlay is None,
+            "bind_initial_lower": _parent_overlay is None,
             "initial_lower_source": str(self.home),
             "session_db": str(self.runtime_dir / "sessions.db"),
             "lower_home": str(self.lower_home_dir),
             "lower_view": str(self.lower_view_dir),
             "inherited_lower_view": (
-                str(parent_overlay.lower_view_dir)
-                if parent_overlay is not None
+                str(_parent_overlay.lower_view_dir)
+                if _parent_overlay is not None
                 else None
             ),
             "upper_dir": str(self.upper_dir),
             "work_dir": str(self.work_dir),
             "project_cwd": str(self.project_root),
             "lower_project_root": str(self.lower_dir),
-            "unshare": parent_overlay is None,
+            "unshare": _parent_overlay is None,
+            "snapshot_byte_limit": self.snapshot_byte_limit,
+            "snapshot_inode_limit": self.snapshot_inode_limit,
+            "snapshot_timeout": self.snapshot_timeout,
+            "snapshot_min_free_bytes": self.snapshot_min_free_bytes,
+            "recursive": self.recursive,
         }
         self._transport = Subagent(
             cwd=str(self.project_root),
             model=model,
             max_turns=max_turns,
         )
-        if parent_overlay is not None:
-            parent_overlay._children.append(self)
+        if _parent_overlay is not None:
+            _parent_overlay._children.append(self)
 
     def _worker_bootstrap(self, port: int, authkey: bytes) -> str:
         import sys
@@ -1820,7 +2214,7 @@ worker_main(
         transport._server.settimeout(30)
         bootstrap = self._worker_bootstrap(port, authkey)
 
-        if self.parent_overlay is None:
+        if self._parent_overlay is None:
             liveness_read_fd, liveness_write_fd = os.pipe()
             env = os.environ.copy()
             env["OVERLAY_LIVENESS_FD"] = str(liveness_read_fd)
@@ -1850,7 +2244,7 @@ worker_main(
             transport._proc.stdin.write(bootstrap.encode())
             transport._proc.stdin.close()
         else:
-            self.parent_overlay._spawn_child_worker(self, bootstrap)
+            self._parent_overlay._spawn_child_worker(self, bootstrap)
 
         try:
             transport._conn, _ = transport._server.accept()
@@ -1916,94 +2310,6 @@ worker_main(
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         transport._started = True
 
-    def _control(self, message: tuple, expected: str) -> Any:
-        import socket
-        import time
-        from code_agent.subagent import _recv_msg, _send_msg
-
-        self._ensure_started()
-        _send_msg(self._transport._conn, message)
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                msg_type, data = _recv_msg(self._transport._conn, timeout=0.1)
-            except (socket.timeout, BlockingIOError):
-                continue
-            if msg_type == expected:
-                return data
-            if msg_type.endswith("_error"):
-                raise OverlayRuntimeError(msg_type, str(data), runtime_id=self.id)
-        raise TimeoutError(f"timed out waiting for overlay worker {expected}")
-
-    def _seal(self) -> list[Path]:
-        if self._current_response is not None and not self._current_response.done:
-            raise RuntimeError("cannot seal an overlay while a task is running")
-
-        import shutil
-
-        generation = self._seal_generation + 1
-        sealed_upper = self.upper_dir
-        sealed_lower = self.runtime_dir / f"sealed-{generation}"
-        next_upper = self.runtime_dir / f"upper-{generation}"
-        next_work = self.runtime_dir / f"work-{generation}"
-        created = (sealed_lower, next_upper, next_work)
-        for path in created:
-            path.mkdir()
-        try:
-            validate_snapshot_capacity(
-                sealed_upper,
-                self.runtime_dir,
-                byte_limit=self.snapshot_byte_limit,
-                inode_limit=self.snapshot_inode_limit,
-                min_free_bytes=self.snapshot_min_free_bytes,
-                runtime_id=self.id,
-            )
-            clone_overlay_layer(
-                sealed_upper,
-                sealed_lower,
-                self.id,
-                timeout=self.snapshot_timeout,
-            )
-        except Exception:
-            for path in reversed(created):
-                shutil.rmtree(path, ignore_errors=True)
-            raise
-
-        child_lower_sources = [sealed_lower, *self.lower_sources]
-        self._control(("seal", {
-            "runtime_id": self.id,
-            "home": str(self.home),
-            "lower_sources": [str(path) for path in child_lower_sources],
-            "lower_view": str(self.lower_view_dir),
-            "upper_dir": str(next_upper),
-            "work_dir": str(next_work),
-            "project_cwd": str(self.project_root),
-        }), "sealed")
-
-        shutil.rmtree(sealed_upper, ignore_errors=True)
-        self._seal_generation = generation
-        self.lower_sources = child_lower_sources
-        self.upper_dir = next_upper
-        self.work_dir = next_work
-        self.runtime_config["lower_sources"] = [
-            str(path) for path in self.lower_sources
-        ]
-        self.runtime_config["upper_dir"] = str(self.upper_dir)
-        self.runtime_config["work_dir"] = str(self.work_dir)
-        return list(child_lower_sources)
-
-    def _spawn_child_worker(self, child: "OverlaySubagent", bootstrap: str) -> None:
-        pid = self._control(("spawn", {
-            "bootstrap": bootstrap,
-            "cwd": str(child.project_root),
-            "session_db": child.runtime_config["session_db"],
-        }), "spawned")
-        child._transport._proc = _InheritedProcess(int(pid))
-
-    def _release_child_worker(self, pid: int) -> None:
-        if self._closed:
-            return
-        self._control(("close_child", {"pid": pid}), "child_closed")
 
     def send(
         self,
@@ -2083,22 +2389,6 @@ worker_main(
                 response._done = True
                 return
 
-    def create_child(
-        self,
-        cwd: Optional[str] = None,
-        model: Optional[str] = None,
-        max_turns: Optional[int] = None,
-    ) -> "OverlaySubagent":
-        return OverlaySubagent(
-            cwd=cwd or str(self.project_root),
-            model=model or self.model,
-            max_turns=max_turns or self.max_turns,
-            parent_overlay=self,
-            snapshot_byte_limit=self.snapshot_byte_limit,
-            snapshot_inode_limit=self.snapshot_inode_limit,
-            snapshot_timeout=self.snapshot_timeout,
-            snapshot_min_free_bytes=self.snapshot_min_free_bytes,
-        )
 
     @property
     def last(self) -> Optional[OverlaySubagentResponse]:
@@ -2107,13 +2397,13 @@ worker_main(
     def close(self) -> None:
         if self._closed:
             return
-        for child in reversed(self._children):
+        for child in reversed(list(self._children)):
             child.close()
         self._children.clear()
         process = self._transport._proc
         inherited_pid = (
             process.pid
-            if self.parent_overlay is not None and process is not None
+            if self._parent_overlay is not None and process is not None
             else None
         )
         try:
@@ -2132,9 +2422,9 @@ worker_main(
                             pass
                 except Exception:
                     pass
-            if inherited_pid is not None and not self.parent_overlay._closed:
+            if inherited_pid is not None and not self._parent_overlay._closed:
                 try:
-                    self.parent_overlay._release_child_worker(inherited_pid)
+                    self._parent_overlay._release_child_worker(inherited_pid)
                 except Exception:
                     pass
             if self._liveness_write_fd is not None:
@@ -2159,25 +2449,19 @@ worker_main(
                 except OSError:
                     pass
             shutil.rmtree(self.runtime_dir, ignore_errors=True)
-            if self.parent_overlay is not None:
+            if self._parent_overlay is not None:
                 try:
-                    self.parent_overlay._children.remove(self)
+                    self._parent_overlay._children.remove(self)
                 except ValueError:
                     pass
             self._closed = True
 
     def kill(self) -> str:
-        for child in reversed(self._children):
+        for child in reversed(list(self._children)):
             child.kill()
         result = self._transport.kill()
         self.close()
         return result
-
-    def __enter__(self) -> "OverlaySubagent":
-        return self
-
-    def __exit__(self, *args) -> None:
-        self.close()
 
     def __del__(self) -> None:
         try:

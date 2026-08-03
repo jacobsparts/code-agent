@@ -9,7 +9,6 @@ ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 GOOGLE_API_KEY=...
 XAI_API_KEY=...
-OPENROUTER_API_KEY=...
 ```
 
 Copy `.env.example` to get started:
@@ -17,6 +16,26 @@ Copy `.env.example` to get started:
 ```bash
 cp .env.example .env
 ```
+
+## Codex transport
+
+The built-in Codex transport uses ChatGPT OAuth credentials rather than an API
+key. Copy the credential file created by the official Codex client:
+
+```bash
+mkdir -p ~/.code-agent
+cp ~/.codex/auth.json ~/.code-agent/codex-auth.json
+chmod 600 ~/.code-agent/codex-auth.json
+```
+
+Then select the registered model:
+
+```bash
+coda --model codex/gpt-5.6-luna
+```
+
+The transport refreshes expiring access tokens and atomically saves refreshed
+credentials with owner-only permissions.
 
 ## `~/.code-agent/config.py`
 

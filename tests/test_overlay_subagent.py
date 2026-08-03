@@ -1,7 +1,15 @@
 """Tests for OverlaySubagent and overlay runtime."""
 
+import gc
+import weakref
+
 import pytest
+import json
 import os
+import socket
+import shutil
+import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock
 import signal
@@ -193,9 +201,35 @@ def test_overlay_subagent_initialization_requires_project_under_home(tmp_path, m
             overlay.runtime_dir / "sessions.db"
         )
         assert overlay.runtime_config["unshare"] is True
+        assert overlay.runtime_config["recursive"] is False
     finally:
         overlay.close()
         assert not overlay.runtime_dir.exists()
+
+
+def test_recursive_worker_code_attaches_skill_and_gates_child_construction():
+    from code_agent.overlay_subagent import _build_overlay_worker_code, _overlay_repl_code
+
+    worker_code = _build_overlay_worker_code()
+    compile(worker_code, "<overlay-worker>", "exec")
+    assert 'if runtime_config["recursive"]:' in worker_code
+    assert 'agent.attach_skill("overlay_subagent_worker")' in worker_code
+    worker_skill = Path("code_agent/skills/overlay_subagent_worker.md").read_text()
+    assert worker_skill.startswith("# Recursive overlay subagent orchestration")
+    assert "# Overlay subagents with isolated, reviewable file changes" not in worker_skill
+    assert "A child does not inherit your conversation" in worker_skill
+
+    recursive_repl = _overlay_repl_code(True)
+    leaf_repl = _overlay_repl_code(False)
+    compile(recursive_repl, "<recursive-overlay-repl>", "exec")
+    compile(leaf_repl, "<leaf-overlay-repl>", "exec")
+    assert "if not True:" in recursive_repl
+    assert "if not False:" in leaf_repl
+    assert "recursive overlay subagents require OverlaySubagent(recursive=True)" in leaf_repl
+    assert "recursive=recursive" in recursive_repl
+    assert "def __enter__(" not in recursive_repl
+    assert "def __exit__(" not in recursive_repl
+    assert "def __del__(self):" in recursive_repl
 
 
 def test_overlay_subagent_response_tracks_overlay_protocol():
@@ -222,150 +256,6 @@ def test_overlay_subagent_response_tracks_overlay_protocol():
     assert resp.is_error is False
     assert resp.files == {"foo.txt": file_art}
     assert "+++ foo.txt" in resp.diff()
-
-
-def test_nested_overlay_subagent_uses_sealed_parent_view(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    project = home / "project"
-    project.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-
-    parent = OverlaySubagent(cwd=str(project))
-    sealed_upper = parent.runtime_dir / "sealed-upper"
-    sealed_base = parent.runtime_dir / "sealed-base"
-    sealed_upper.mkdir()
-    sealed_base.mkdir()
-    monkeypatch.setattr(parent, "_seal", lambda: [sealed_upper, sealed_base])
-
-    try:
-        child = parent.create_child()
-        assert child.parent_overlay is parent
-        assert child in parent._children
-        assert child.runtime_config["lower_sources"] == [
-            str(sealed_upper),
-            str(sealed_base),
-        ]
-        assert child.runtime_config["unshare"] is False
-        child.close()
-        assert child not in parent._children
-    finally:
-        parent.close()
-
-
-def test_seal_rolls_parent_to_fresh_upper_each_time(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    project = home / "project"
-    project.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-
-    parent = OverlaySubagent(cwd=str(project))
-    calls = []
-    monkeypatch.setattr(
-        parent,
-        "_control",
-        lambda message, expected: calls.append((message, expected)) or {
-            "lower_sources": message[1]["lower_sources"]
-        },
-    )
-    try:
-        initial_upper = parent.upper_dir
-        initial_lower = parent.lower_home_dir
-        (initial_upper / "project").mkdir()
-        (initial_upper / "project" / "seed.txt").write_text("seed\\n")
-        first = parent._seal()
-        first_upper = parent.upper_dir
-        assert (first[0] / "project" / "seed.txt").read_text() == "seed\\n"
-        assert not initial_upper.exists()
-        second = parent._seal()
-        assert first == [
-            parent.runtime_dir / "sealed-1",
-            initial_lower,
-        ]
-        assert second == [
-            parent.runtime_dir / "sealed-2",
-            parent.runtime_dir / "sealed-1",
-            initial_lower,
-        ]
-        assert first_upper == parent.runtime_dir / "upper-1"
-        assert parent.upper_dir == parent.runtime_dir / "upper-2"
-        assert [expected for _, expected in calls] == ["sealed", "sealed"]
-    finally:
-        parent.close()
-
-
-def test_seal_failure_rolls_back_paths_and_generation(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    project = home / "project"
-    project.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-
-    parent = OverlaySubagent(cwd=str(project))
-    original_upper = parent.upper_dir
-    original_work = parent.work_dir
-    original_lowers = list(parent.lower_sources)
-    monkeypatch.setattr(
-        "code_agent.overlay_subagent.clone_overlay_layer",
-        MagicMock(side_effect=OverlayRuntimeError("clone", "failed")),
-    )
-    try:
-        with pytest.raises(OverlayRuntimeError, match="failed"):
-            parent._seal()
-
-        assert parent._seal_generation == 0
-        assert parent.upper_dir == original_upper
-        assert parent.work_dir == original_work
-        assert parent.lower_sources == original_lowers
-        assert original_upper.exists()
-        assert not (parent.runtime_dir / "sealed-1").exists()
-        assert not (parent.runtime_dir / "upper-1").exists()
-        assert not (parent.runtime_dir / "work-1").exists()
-    finally:
-        parent.close()
-
-
-def test_seal_control_failure_preserves_possible_mounted_paths(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    project = home / "project"
-    project.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-
-    parent = OverlaySubagent(cwd=str(project))
-    monkeypatch.setattr(
-        parent,
-        "_control",
-        MagicMock(side_effect=TimeoutError("lost acknowledgement")),
-    )
-    try:
-        with pytest.raises(TimeoutError, match="lost acknowledgement"):
-            parent._seal()
-
-        assert parent._seal_generation == 0
-        assert (parent.runtime_dir / "sealed-1").exists()
-        assert (parent.runtime_dir / "upper-1").exists()
-        assert (parent.runtime_dir / "work-1").exists()
-    finally:
-        parent.close()
-
-
-def test_child_constructor_failure_removes_runtime(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    project = home / "project"
-    project.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-
-    parent = OverlaySubagent(cwd=str(project))
-    monkeypatch.setattr(
-        parent,
-        "_seal",
-        MagicMock(side_effect=OverlayRuntimeError("seal", "failed")),
-    )
-    before = set(Path("/tmp").glob("overlay_subagent_*"))
-    try:
-        with pytest.raises(OverlayRuntimeError, match="failed"):
-            parent.create_child()
-        assert set(Path("/tmp").glob("overlay_subagent_*")) == before
-    finally:
-        parent.close()
 
 
 def test_snapshot_capacity_enforces_byte_and_inode_limits(tmp_path):
@@ -601,14 +491,229 @@ def test_close_removes_overlay_work_directory_with_restricted_mode(tmp_path, mon
     assert not runtime_dir.exists()
 
 
-def test_overlay_subagent_context_manager(tmp_path, monkeypatch):
+def test_overlay_subagent_requires_explicit_close(tmp_path, monkeypatch):
     home = tmp_path / "home"
     project = home / "project"
     project.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
-    with OverlaySubagent(cwd=str(project)) as worker:
-        assert worker.runtime_dir.exists()
-        rdir = worker.runtime_dir
+    worker = OverlaySubagent(cwd=str(project))
+    assert worker.runtime_dir.exists()
+    rdir = worker.runtime_dir
+    worker.close()
 
     assert not rdir.exists()
+
+def test_overlay_subagent_has_no_context_manager_and_destructor_closes(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    project = home / "project"
+    project.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    worker = OverlaySubagent(cwd=str(project))
+    runtime_dir = worker.runtime_dir
+    worker_ref = weakref.ref(worker)
+
+    assert not hasattr(worker, "__enter__")
+    assert not hasattr(worker, "__exit__")
+
+    del worker
+    gc.collect()
+
+    assert worker_ref() is None
+    assert not runtime_dir.exists()
+
+
+@pytest.mark.integration
+def test_worker_can_fan_out_to_overlay_children_and_apply_results(tmp_path):
+    root = Path(tempfile.mkdtemp(prefix="overlay-fanout-test-", dir=Path.home()))
+    home = root / "home"
+    project = home / "project"
+    config_dir = home / ".code-agent"
+    project.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    child_requests = set()
+    skill_requests = set()
+    child_requests_lock = threading.Lock()
+    both_children_started = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            payload = json.loads(self.rfile.read(length))
+            content = payload["messages"][-1]["content"]
+            if isinstance(content, str):
+                text = content
+            else:
+                text = "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+
+            if "orchestrate-two-children" in text:
+                if "# Recursive overlay subagent orchestration" in json.dumps(payload):
+                    skill_requests.add("orchestrator")
+                response_text = (
+                    'from code_agent.overlay_subagent import OverlaySubagent\n'
+                    'a = OverlaySubagent(recursive=True)\n'
+                    'b = OverlaySubagent()\n'
+                    'ra = a.send("make-child-a", bg=True)\n'
+                    'rb = b.send("make-child-b", bg=True)\n'
+                    'ra.wait(60)\n'
+                    'rb.wait(60)\n'
+                    'assert not ra.is_error, ra.error\n'
+                    'assert not rb.is_error, rb.error\n'
+                    'ra.apply()\n'
+                    'rb.apply()\n'
+                    'a.close()\n'
+                    'b.close()\n'
+                    'emit("fanout complete", release=True, files=["a.txt", "b.txt"])'
+                )
+            elif "make-grandchild-a" in text:
+                response_text = (
+                    'from pathlib import Path\n'
+                    'Path("a.txt").write_text("A\\n")\n'
+                    'emit("A complete", release=True, files=["a.txt"])'
+                )
+            elif "make-child-a" in text:
+                if "# Recursive overlay subagent orchestration" in json.dumps(payload):
+                    skill_requests.add("child-a")
+                with child_requests_lock:
+                    child_requests.add("a")
+                    if child_requests == {"a", "b"}:
+                        both_children_started.set()
+                if not both_children_started.wait(10):
+                    raise AssertionError("overlay children did not run concurrently")
+                response_text = (
+                    'from code_agent.overlay_subagent import OverlaySubagent\n'
+                    'grandchild = OverlaySubagent()\n'
+                    'response = grandchild.send("make-grandchild-a")\n'
+                    'assert not response.is_error, response.error\n'
+                    'response.apply()\n'
+                    'grandchild.close()\n'
+                    'emit("A integrated", release=True, files=["a.txt"])'
+                )
+            elif "make-child-b" in text:
+                with child_requests_lock:
+                    child_requests.add("b")
+                    if child_requests == {"a", "b"}:
+                        both_children_started.set()
+                if not both_children_started.wait(10):
+                    raise AssertionError("overlay children did not run concurrently")
+                response_text = (
+                    'from pathlib import Path\n'
+                    'Path("b.txt").write_text("B\\n")\n'
+                    'emit("B complete", release=True, files=["b.txt"])'
+                )
+            else:
+                response_text = 'emit("unexpected prompt", release=True)'
+
+            body = json.dumps({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 10,
+                    "total_tokens": 20,
+                },
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    (config_dir / "config.py").write_text(
+        f"""
+register_provider(
+    "overlaytest",
+    host="127.0.0.1",
+    path="/v1/chat/completions",
+    port={port},
+    timeout=30,
+    tpm=100000,
+    concurrency=10,
+    tools=False,
+    api_type="completions",
+)
+register_model(
+    "overlaytest",
+    "worker",
+    aliases="overlay-test",
+    model="worker",
+    input_cost=0.0,
+    output_cost=0.0,
+)
+code_agent_model = "overlay-test"
+"""
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    script = f"""
+from pathlib import Path
+from code_agent.overlay_subagent import OverlaySubagent
+
+project = Path({str(project)!r})
+agent = OverlaySubagent(
+    cwd=str(project),
+    model="overlay-test",
+    max_turns=10,
+    snapshot_min_free_bytes=0,
+    recursive=True,
+)
+try:
+    response = agent.send("orchestrate-two-children", timeout=120)
+    assert response.done
+    assert not response.is_error, response.error
+    assert not response.submission_error
+    assert sorted(response.files) == ["a.txt", "b.txt"]
+    assert response.files["a.txt"].text() == "A\\n"
+    assert response.files["b.txt"].text() == "B\\n"
+    assert not (project / "a.txt").exists()
+    assert not (project / "b.txt").exists()
+    response.apply()
+    assert (project / "a.txt").read_text() == "A\\n"
+    assert (project / "b.txt").read_text() == "B\\n"
+finally:
+    agent.close()
+"""
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["OVERLAYTEST_API_KEY"] = "dummy"
+    env["CODE_AGENT_SESSION_DB"] = str(tmp_path / "top-sessions.db")
+    env["CODE_AGENT_CLI_HISTORY_DB"] = str(tmp_path / "history.db")
+    env["PYTHONPATH"] = os.pathsep.join([str(Path.cwd()), *sys.path])
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        shutil.rmtree(root, ignore_errors=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert child_requests == {"a", "b"}
+    assert skill_requests == {"orchestrator", "child-a"}

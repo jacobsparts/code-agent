@@ -93,8 +93,8 @@ def normalize_openai_repl_response(message):
     }
 
 
-def _public_message(message):
-    return {k: v for k, v in message.items() if not k.startswith("_") and k != "tool_calls"}
+def _project_non_assistant_message(message):
+    return {k: v for k, v in message.items() if k != "tool_calls"}
 
 
 def _strip_leading_input_echo(output, human_input):
@@ -141,7 +141,7 @@ def project_openai_repl_messages(messages):
         role = message.get("role")
 
         if role != "assistant":
-            projected.append(_public_message(message))
+            projected.append(_project_non_assistant_message(message))
             if role == "user":
                 pending_human_input = message.get("_user_content", message.get("content"))
             index += 1

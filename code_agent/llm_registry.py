@@ -20,6 +20,7 @@ class ProviderConfig:
     tools: bool = False
     api_type: str = "completions"
     token_transform: object = None    # callable(usage_dict) -> usage_dict
+    requires_api_key: bool = True
     cost_transform: object = None     # callable(prompt, cached, completion, reasoning, in_cost, cached_cost, out_cost, rsn_cost) -> (in_cost, cached_cost, out_cost, rsn_cost)
     response_parser: object = None    # callable(response_json) -> (message, stop_reason, usage)
 
@@ -108,7 +109,8 @@ class EndpointRegistry:
         model_config['path'] = _provider['path']
         model_config['request_path'] = model_obj.request_path
         env_var = f"{model_config['provider'].upper()}_API_KEY"
-        if not (api_key := os.getenv(env_var)):
+        api_key = os.getenv(env_var)
+        if model_config.get("requires_api_key", True) and not api_key:
             raise Exception(f"{env_var} is not set.")
         return {**model_config, 'api_key': api_key}
 
@@ -141,6 +143,42 @@ for conf, efforts in (
         kwargs = {**conf, "config":{"reasoning_effort": effort}} if effort else conf
         kwargs.setdefault('config',{})['prompt_cache_key'] = 'jp-code-agent-001'
         register_model("openai", f"{conf['model']}{suffix}", **kwargs)
+
+
+# --- Codex OAuth transport ---
+register_provider(
+    "codex",
+    host=None,
+    path=None,
+    tpm=60,
+    concurrency=5,
+    timeout=300,
+    tools=True,
+    api_type="codex",
+    requires_api_key=False,
+)
+register_model(
+    "codex",
+    "gpt-5.6-luna-xhigh",
+    model="gpt-5.6-luna",
+    tool_mode="repl_execute",
+    context_window=272_000,
+    input_cost=0.2,
+    cached_cost=0.02,
+    output_cost=1.2,
+    config={"reasoning_effort": "xhigh"},
+)
+for effort in ('low','medium'):
+    register_model(
+        "codex",
+        "gpt-5.6-sol-"+effort,
+        model="gpt-5.6-sol",
+        context_window=272_000,
+        input_cost=5.0,
+        cached_cost=0.5,
+        output_cost=30.0,
+        config={"reasoning_effort": effort},
+    )
 
 
 # --- Cursor ---

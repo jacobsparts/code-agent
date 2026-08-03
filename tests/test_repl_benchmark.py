@@ -28,6 +28,16 @@ from code_agent.repl_benchmark.core import BenchmarkTaskContext, checker_expecte
 from code_agent.repl_benchmark.registry import task_registry
 
 
+def _message_text(content):
+    if isinstance(content, str):
+        return content
+    return "".join(
+        part.get("text", "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
+
+
 class FakeUsageTracker:
     def __init__(self):
         self.history = []
@@ -746,7 +756,7 @@ def test_cli_includes_code_agent_builtin_suite(tmp_path):
         def do_POST(self):
             length = int(self.headers["Content-Length"])
             payload = json.loads(self.rfile.read(length))
-            text = payload["messages"][-1]["content"]
+            text = _message_text(payload["messages"][-1]["content"])
             content = self.next_response(text)
             response = {
                 "choices": [{
@@ -801,7 +811,7 @@ def test_cli_can_stream_code_agent_repl_output(tmp_path):
         def do_POST(self):
             length = int(self.headers["Content-Length"])
             payload = json.loads(self.rfile.read(length))
-            text = payload["messages"][-1]["content"]
+            text = _message_text(payload["messages"][-1]["content"])
             if "overrides the session sqlite path" in text:
                 content = 'preview(grep("CODE_AGENT_SESSION_DB", ".", None, None, False, 2, False, False))\nemit("CODE_AGENT_SESSION_DB", release=True)'
             else:

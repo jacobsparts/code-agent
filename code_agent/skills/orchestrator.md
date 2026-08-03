@@ -15,7 +15,13 @@ Use subagents as an implementation and review pipeline, not as a one-shot delega
    - Use a fresh final-review agent after all stages are complete.
    - Reuse an implementation agent for follow-up fixes within the same stage so it retains context.
 
-3. **Divide work at architectural boundaries.**
+3. **Own every subagent's lifecycle explicitly.**
+   - Keep each `Subagent` in a named variable or collection until its work and response handling are complete.
+   - Call `close()` promptly when no follow-up work remains.
+   - Do not create a subagent as a temporary expression or rely on its response to keep it alive.
+   - Treat destructor cleanup as a last resort, not normal orchestration.
+
+4. **Divide work at architectural boundaries.**
    Good stage boundaries have independently testable outcomes, such as:
    - refactor shared primitives;
    - add persistence and replay;
@@ -23,7 +29,7 @@ Use subagents as an implementation and review pipeline, not as a one-shot delega
 
    Avoid splitting tightly coupled edits across parallel agents. Parallelism is useful only when tasks truly do not share files, invariants, or sequencing.
 
-4. **Make exclusions explicit.**
+5. **Make exclusions explicit.**
    State what the subagent must not implement or modify. Examples:
    - no schema migration;
    - no agentic policy yet;

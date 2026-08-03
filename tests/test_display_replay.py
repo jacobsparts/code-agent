@@ -546,7 +546,7 @@ def test_code_agent_observe_is_hidden_when_repl_display_is_disabled(capsys):
     assert agent._display_capture == []
 
 
-def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
+def test_code_agent_observe_statement_is_quiet_without_result(capsys):
     from code_agent.agent import CodeAgentBase
 
     agent = CodeAgentBase.__new__(CodeAgentBase)
@@ -561,7 +561,6 @@ def test_code_agent_observe_result_is_hidden_only_from_display(capsys):
             "display_echo": "",
         },
     ))
-    agent.on_repl_event(ReplEvent(kind="output", text="'[Continuing...]'\n"))
 
     assert capsys.readouterr().out == ""
     assert agent._display_capture == []

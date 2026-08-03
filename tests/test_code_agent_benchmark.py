@@ -15,6 +15,16 @@ from code_agent.repl_benchmark.code_agent_benchmark import (
 )
 
 
+def _message_text(content):
+    if isinstance(content, str):
+        return content
+    return "".join(
+        part.get("text", "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
+
+
 class _ScriptedModelServer:
     def __init__(self, responses):
         self._responses = list(responses)
@@ -279,7 +289,7 @@ def test_code_agent_benchmark_file_edit_patch_tracks_attempts_and_cleans_up(tmp_
     state = {"target": None}
 
     def first_response(payload):
-        text = payload["messages"][-1]["content"]
+        text = _message_text(payload["messages"][-1]["content"])
         match = re.search(r"View (.+?) first, then update only the status line", text)
         assert match, text
         state["target"] = match.group(1)

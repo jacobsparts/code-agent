@@ -63,6 +63,10 @@ def _configured_models() -> list[str]:
     return [value]
 
 
+VIEW_PROMOTE_MAX_LINES = 2000
+VIEW_PROMOTE_MAX_CHARS = 100_000
+
+
 def _skill_description(path: Path) -> str:
     try:
         for line in path.read_text().splitlines():
@@ -99,6 +103,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self._pending_session_events = []
             self._display_capture = []
             self._pending_unviewed_files = set()
+            self._pending_full_views = set()
             self._pending_observations = []
             self._pending_observation_transition = False
             self._pending_repl_output_for = None
@@ -1086,6 +1091,14 @@ def _code_agent_send_rg_available():
             return
         self._append_session_event("attachment_invalidated", {"name": name})
 
+    def _clear_pending_full_view(self, path: str):
+        pending = getattr(self, "_pending_full_views", None)
+        if pending is None:
+            return
+        normalized = self._logical_path(path)
+        mode = "reposition" if self._is_attached(path) else "attach"
+        pending.discard((normalized, mode))
+
     def _view_attachment_context_error(self, path: str, content: str, current_output: str = "") -> str | None:
         client = getattr(self, "llm_client", None)
         model_config = getattr(client, "model_config", {}) or {}
@@ -1179,6 +1192,7 @@ def _code_agent_send_rg_available():
         self._pending_observations = []
         self._pending_observation_transition = False
         self._pending_repl_output_for = None
+        self._pending_full_views = set()
 
     def _on_assistant_message_committed(self, message: dict):
         observations = list(getattr(self, "_pending_observations", []))
@@ -1249,11 +1263,13 @@ def _code_agent_send_rg_available():
                 path = attach_path
                 attach_path = None
                 if path in unviewed_files:
+                    self._clear_pending_full_view(path)
                     result.append(self._auto_preview_output(chunk))
                     continue
                 content = chunk.rstrip('\n')
                 error = self._view_attachment_context_error(path, content, "".join(result))
                 if error is not None:
+                    self._clear_pending_full_view(path)
                     result.append(error)
                     continue
                 self._invalidate_attachment(path)
@@ -1335,6 +1351,86 @@ def _code_agent_send_rg_available():
     def _is_attached(self, name: str) -> bool:
         """Check if a file is currently attached in any message."""
         return self._attached_file_name(name) is not None
+
+    def _decide_view_request(
+        self,
+        path: str,
+        *,
+        reposition: bool = False,
+        is_partial: bool = False,
+        line_count: int | None = None,
+        char_count: int | None = None,
+    ) -> dict:
+        """Decide attach/deny/promote/ignore for a filesystem view() call.
+
+        Committed attachment state drives deny/reposition/pre-attached partial
+        decisions. Same-turn pending full-view state is only for dedupe after a
+        successful full attach/reposition in this execution attempt.
+        """
+        if not isinstance(path, str) or path.startswith("session://preview/"):
+            return {"action": "proceed"}
+
+        normalized = self._logical_path(path)
+        pending = getattr(self, "_pending_full_views", None)
+        if pending is None:
+            pending = set()
+            self._pending_full_views = pending
+
+        if reposition and is_partial:
+            return {
+                "action": "deny",
+                "notice": "reposition=True is only valid for a full file view.",
+            }
+
+        attached = self._is_attached(path)
+
+        if is_partial:
+            if attached:
+                return {"action": "partial"}
+            lines = 0 if line_count is None else int(line_count)
+            chars = 0 if char_count is None else int(char_count)
+            if lines <= VIEW_PROMOTE_MAX_LINES and chars <= VIEW_PROMOTE_MAX_CHARS:
+                key = (normalized, "attach")
+                if key in pending:
+                    return {"action": "ignore"}
+                pending.add(key)
+                return {
+                    "action": "promote",
+                    "notice": (
+                        "Promoted partial view to full view: file is small "
+                        "and not already in context."
+                    ),
+                }
+            return {"action": "partial"}
+
+        mode = "reposition" if reposition else "attach"
+        key = (normalized, mode)
+        if key in pending:
+            return {"action": "ignore"}
+
+        if reposition:
+            if not attached:
+                return {
+                    "action": "deny",
+                    "notice": (
+                        "Cannot reposition: file is not in context. "
+                        "Call view(path) first."
+                    ),
+                }
+            pending.add(key)
+            return {"action": "reposition"}
+
+        if attached:
+            return {
+                "action": "deny",
+                "notice": (
+                    "Already in context; use reposition=True to move it "
+                    "to the newest context."
+                ),
+            }
+
+        pending.add(key)
+        return {"action": "attach"}
 
     @REPLAgent.tool
     def view_images(self,
@@ -1853,9 +1949,10 @@ view("file.py") is for inspecting code with line numbers:
 - Do not repeatedly call partial view(..., offset=..., limit=...) on the
   same normal-sized file.
 
-Partial views of source files emit a warning because full view(file_path) is
-usually better for source inspection. If the file is too large or not relevant,
-call unview(path_or_uri) on a later turn to remove it from future context.
+Viewed files persist across turns. Do not call view() again on a file already
+in context; use reposition=True only when moving its full view to the newest
+context is necessary. Partial views of small, unattached files are promoted to
+full views. Use partial views for large files or to focus on an attached file.
 
 If you accidentally view an irrelevant file, call unview(file_path) to
 remove it from future context.
@@ -1863,9 +1960,8 @@ remove it from future context.
 Unintended image-generation invocation should be silently ignored, do not make observations about them.
 
 When files change, previous full views stay up to date automatically.
-Re-view a file only when you need to inspect it again. A collapsed display of a
-past view() command does not remove the viewed file from context; only
-unview(path_or_uri) does that.
+A collapsed display of a past view() command does not remove the viewed file
+from context; only unview(path_or_uri) does that.
 
 Large output is automatically collapsed to a session://preview/... URI. Use
 print(...) to inspect command output or computed text. For PreviewRefs, if the
@@ -3345,7 +3441,15 @@ class CodeAgent(MCPMixin, CodeAgentBase):
 
     def _handle_tool_request(self, repl, req: dict) -> None:
         tool_name = req.get('tool')
-        if tool_name in {'__preview_blob_save__', '__preview_blob_read__', '__line_patch_is_attached__', '__preview_ref_expand__', '__preview_ref_collapse__', '__file_diffs__'}:
+        if tool_name in {
+            '__preview_blob_save__',
+            '__preview_blob_read__',
+            '__line_patch_is_attached__',
+            '__preview_ref_expand__',
+            '__preview_ref_collapse__',
+            '__file_diffs__',
+            '__decide_view_request__',
+        }:
 
             request_id = req.get('request_id')
             args = req.get('args', {})
@@ -3354,6 +3458,18 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                     file_path = args.get("file_path")
                     limit = args.get("limit")
                     repl.send_reply(request_id, result=self._format_file_diff_events(file_path, limit))
+                    return
+                if tool_name == '__decide_view_request__':
+                    repl.send_reply(
+                        request_id,
+                        result=self._decide_view_request(
+                            args.get('path'),
+                            reposition=bool(args.get('reposition', False)),
+                            is_partial=bool(args.get('is_partial', False)),
+                            line_count=args.get('line_count'),
+                            char_count=args.get('char_count'),
+                        ),
+                    )
                     return
                 if tool_name == '__preview_ref_expand__':
                     uri = args.get('uri')
@@ -3534,14 +3650,22 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             file_path: str = "Path to the file",
             offset: Optional[int] = "Line number to start from (1-indexed)",
             limit: Optional[int] = "Number of lines to read (default: 5000)",
-            numbered: Optional[bool] = "Number output lines. Defaults true for files, false for full preview URIs."
+            numbered: Optional[bool] = "Number output lines. Defaults true for files, false for full preview URIs.",
+            reposition: bool = False,
         ):
 
         """Display a file or session://preview/... URI with line numbers.
 
+        Full views attach the file for later turns. If the file is already
+        attached, view(path) is denied; use reposition=True only to move the
+        existing full view to the newest context. Partial views of small files
+        not already in context are promoted to full attached views. Partial
+        views of attached or larger files show only the requested range.
+
         Use view() for inspection with numbered lines:
             view("file.py")
             view("file.py", offset=100, limit=20)
+            view("file.py", reposition=True)
             view("session://preview/abc123", offset=100, limit=20)
 
         Preview URI reads are for inspecting saved preview() output and are
@@ -3557,29 +3681,17 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             full_output = read("session://preview/abc123")
         """
         import os
+        global _request_id
         if not isinstance(file_path, str):
             file_path = os.fspath(file_path)
+        if type(reposition) is not bool:
+            raise TypeError("reposition must be a boolean.")
 
         prefix = "session://preview/"
         is_preview_uri = isinstance(file_path, str) and file_path.startswith(prefix)
         if numbered is None:
             numbered = not is_preview_uri
         path = Path(file_path).expanduser()
-        if not is_preview_uri and offset is None and limit is None:
-            import json as _json
-            global _request_id
-            _request_id += 1
-            _context_req_id = _request_id
-            _send_tool_request(_json.dumps({
-                "tool": "__line_patch_is_attached__",
-                "args": {"path": file_path},
-                "request_id": _context_req_id,
-            }))
-            if _wait_for_ack(_context_req_id):
-                _send_output(
-                    "output",
-                    "\nNotice: file was already in context. Calling view() on files that are already in context is wasteful.\n\n",
-                )
         if is_preview_uri:
             key = file_path[len(prefix):]
             import json as _json
@@ -3608,42 +3720,57 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             content = path.read_text()
 
         all_lines = content.split('\n')
-        total_lines = len(all_lines)
+        total_lines = len(content.splitlines())
         is_partial = offset is not None or limit is not None
-        source_extensions = {
-            ".py", ".pyi", ".pyx", ".pxd", ".pxi",
-            ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
-            ".html", ".htm", ".xhtml", ".css", ".scss", ".sass", ".less",
-            ".vue", ".svelte", ".astro",
-            ".java", ".kt", ".kts", ".scala", ".groovy",
-            ".c", ".h", ".cc", ".hh", ".cpp", ".cxx", ".hpp", ".hxx",
-            ".cs", ".go", ".rs", ".swift", ".m", ".mm",
-            ".php", ".rb", ".rake", ".pl", ".pm", ".t", ".lua",
-            ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
-            ".sql", ".graphql", ".gql",
-            ".xml", ".xsl", ".xslt", ".svg",
-            ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-            ".md", ".mdx", ".rst", ".tex",
-            ".dockerfile", ".containerfile",
-            ".vim", ".el", ".clj", ".cljs", ".cljc", ".ex", ".exs", ".erl", ".hrl",
-            ".fs", ".fsx", ".fsi", ".hs", ".lhs", ".ml", ".mli", ".nim", ".zig",
-            ".r", ".R", ".jl", ".dart", ".sol", ".tf", ".tfvars", ".hcl",
-        }
-        source_names = {
-            "Dockerfile", "Containerfile", "Makefile", "Rakefile", "Gemfile",
-            "Podfile", "Brewfile", "Justfile", "Taskfile", "Jenkinsfile",
-            "BUILD", "WORKSPACE", "CMakeLists.txt",
-        }
-        if not is_preview_uri and is_partial and (path.suffix in source_extensions or path.name in source_names):
-            _send_output(
-                "output",
-                "\nNotice: Direct or partial file reads bypass file inspection tools. Prefer full view(file_path) for inspection; use read(file_path) only when you need a Python string value.\n\n",
-            )
+        attach_full = not is_partial
 
-        start = (offset or 1) - 1
-        end = start + (limit or 5000)
-        lines = all_lines[start:end]
-        start_line = start + 1
+        if not is_preview_uri:
+            import json as _json
+            _request_id += 1
+            _decision_req_id = _request_id
+            _send_tool_request(_json.dumps({
+                "tool": "__decide_view_request__",
+                "args": {
+                    "path": file_path,
+                    "reposition": bool(reposition),
+                    "is_partial": bool(is_partial),
+                    "line_count": total_lines,
+                    "char_count": len(content),
+                },
+                "request_id": _decision_req_id,
+            }))
+            decision = _wait_for_ack(_decision_req_id) or {"action": "proceed"}
+            action = decision.get("action")
+            notice = decision.get("notice")
+            if action in {"deny", "ignore"}:
+                if action == "deny" and notice:
+                    _send_output("output", f"\n{notice}\n\n")
+                return
+            if action == "promote":
+                if notice:
+                    _send_output("output", f"\n{notice}\n\n")
+                attach_full = True
+                is_partial = False
+                offset = None
+                limit = None
+            elif action in {"attach", "reposition"}:
+                attach_full = True
+                is_partial = False
+                offset = None
+                limit = None
+            elif action == "partial":
+                attach_full = False
+
+        if attach_full:
+            start = 0
+            end = total_lines
+            lines = all_lines
+            start_line = 1
+        else:
+            start = (offset or 1) - 1
+            end = start + (limit or 5000)
+            lines = all_lines[start:end]
+            start_line = start + 1
 
         if numbered:
             formatted = [f"{start_line + i:>5}→{line}" for i, line in enumerate(lines)]
@@ -3651,18 +3778,15 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         else:
             output = '\n'.join(lines)
 
-
         remaining = total_lines - end
-        if remaining > 0 and limit is None:
+        if remaining > 0 and limit is None and not attach_full:
             output += f"\n... ({remaining} more lines)"
 
-        if offset is None and limit is None:
+        if attach_full:
             if not is_preview_uri:
                 import hashlib
                 snapshots = globals().setdefault("_line_patch_snapshots", {})
                 snapshots[file_path] = {
-
-
                     "path": file_path,
                     "resolved_path": str(path.resolve()),
                     "content": content,

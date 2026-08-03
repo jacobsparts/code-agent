@@ -172,8 +172,8 @@ def test_observe_records_runtime_text_and_commits_metadata():
     agent = make_agent()
     agent._start_assistant_execution_attempt()
 
-    assert agent.observe(42) == "[Continuing...]"
-    assert agent.observe("  first\nsecond  ") == "[Continuing...]"
+    assert agent.observe(42) is None
+    assert agent.observe("  first\nsecond  ") is None
 
     message = {"role": "assistant", "content": "observe(value)"}
     agent._on_assistant_message_committed(message)
@@ -202,7 +202,7 @@ def test_observe_does_not_pin_or_release():
     agent.complete = False
     agent._start_assistant_execution_attempt()
 
-    assert agent.observe("Result learned.") == "[Continuing...]"
+    assert agent.observe("Result learned.") is None
 
     assert "_pinned_coalesce" not in assistant
     assert agent.complete is False
@@ -237,7 +237,7 @@ def test_observe_relay_captures_runtime_expression_and_arbitrary_value():
 
     assert pure_syntax_error is False
     assert "Traceback" not in output
-    assert "'[Continuing...]'" in output
+    assert "'[Continuing...]'" not in output
     assert agent._pending_observations == ["runtime text"]
 
 
@@ -637,7 +637,7 @@ def test_preview_uri_attachments_appear_in_context_notice():
 
 def test_context_pressure_notice_when_near_limit():
     agent = make_agent()
-    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.model_config["context_constraint"] = 100
     agent.llm_client.usage_tracker.input_tokens_per_byte = {agent.llm_client.model_name: 1.0}
     agent.conversation.usermsg("x" * 200)
 
@@ -653,7 +653,7 @@ def test_context_pressure_notice_when_near_limit():
 
 def test_context_pressure_notice_combines_with_expanded_context():
     agent = make_agent()
-    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.model_config["context_constraint"] = 100
     agent.llm_client.usage_tracker.input_tokens_per_byte = {agent.llm_client.model_name: 1.0}
     agent.conversation.usermsg("x" * 200)
 
@@ -677,7 +677,7 @@ def test_context_pressure_notice_combines_with_expanded_context():
 
 def test_dynamic_context_inventory_is_current_and_precedes_guidance():
     agent = make_agent()
-    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.model_config["context_constraint"] = 100
     agent.llm_client.usage_tracker.input_tokens_per_byte = {
         agent.llm_client.model_name: 1.0
     }
@@ -819,7 +819,7 @@ def test_context_guidance_tiers_and_available_actions():
 
 def test_context_accounting_estimation_failure_is_nonfatal():
     agent = make_agent()
-    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.model_config["context_constraint"] = 100
     agent.llm_client._estimate_input_tokens = lambda value: (_ for _ in ()).throw(
         RuntimeError("estimate failed")
     )
@@ -1031,32 +1031,533 @@ def make_persistent_agent(tmp_path):
     return agent
 
 
+_VIEW_CONTENT_EVENT_KINDS = {"read", "read_partial", "read_attach"}
+
+
+def _run_view_code(agent, code, *, start_attempt=True):
+    """Execute view-related code through the real worker/parent tool path."""
+    if start_attempt:
+        agent._start_assistant_execution_attempt()
+    agent.complete = False
+    repl = agent._get_tool_repl()
+    try:
+        return agent._execute_with_tool_handling(repl, code)
+    finally:
+        repl.close()
+
+
+def _content_events(events):
+    return [event for event in events if event.kind in _VIEW_CONTENT_EVENT_KINDS]
+
+
+def _output_text(events):
+    return "".join(event.text for event in events if event.kind == "output")
+
+
+def _commit_view_attachments(agent, events, content="[view committed]"):
+    previous = getattr(agent, "_suspend_persistence", False)
+    agent._suspend_persistence = True
+    try:
+        llm_output = agent.build_output_for_llm(events)
+        agent.usermsg(content if llm_output.strip() == "" else llm_output)
+    finally:
+        agent._suspend_persistence = previous
+    return llm_output
+
+
 def test_view_full_file_already_in_context_emits_notice(tmp_path):
     path = tmp_path / "already.py"
     path.write_text("print('already')\n")
     file_path = str(path)
     agent = make_persistent_agent(tmp_path)
-    agent.complete = False
     agent.conversation.usermsg(
         f"[Attachment: {file_path}]",
         _attachments={file_path: "    1→print('already')\n"},
         _attachment_refs={file_path: file_path},
     )
-    repl = agent._get_tool_repl()
-    try:
-        output, pure_syntax_error, output_chunks, _ = agent._execute_with_tool_handling(
-            repl,
-            f"view({file_path!r})",
-        )
-    finally:
-        repl.close()
+    output, pure_syntax_error, output_chunks, _ = _run_view_code(
+        agent,
+        f"view({file_path!r})",
+    )
 
     assert pure_syntax_error is False
-    assert "Notice: file was already in context." in output
-    assert any(
-        event.kind == "output" and "Calling view() on files that are already in context is wasteful." in event.text
-        for event in output_chunks
+    assert "Already in context; use reposition=True to move it to the newest context." in output
+    assert "Notice: file was already in context." not in output
+    assert "Calling view() on files that are already in context is wasteful." not in output
+    assert _content_events(output_chunks) == []
+
+
+def test_view_attach_unattached_full_file(tmp_path):
+    path = tmp_path / "fresh.py"
+    path.write_text("print('fresh')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(agent, f"view({file_path!r})")
+
+    assert pure_syntax_error is False
+    assert "Already in context" not in output
+    assert any(event.kind == "read_attach" and event.text.strip() == file_path for event in events)
+    assert any(event.kind == "read" for event in events)
+    assert not any(event.kind == "read_partial" for event in events)
+    llm_output = agent.build_output_for_llm(events)
+    assert f"[Attachment: {file_path}]" in llm_output
+    assert file_path in agent._read_attachments
+
+
+def test_view_deny_preattached_without_read_events(tmp_path):
+    path = tmp_path / "pre.py"
+    path.write_text("print('pre')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {file_path}]",
+        _attachments={file_path: "    1→print('pre')\n"},
+        _attachment_refs={file_path: file_path},
     )
+
+    output, pure_syntax_error, events, _ = _run_view_code(agent, f"view({file_path!r})")
+
+    assert pure_syntax_error is False
+    assert "Already in context; use reposition=True to move it to the newest context." in output
+    assert _content_events(events) == []
+
+
+def test_view_reposition_attached_moves_to_newest_context(tmp_path):
+    path = tmp_path / "move.py"
+    path.write_text("print('move')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    _, _, attach_events, _ = _run_view_code(agent, f"view({file_path!r})")
+    _commit_view_attachments(agent, attach_events)
+    assert agent._is_attached(file_path)
+
+    agent.conversation.usermsg("spacer message between attachment and reposition")
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, reposition=True)",
+    )
+
+    assert pure_syntax_error is False
+    assert "Already in context" not in output
+    assert "Cannot reposition" not in output
+    assert any(event.kind == "read_attach" and event.text.strip() == file_path for event in events)
+    assert any(event.kind == "read" for event in events)
+    llm_output = _commit_view_attachments(agent, events)
+    assert f"[Attachment: {file_path}]" in llm_output
+    # Invalidation clears the old placement and commit adds one newest placement.
+    placements = [
+        (index, msg)
+        for index, msg in enumerate(agent.conversation.messages)
+        if file_path in (msg.get("_attachments") or {})
+        or file_path in (msg.get("_attachment_refs") or {})
+    ]
+    assert len(placements) == 1
+    index, message = placements[0]
+    assert index == len(agent.conversation.messages) - 1
+    assert "print('move')" in message["_attachments"][file_path]
+
+
+def test_view_deny_reposition_unattached(tmp_path):
+    path = tmp_path / "missing.py"
+    path.write_text("print('missing')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, reposition=True)",
+    )
+
+    assert pure_syntax_error is False
+    assert "Cannot reposition: file is not in context. Call view(path) first." in output
+    assert _content_events(events) == []
+
+
+def test_view_deny_reposition_partial(tmp_path):
+    path = tmp_path / "partial_repo.py"
+    path.write_text("line1\nline2\nline3\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {file_path}]",
+        _attachments={file_path: "    1→line1\n"},
+        _attachment_refs={file_path: file_path},
+    )
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=1, reposition=True)",
+    )
+
+    assert pure_syntax_error is False
+    assert "reposition=True is only valid for a full file view." in output
+    assert _content_events(events) == []
+
+
+def test_view_same_attempt_duplicate_attach_silent(tmp_path):
+    path = tmp_path / "dup_attach.py"
+    path.write_text("print('dup')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r})\nview({file_path!r})",
+    )
+
+    assert pure_syntax_error is False
+    assert "Already in context" not in output
+    assert sum(1 for event in events if event.kind == "read_attach") == 1
+    assert sum(1 for event in events if event.kind == "read") == 1
+    assert not any(event.kind == "read_partial" for event in events)
+
+
+def test_view_same_attempt_duplicate_reposition_silent(tmp_path):
+    path = tmp_path / "dup_repo.py"
+    path.write_text("print('repo')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {file_path}]",
+        _attachments={file_path: "    1→print('repo')\n"},
+        _attachment_refs={file_path: file_path},
+    )
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, reposition=True)\nview({file_path!r}, reposition=True)",
+    )
+
+    assert pure_syntax_error is False
+    assert "Cannot reposition" not in output
+    assert "Already in context" not in output
+    assert sum(1 for event in events if event.kind == "read_attach") == 1
+    assert sum(1 for event in events if event.kind == "read") == 1
+
+
+def test_view_small_partial_promotes_with_notice_and_attachment(tmp_path):
+    path = tmp_path / "small.py"
+    path.write_text("print('small')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=1)",
+    )
+
+    assert pure_syntax_error is False
+    assert (
+        "Promoted partial view to full view: file is small and not already in context."
+        in output
+    )
+    assert any(event.kind == "read_attach" and event.text.strip() == file_path for event in events)
+    assert any(event.kind == "read" for event in events)
+    assert not any(event.kind == "read_partial" for event in events)
+    llm_output = agent.build_output_for_llm(events)
+    assert f"[Attachment: {file_path}]" in llm_output
+
+
+def test_view_large_partial_remains_partial(tmp_path):
+    path = tmp_path / "large.py"
+    # Exceed line threshold (>2000 lines).
+    path.write_text("\n".join(f"line-{i}" for i in range(2001)) + "\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=2)",
+    )
+
+    assert pure_syntax_error is False
+    assert "Promoted partial view" not in output
+    assert any(event.kind == "read_partial" and event.text.strip() == file_path for event in events)
+    assert any(event.kind == "read" for event in events)
+    assert not any(event.kind == "read_attach" for event in events)
+    llm_output = agent.build_output_for_llm(events)
+    assert f"[Attachment: {file_path}]" not in llm_output
+
+
+def test_view_preattached_partial_remains_partial(tmp_path):
+    path = tmp_path / "attached_partial.py"
+    path.write_text("alpha\nbeta\ngamma\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+    agent.conversation.usermsg(
+        f"[Attachment: {file_path}]",
+        _attachments={file_path: "    1→alpha\n"},
+        _attachment_refs={file_path: file_path},
+    )
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=2, limit=1)",
+    )
+
+    assert pure_syntax_error is False
+    assert "Promoted partial view" not in output
+    assert any(event.kind == "read_partial" and event.text.strip() == file_path for event in events)
+    assert any(event.kind == "read" and "beta" in event.text for event in events)
+    assert not any(event.kind == "read_attach" for event in events)
+
+
+def test_view_duplicate_promoting_partial_silent_no_fallback(tmp_path):
+    path = tmp_path / "promote_dup.py"
+    path.write_text("print('promote')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=1)\nview({file_path!r}, offset=1, limit=1)",
+    )
+
+    assert pure_syntax_error is False
+    assert output.count(
+        "Promoted partial view to full view: file is small and not already in context."
+    ) == 1
+    assert sum(1 for event in events if event.kind == "read_attach") == 1
+    assert sum(1 for event in events if event.kind == "read") == 1
+    assert not any(event.kind == "read_partial" for event in events)
+
+
+def test_view_partial_obsolete_bypass_notice_absent(tmp_path):
+    path = tmp_path / "no_bypass.py"
+    # Large enough to remain partial so we exercise the partial path.
+    path.write_text("\n".join(f"row-{i}" for i in range(2001)) + "\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    output, pure_syntax_error, events, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=1)",
+    )
+
+    assert pure_syntax_error is False
+    assert "bypass file inspection tools" not in output
+    assert "Prefer full view(file_path) for inspection" not in output
+    assert any(event.kind == "read_partial" for event in events)
+
+
+def test_view_preview_uri_unaffected_by_reposition_rules(tmp_path):
+    agent = make_persistent_agent(tmp_path)
+    agent.complete = False
+    original = "line\n" + ("x" * 6000)
+    rendered = agent.process_output_for_llm(original)
+    uri = re.search(r"session://preview/[0-9a-f]{16}", rendered).group(0)
+
+    output, pure_syntax_error, events, _ = _run_view_code(agent, f"view({uri!r})")
+    llm_output = agent.build_output_for_llm(events)
+
+    assert pure_syntax_error is False
+    assert f"Expanded preview: {uri}" in llm_output
+    assert "Already in context" not in output
+    assert "Cannot reposition" not in output
+    assert "Promoted partial view" not in output
+    assert agent._expanded_preview_refs == {uri: {"numbered": False}}
+    assert _content_events(events) == []
+
+
+def test_view_preprocessor_created_duplicates_obey_runtime_rules(tmp_path):
+    path = tmp_path / "preproc.py"
+    path.write_text("print('preproc')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    # Bare read(...) statements are rewritten to view(...) by preprocess_code_agent.
+    output, pure_syntax_error, events, processed = _run_view_code(
+        agent,
+        f"read({file_path!r})\nread({file_path!r})",
+    )
+
+    assert pure_syntax_error is False
+    assert "view(" in processed
+    assert processed.count("view(") >= 2
+    assert "Already in context" not in output
+    assert sum(1 for event in events if event.kind == "read_attach") == 1
+    assert sum(1 for event in events if event.kind == "read") == 1
+    assert not any(event.kind == "read_partial" for event in events)
+
+
+def test_view_full_attach_context_reject_clears_pending_for_retry(tmp_path):
+    """Context-limit rejection of a full attach must clear pending so retry is not ignored."""
+    path = tmp_path / "retry_full.py"
+    path.write_text("print('retry-full')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    # Force first attach to be rejected during parent-side attachment conversion.
+    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.model_config["max_input_tokens"] = 100
+    agent.llm_client.usage_tracker.input_tokens_per_byte = {
+        agent.llm_client.model_name: 1.0
+    }
+
+    output1, pure_syntax_error1, events1, _ = _run_view_code(
+        agent,
+        f"view({file_path!r})",
+    )
+    llm_output1 = agent.build_output_for_llm(events1)
+
+    assert pure_syntax_error1 is False
+    assert "denied because the file would exceed 90%" in llm_output1
+    assert f"[Attachment: {file_path}]" not in llm_output1
+    assert file_path not in getattr(agent, "_read_attachments", {})
+    pending = getattr(agent, "_pending_full_views", set())
+    assert (agent._logical_path(file_path), "attach") not in pending
+
+    # Allow the same-attempt retry to succeed.
+    agent.llm_client.model_config["context_window"] = 1_000_000
+    agent.llm_client.model_config["max_input_tokens"] = None
+    agent.llm_client.usage_tracker.input_tokens_per_byte = {
+        agent.llm_client.model_name: 0.0
+    }
+
+    output2, pure_syntax_error2, events2, _ = _run_view_code(
+        agent,
+        f"view({file_path!r})",
+        start_attempt=False,
+    )
+    llm_output2 = agent.build_output_for_llm(events2)
+
+    assert pure_syntax_error2 is False
+    assert "Already in context" not in output2
+    assert sum(1 for event in events2 if event.kind == "read_attach") == 1
+    assert sum(1 for event in events2 if event.kind == "read") == 1
+    assert f"[Attachment: {file_path}]" in llm_output2
+    assert file_path in agent._read_attachments
+
+
+def test_view_promoted_partial_context_reject_clears_pending_for_retry(tmp_path):
+    """Context-limit rejection after promotion must clear attach pending so retry is not ignored."""
+    path = tmp_path / "retry_promote.py"
+    path.write_text("print('retry-promote')\n")
+    file_path = str(path)
+    agent = make_persistent_agent(tmp_path)
+
+    agent.llm_client.model_config["context_window"] = 100
+    agent.llm_client.model_config["max_input_tokens"] = 100
+    agent.llm_client.usage_tracker.input_tokens_per_byte = {
+        agent.llm_client.model_name: 1.0
+    }
+
+    output1, pure_syntax_error1, events1, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=1)",
+    )
+    llm_output1 = agent.build_output_for_llm(events1)
+
+    assert pure_syntax_error1 is False
+    assert (
+        "Promoted partial view to full view: file is small and not already in context."
+        in output1
+    )
+    assert "denied because the file would exceed 90%" in llm_output1
+    assert f"[Attachment: {file_path}]" not in llm_output1
+    assert file_path not in getattr(agent, "_read_attachments", {})
+    pending = getattr(agent, "_pending_full_views", set())
+    assert (agent._logical_path(file_path), "attach") not in pending
+
+    agent.llm_client.model_config["context_window"] = 1_000_000
+    agent.llm_client.model_config["max_input_tokens"] = None
+    agent.llm_client.usage_tracker.input_tokens_per_byte = {
+        agent.llm_client.model_name: 0.0
+    }
+
+    output2, pure_syntax_error2, events2, _ = _run_view_code(
+        agent,
+        f"view({file_path!r}, offset=1, limit=1)",
+        start_attempt=False,
+    )
+    llm_output2 = agent.build_output_for_llm(events2)
+
+    assert pure_syntax_error2 is False
+    assert output2.count(
+        "Promoted partial view to full view: file is small and not already in context."
+    ) == 1
+    assert sum(1 for event in events2 if event.kind == "read_attach") == 1
+    assert sum(1 for event in events2 if event.kind == "read") == 1
+    assert not any(event.kind == "read_partial" for event in events2)
+    assert f"[Attachment: {file_path}]" in llm_output2
+    assert file_path in agent._read_attachments
+
+
+def test_view_promote_line_threshold_boundary_with_trailing_newline(tmp_path):
+    """Exact 2000 logical lines (trailing newline) promote; 2001 remain partial."""
+    eligible = tmp_path / "lines_2000.py"
+    ineligible = tmp_path / "lines_2001.py"
+    eligible.write_text("\n".join(f"line-{i}" for i in range(2000)) + "\n")
+    ineligible.write_text("\n".join(f"line-{i}" for i in range(2001)) + "\n")
+    assert len(eligible.read_text().splitlines()) == 2000
+    assert len(ineligible.read_text().splitlines()) == 2001
+
+    agent = make_persistent_agent(tmp_path)
+    eligible_path = str(eligible)
+    ineligible_path = str(ineligible)
+
+    output_ok, err_ok, events_ok, _ = _run_view_code(
+        agent,
+        f"view({eligible_path!r}, offset=1, limit=1)",
+    )
+    assert err_ok is False
+    assert (
+        "Promoted partial view to full view: file is small and not already in context."
+        in output_ok
+    )
+    assert any(event.kind == "read_attach" for event in events_ok)
+    assert not any(event.kind == "read_partial" for event in events_ok)
+
+    output_no, err_no, events_no, _ = _run_view_code(
+        agent,
+        f"view({ineligible_path!r}, offset=1, limit=1)",
+    )
+    assert err_no is False
+    assert "Promoted partial view" not in output_no
+    assert any(event.kind == "read_partial" for event in events_no)
+    assert not any(event.kind == "read_attach" for event in events_no)
+
+
+def test_view_promote_char_threshold_exact_boundary(tmp_path):
+    """<=100000 chars promote when line threshold is met; >100000 remain partial."""
+    at_limit = tmp_path / "chars_100000.txt"
+    over_limit = tmp_path / "chars_100001.txt"
+    prefix = "h0\nh1\nh2\n"
+    at_limit.write_text(prefix + ("a" * (100_000 - len(prefix))))
+    over_limit.write_text(prefix + ("a" * (100_001 - len(prefix))))
+    assert len(at_limit.read_text()) == 100_000
+    assert len(over_limit.read_text()) == 100_001
+    assert len(at_limit.read_text().splitlines()) <= 2000
+    assert len(over_limit.read_text().splitlines()) <= 2000
+
+    agent = make_persistent_agent(tmp_path)
+    at_path = str(at_limit)
+    over_path = str(over_limit)
+
+    output_ok, err_ok, events_ok, _ = _run_view_code(
+        agent,
+        f"view({at_path!r}, offset=1, limit=1)",
+    )
+    assert err_ok is False
+    assert (
+        "Promoted partial view to full view: file is small and not already in context."
+        in output_ok
+    )
+    assert any(event.kind == "read_attach" for event in events_ok)
+    assert not any(event.kind == "read_partial" for event in events_ok)
+
+    output_no, err_no, events_no, _ = _run_view_code(
+        agent,
+        f"view({over_path!r}, offset=1, limit=1)",
+    )
+    assert err_no is False
+    assert "Promoted partial view" not in output_no
+    assert any(event.kind == "read_partial" for event in events_no)
+    assert not any(event.kind == "read_attach" for event in events_no)
+
 
 
 def test_auto_preview_long_complete_turn_output(tmp_path):
