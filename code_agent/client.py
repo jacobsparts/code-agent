@@ -449,9 +449,9 @@ class LLMClient:
             self.model_config["provider"],
             self.model_config.get("tpm", 5),
         )
-        return self._parse_responses_result(
-            codex.responses(req, timeout=self.timeout)
-        )
+        # Stage idle budgets live in code_agent.codex (60s/30s/30s).
+        # Do not impose a total wall-clock timeout here.
+        return self._parse_responses_result(codex.responses(req))
 
     def _call_messages(self, messages, tools):
         """

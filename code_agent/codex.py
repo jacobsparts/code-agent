@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import base64
 import copy
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
+import socket
 from io import BytesIO
 import tempfile
 import urllib.error
 import urllib.request
 import uuid
+
+logger = logging.getLogger("code_agent")
 
 CRED_FILE = os.path.expanduser("~/.code-agent/codex-auth.json")
 REFRESH_URL = "https://auth.openai.com/oauth/token"
@@ -19,7 +24,11 @@ RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLIENT_VERSION = "0.146.0"
 MODEL = "gpt-5.6-luna"
-DEFAULT_TIMEOUT = 300
+DEFAULT_FIRST_BYTE_TIMEOUT = 60.0
+DEFAULT_THINKING_IDLE_TIMEOUT = 30.0
+DEFAULT_ANSWERING_IDLE_TIMEOUT = 30.0
+# Backward-compatible alias: historical `timeout` means first-byte / connect budget.
+DEFAULT_TIMEOUT = DEFAULT_FIRST_BYTE_TIMEOUT
 REFRESH_WINDOW_MINUTES = 5
 MAX_REFRESH_AGE_DAYS = 8
 
@@ -42,6 +51,78 @@ SESSION_ID = _uuid7()
 
 class CodexError(Exception):
     pass
+
+
+class CodexStallError(CodexError):
+    """Raised when a Codex SSE stream stops emitting progress events."""
+
+    def __init__(self, message: str, *, stage: str, idle_timeout: float, last_event_type: str | None = None):
+        super().__init__(message)
+        self.stage = stage
+        self.idle_timeout = idle_timeout
+        self.last_event_type = last_event_type
+
+
+@dataclass(frozen=True)
+class StreamTimeouts:
+    first_byte: float = DEFAULT_FIRST_BYTE_TIMEOUT
+    thinking_idle: float = DEFAULT_THINKING_IDLE_TIMEOUT
+    answering_idle: float = DEFAULT_ANSWERING_IDLE_TIMEOUT
+
+    def idle_for(self, stage: str) -> float:
+        if stage == "answering":
+            return self.answering_idle
+        if stage == "thinking":
+            return self.thinking_idle
+        return self.first_byte
+
+
+def _response_socket(stream):
+    """Best-effort extraction of the live socket behind an HTTP/SSE stream."""
+    seen = set()
+    stack = [stream]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        if hasattr(obj, "settimeout") and hasattr(obj, "recv"):
+            return obj
+        for attr in ("_sock", "socket", "raw", "fp", "_stream", "rfile"):
+            child = getattr(obj, attr, None)
+            if child is not None:
+                stack.append(child)
+    return None
+
+
+def _set_socket_timeout(sock, timeout: float | None) -> None:
+    if sock is None or timeout is None:
+        return
+    try:
+        sock.settimeout(timeout)
+    except OSError:
+        pass
+
+
+def _is_answering_event(event: dict) -> bool:
+    event_type = event.get("type") or ""
+    if event_type in {
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    }:
+        return True
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") in {"message", "function_call"}:
+            return True
+    return False
 
 
 def _b64url_decode(value: str) -> bytes:
@@ -298,37 +379,89 @@ def _event_result(events: list[dict]) -> dict:
     return response
 
 
-def parse_sse(stream) -> dict:
+def _log_sse_event(event: dict) -> None:
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(json.dumps(event, separators=(",", ":")))
+
+
+def parse_sse(stream, timeouts: StreamTimeouts | None = None) -> dict:
     events = []
     data_lines = []
-    for raw_line in stream:
-        line = raw_line.decode("utf-8", "strict").rstrip("\r\n")
-        if line:
-            if line.startswith("data:"):
-                value = line[5:]
-                data_lines.append(value[1:] if value.startswith(" ") else value)
-            continue
-        if not data_lines:
-            continue
-        data = "\n".join(data_lines)
-        data_lines.clear()
-        if data == "[DONE]":
-            break
-        try:
-            event = json.loads(data)
-        except json.JSONDecodeError as exc:
-            raise CodexError(f"Malformed Codex SSE event: {exc}") from exc
-        if isinstance(event, dict):
-            events.append(event)
-    if data_lines:
-        data = "\n".join(data_lines)
-        if data != "[DONE]":
+    log_events = logger.isEnabledFor(logging.INFO)
+    sock = _response_socket(stream) if timeouts is not None else None
+    stage = "first_byte"
+    last_event_type = None
+    if timeouts is not None:
+        _set_socket_timeout(sock, timeouts.idle_for(stage))
+    if log_events:
+        logger.info("---------- FROM LLM ----------")
+
+    def note_event(event: dict) -> None:
+        nonlocal stage, last_event_type
+        last_event_type = event.get("type")
+        if timeouts is None:
+            return
+        if stage == "first_byte":
+            stage = "answering" if _is_answering_event(event) else "thinking"
+        elif stage == "thinking" and _is_answering_event(event):
+            stage = "answering"
+        _set_socket_timeout(sock, timeouts.idle_for(stage))
+
+    def stall_error(exc: Exception) -> CodexStallError:
+        idle = timeouts.idle_for(stage) if timeouts is not None else 0.0
+        detail = last_event_type or "none"
+        return CodexStallError(
+            f"Codex SSE stalled during {stage} after {idle:g}s idle "
+            f"(last event={detail})",
+            stage=stage,
+            idle_timeout=idle,
+            last_event_type=last_event_type,
+        )
+
+    try:
+        stream_iter = iter(stream)
+        while True:
+            try:
+                raw_line = next(stream_iter)
+            except StopIteration:
+                break
+            except (TimeoutError, socket.timeout) as exc:
+                raise stall_error(exc) from exc
+            line = raw_line.decode("utf-8", "strict").rstrip("\r\n")
+            if line:
+                if line.startswith("data:"):
+                    value = line[5:]
+                    data_lines.append(value[1:] if value.startswith(" ") else value)
+                continue
+            if not data_lines:
+                continue
+            data = "\n".join(data_lines)
+            data_lines.clear()
+            if data == "[DONE]":
+                break
             try:
                 event = json.loads(data)
             except json.JSONDecodeError as exc:
                 raise CodexError(f"Malformed Codex SSE event: {exc}") from exc
             if isinstance(event, dict):
+                if log_events:
+                    _log_sse_event(event)
                 events.append(event)
+                note_event(event)
+        if data_lines:
+            data = "\n".join(data_lines)
+            if data != "[DONE]":
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise CodexError(f"Malformed Codex SSE event: {exc}") from exc
+                if isinstance(event, dict):
+                    if log_events:
+                        _log_sse_event(event)
+                    events.append(event)
+                    note_event(event)
+    except (TimeoutError, socket.timeout) as exc:
+        raise stall_error(exc) from exc
     return _event_result(events)
 
 
@@ -348,62 +481,176 @@ def _headers(auth: CodexAuth) -> dict[str, str]:
     return headers
 
 
+def _parse_json_payload(payload: bytes) -> dict:
+    try:
+        result = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CodexError(f"Malformed Codex JSON response: {exc}") from exc
+    if not isinstance(result, dict):
+        raise CodexError("Codex JSON response is not an object")
+    return result
+
+
 def _parse_response_body(content_type: str, payload: bytes) -> dict:
     content_type = content_type.lower()
     if "text/event-stream" in content_type:
         return parse_sse(BytesIO(payload))
     if "json" in content_type:
-        try:
-            result = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CodexError(f"Malformed Codex JSON response: {exc}") from exc
-        if not isinstance(result, dict):
-            raise CodexError("Codex JSON response is not an object")
-        return result
+        return _parse_json_payload(payload)
     if not content_type:
         # The Codex endpoint can omit Content-Type on an otherwise valid SSE
         # response.  Prefer JSON when the body is clearly JSON, then fall back
         # to the event parser used by the normal streaming response.
         if payload.lstrip().startswith(b"{"):
             try:
-                result = json.loads(payload)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                result = None
-            if isinstance(result, dict):
-                return result
+                return _parse_json_payload(payload)
+            except CodexError:
+                pass
         return parse_sse(BytesIO(payload))
     raise CodexError(f"Unexpected Codex Content-Type: {content_type!r}")
 
 
-def _request(auth: CodexAuth, body: dict, timeout: float) -> dict:
+def _parse_http_response(response, timeouts: StreamTimeouts | None = None) -> dict:
+    content_type = ""
+    if getattr(response, "headers", None):
+        content_type = response.headers.get("Content-Type", "") or ""
+    lowered = content_type.lower()
+    if "text/event-stream" in lowered:
+        return parse_sse(response, timeouts=timeouts)
+    if "json" in lowered:
+        payload = response.read()
+        result = _parse_json_payload(payload)
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("---------- FROM LLM ----------")
+            logger.info(payload.decode("utf-8", "replace"))
+        return result
+    if lowered:
+        raise CodexError(f"Unexpected Codex Content-Type: {content_type!r}")
+    # Empty Content-Type: peek enough to distinguish JSON vs SSE, then either
+    # parse JSON or continue incrementally through the live stream.
+    first = response.read(1)
+    if not first:
+        raise CodexError("Empty Codex response body")
+    if first.lstrip().startswith(b"{"):
+        payload = first + response.read()
+        result = _parse_json_payload(payload)
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("---------- FROM LLM ----------")
+            logger.info(payload.decode("utf-8", "replace"))
+        return result
+    return parse_sse(_PrefixedStream(first, response), timeouts=timeouts)
+
+
+class _PrefixedStream:
+    """Yield one already-read prefix byte, then continue from the live stream."""
+
+    def __init__(self, prefix: bytes, stream):
+        self._prefix = prefix
+        self._stream = stream
+        self._sent_prefix = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._sent_prefix:
+            self._sent_prefix = True
+            if self._prefix:
+                # Prefer a full first line when the underlying stream is line-based.
+                rest = self._stream.readline() if hasattr(self._stream, "readline") else b""
+                return self._prefix + rest
+        if hasattr(self._stream, "readline"):
+            line = self._stream.readline()
+            if line:
+                return line
+            raise StopIteration
+        return next(self._stream)
+
+
+def _normalize_stream_timeouts(
+    timeouts: StreamTimeouts | None = None,
+    *,
+    timeout: float | None = None,
+    first_byte_timeout: float | None = None,
+    thinking_idle_timeout: float | None = None,
+    answering_idle_timeout: float | None = None,
+) -> StreamTimeouts:
+    if timeouts is not None:
+        base = timeouts
+    else:
+        first_byte = DEFAULT_FIRST_BYTE_TIMEOUT if timeout is None else float(timeout)
+        base = StreamTimeouts(first_byte=first_byte)
+    return StreamTimeouts(
+        first_byte=base.first_byte if first_byte_timeout is None else float(first_byte_timeout),
+        thinking_idle=(
+            base.thinking_idle if thinking_idle_timeout is None else float(thinking_idle_timeout)
+        ),
+        answering_idle=(
+            base.answering_idle if answering_idle_timeout is None else float(answering_idle_timeout)
+        ),
+    )
+
+
+def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts) -> dict:
     encoded = json.dumps(body, separators=(",", ":")).encode()
     for attempt in range(2):
         auth.ensure_valid()
+        headers = _headers(auth)
         request = urllib.request.Request(
             RESPONSES_URL,
             data=encoded,
-            headers=_headers(auth),
+            headers=headers,
             method="POST",
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("----------- TO LLM -----------")
+            logger.debug(f"POST {RESPONSES_URL} {headers}")
+            logger.debug(encoded.decode("utf-8"))
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                content_type = response.headers.get("Content-Type", "")
-                return _parse_response_body(content_type, response.read())
+            with urllib.request.urlopen(request, timeout=timeouts.first_byte) as response:
+                return _parse_http_response(response, timeouts=timeouts)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("---------- FROM LLM ----------")
+                logger.info(detail)
             if exc.code == 401 and attempt == 0:
                 auth.refresh()
                 continue
             raise CodexError(f"Codex request failed: HTTP {exc.code}: {detail}") from exc
+        except CodexStallError:
+            raise
         except urllib.error.URLError as exc:
-            raise CodexError(f"Codex request failed: {exc.reason}") from exc
+            reason = exc.reason
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise CodexStallError(
+                    f"Codex SSE stalled during first_byte after {timeouts.first_byte:g}s idle "
+                    f"(last event=none)",
+                    stage="first_byte",
+                    idle_timeout=timeouts.first_byte,
+                    last_event_type=None,
+                ) from exc
+            raise CodexError(f"Codex request failed: {reason}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise CodexStallError(
+                f"Codex SSE stalled during first_byte after {timeouts.first_byte:g}s idle "
+                f"(last event=none)",
+                stage="first_byte",
+                idle_timeout=timeouts.first_byte,
+                last_event_type=None,
+            ) from exc
     raise CodexError("Codex request failed after token refresh")
 
 
 def responses(
     body: dict,
     auth: CodexAuth | None = None,
-    timeout: float = DEFAULT_TIMEOUT,
+    timeout: float | None = None,
+    *,
+    timeouts: StreamTimeouts | None = None,
+    first_byte_timeout: float | None = None,
+    thinking_idle_timeout: float | None = None,
+    answering_idle_timeout: float | None = None,
 ) -> dict:
     if not isinstance(body, dict):
         raise TypeError("body must be a dictionary")
@@ -432,4 +679,11 @@ def responses(
     request_body.setdefault("parallel_tool_calls", True)
     request_body.setdefault("prompt_cache_key", SESSION_ID)
     request_body.setdefault("include", ["reasoning.encrypted_content"])
-    return _request(auth or CodexAuth(), request_body, timeout)
+    stream_timeouts = _normalize_stream_timeouts(
+        timeouts,
+        timeout=timeout,
+        first_byte_timeout=first_byte_timeout,
+        thinking_idle_timeout=thinking_idle_timeout,
+        answering_idle_timeout=answering_idle_timeout,
+    )
+    return _request(auth or CodexAuth(), request_body, stream_timeouts)

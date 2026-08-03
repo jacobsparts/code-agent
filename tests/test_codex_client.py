@@ -1,4 +1,6 @@
 import json
+import socket
+import logging
 import os
 import stat
 import subprocess
@@ -159,8 +161,8 @@ def test_responses_adds_transport_defaults(monkeypatch, tmp_path):
         "usage": {"input_tokens": 10, "output_tokens": 2},
     }
 
-    def request(auth_arg, body, timeout):
-        captured.update(auth=auth_arg, body=body, timeout=timeout)
+    def request(auth_arg, body, timeouts):
+        captured.update(auth=auth_arg, body=body, timeouts=timeouts)
         return native_response
 
     monkeypatch.setattr(codex, "_request", request)
@@ -179,7 +181,11 @@ def test_responses_adds_transport_defaults(monkeypatch, tmp_path):
     response = codex.responses(request_body, auth=auth, timeout=17)
 
     assert response is native_response
-    assert captured["timeout"] == 17
+    assert captured["timeouts"] == codex.StreamTimeouts(
+        first_byte=17,
+        thinking_idle=codex.DEFAULT_THINKING_IDLE_TIMEOUT,
+        answering_idle=codex.DEFAULT_ANSWERING_IDLE_TIMEOUT,
+    )
     assert captured["body"]["input"] == request_body["input"]
     assert captured["body"]["instructions"] == ""
     assert captured["body"]["tools"] == request_body["tools"]
@@ -195,7 +201,7 @@ def test_responses_maps_system_to_developer_without_mutating_request(monkeypatch
     auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
     captured = {}
 
-    def request(auth_arg, body, timeout):
+    def request(auth_arg, body, timeouts):
         captured["body"] = body
         return {"status": "completed", "output": []}
 
@@ -287,7 +293,7 @@ def test_codex_strips_unsupported_prompt_cache_fields(monkeypatch, tmp_path):
     auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
     captured = {}
 
-    def request(auth_arg, body, timeout):
+    def request(auth_arg, body, timeouts):
         captured.update(body=body)
         return {"status": "completed", "output": []}
 
@@ -330,8 +336,8 @@ def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     captured = {}
 
-    def complete(body, auth=None, timeout=codex.DEFAULT_TIMEOUT):
-        captured.update(body=body, auth=auth, timeout=timeout)
+    def complete(body, auth=None, **kwargs):
+        captured.update(body=body, auth=auth, kwargs=kwargs)
         return {
             "id": "response-1",
             "status": "completed",
@@ -351,6 +357,7 @@ def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
         "content": [{"type": "input_text", "text": "hello"}],
     }]
     assert "tools" not in captured["body"]
+    assert "timeout" not in captured["kwargs"]
     assert result == {"role": "assistant", "content": "hello", "_stop_reason": "stop"}
 
 
@@ -375,8 +382,8 @@ def test_codex_client_adapter(monkeypatch, tmp_path):
     )
     captured = {}
 
-    def complete(body, auth=None, timeout=codex.DEFAULT_TIMEOUT):
-        captured.update(body=body, auth=auth, timeout=timeout)
+    def complete(body, auth=None, **kwargs):
+        captured.update(body=body, auth=auth, kwargs=kwargs)
         return {
             "id": "response-1",
             "status": "completed",
@@ -398,6 +405,306 @@ def test_codex_client_adapter(monkeypatch, tmp_path):
         "type": "function",
         **REPL_EXECUTE_TOOL["function"],
     }]
-    assert captured["timeout"] == 20
+    assert "timeout" not in captured["kwargs"]
     assert result["content"] == "emit('ok', release=True)"
     assert result["_stop_reason"] == "tool_calls"
+
+
+class _FakeHeaders(dict):
+    def get(self, key, default=None):
+        for candidate, value in self.items():
+            if candidate.lower() == key.lower():
+                return value
+        return default
+
+
+class _FakeResponse:
+    def __init__(self, payload: bytes, content_type: str = "text/event-stream"):
+        self.headers = _FakeHeaders({"Content-Type": content_type} if content_type else {})
+        self._stream = BytesIO(payload)
+        self.status = 200
+
+    def read(self, size=-1):
+        return self._stream.read(size)
+
+    def readline(self, size=-1):
+        return self._stream.readline(size)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_parse_sse_logs_events_as_they_arrive(caplog):
+    events = [
+        {"type": "response.created", "response": {"id": "resp_1"}},
+        {"type": "response.output_text.delta", "delta": "hi"},
+        {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}],
+                }],
+            },
+        },
+    ]
+    payload = b"".join(
+        f"data: {json.dumps(event)}\n\n".encode() for event in events
+    ) + b"data: [DONE]\n\n"
+
+    with caplog.at_level(logging.INFO, logger="code_agent"):
+        response = codex.parse_sse(BytesIO(payload))
+
+    assert response["output"][0]["content"][0]["text"] == "hi"
+    messages = [record.getMessage() for record in caplog.records]
+    assert "---------- FROM LLM ----------" in messages
+    assert json.dumps(events[0], separators=(",", ":")) in messages
+    assert json.dumps(events[1], separators=(",", ":")) in messages
+    assert json.dumps(events[2], separators=(",", ":")) in messages
+
+
+def test_request_logs_to_llm_and_streams_sse(monkeypatch, tmp_path, caplog):
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
+    events = [
+        {"type": "response.output_text.delta", "delta": "ok"},
+        {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }],
+            },
+        },
+    ]
+    payload = b"".join(
+        f"data: {json.dumps(event)}\n\n".encode() for event in events
+    ) + b"data: [DONE]\n\n"
+    fake = _FakeResponse(payload, content_type="text/event-stream")
+
+    def fake_urlopen(request, timeout=None):
+        assert timeout == 17
+        assert request.full_url == codex.RESPONSES_URL
+        fake.request = request
+        return fake
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", fake_urlopen)
+
+    body = {
+        "model": "gpt-5.6-luna",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": True,
+    }
+    with caplog.at_level(logging.DEBUG, logger="code_agent"):
+        response = codex._request(
+            auth,
+            body,
+            codex.StreamTimeouts(
+                first_byte=17,
+                thinking_idle=codex.DEFAULT_THINKING_IDLE_TIMEOUT,
+                answering_idle=codex.DEFAULT_ANSWERING_IDLE_TIMEOUT,
+            ),
+        )
+
+    assert response["output"][0]["content"][0]["text"] == "ok"
+    messages = [record.getMessage() for record in caplog.records]
+    assert "----------- TO LLM -----------" in messages
+    assert any(msg.startswith(f"POST {codex.RESPONSES_URL} ") for msg in messages)
+    assert json.dumps(body, separators=(",", ":")) in messages
+    assert "---------- FROM LLM ----------" in messages
+    assert json.dumps(events[0], separators=(",", ":")) in messages
+    assert json.dumps(events[1], separators=(",", ":")) in messages
+
+
+def test_parse_http_response_streams_sse_without_content_type():
+    payload = (
+        b'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    response = codex._parse_http_response(_FakeResponse(payload, content_type=""))
+    assert response["status"] == "completed"
+    assert response["output"] == []
+
+
+
+class _FakeSock:
+    def __init__(self):
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def recv(self, size=0):
+        return b""
+
+
+class _SocketBackedStream:
+    """Yield SSE lines for the given events, then raise socket.timeout."""
+
+    def __init__(self, events, sock, timeout_exc=None):
+        payload = b"".join(
+            f"data: {json.dumps(event)}\n\n".encode() for event in events
+        )
+        self._lines = payload.splitlines(keepends=True)
+        self._index = 0
+        self._timeout_exc = timeout_exc or socket.timeout("timed out")
+        self._sock = sock
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._index >= len(self._lines):
+            raise self._timeout_exc
+        line = self._lines[self._index]
+        self._index += 1
+        return line
+
+
+def test_normalize_stream_timeouts_defaults_and_overrides():
+    defaults = codex._normalize_stream_timeouts()
+    assert defaults == codex.StreamTimeouts(
+        first_byte=codex.DEFAULT_FIRST_BYTE_TIMEOUT,
+        thinking_idle=codex.DEFAULT_THINKING_IDLE_TIMEOUT,
+        answering_idle=codex.DEFAULT_ANSWERING_IDLE_TIMEOUT,
+    )
+    assert defaults.first_byte == 60.0
+    assert defaults.thinking_idle == 30.0
+    assert defaults.answering_idle == 30.0
+
+    legacy = codex._normalize_stream_timeouts(timeout=17)
+    assert legacy.first_byte == 17.0
+    assert legacy.thinking_idle == 30.0
+    assert legacy.answering_idle == 30.0
+
+    custom = codex._normalize_stream_timeouts(
+        first_byte_timeout=12,
+        thinking_idle_timeout=34,
+        answering_idle_timeout=56,
+    )
+    assert custom == codex.StreamTimeouts(first_byte=12, thinking_idle=34, answering_idle=56)
+
+
+def test_is_answering_event_distinguishes_message_and_tool_from_reasoning():
+    assert codex._is_answering_event({"type": "response.output_text.delta", "delta": "x"})
+    assert codex._is_answering_event({
+        "type": "response.output_item.added",
+        "item": {"type": "message"},
+    })
+    assert codex._is_answering_event({
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "name": "echo"},
+    })
+    assert not codex._is_answering_event({
+        "type": "response.output_item.added",
+        "item": {"type": "reasoning"},
+    })
+    assert not codex._is_answering_event({"type": "response.created"})
+
+
+def test_parse_sse_stalls_during_thinking_with_stage_timeouts(monkeypatch):
+    sock = _FakeSock()
+    events = [
+        {"type": "response.created", "response": {"id": "resp_1"}},
+        {
+            "type": "response.output_item.added",
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []},
+        },
+    ]
+    stream = _SocketBackedStream(events, sock)
+    monkeypatch.setattr(codex, "_response_socket", lambda s: sock)
+
+    with pytest.raises(codex.CodexStallError) as exc_info:
+        codex.parse_sse(
+            stream,
+            timeouts=codex.StreamTimeouts(first_byte=60, thinking_idle=30, answering_idle=30),
+        )
+
+    err = exc_info.value
+    assert err.stage == "thinking"
+    assert err.idle_timeout == 30
+    assert err.last_event_type == "response.output_item.added"
+    assert "stalled during thinking" in str(err)
+    assert sock.timeouts[0] == 60
+    assert sock.timeouts[-1] == 30
+
+
+def test_parse_sse_moves_to_answering_idle_timeout(monkeypatch):
+    sock = _FakeSock()
+    events = [
+        {"type": "response.created", "response": {"id": "resp_1"}},
+        {
+            "type": "response.output_item.added",
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []},
+        },
+        {
+            "type": "response.output_item.added",
+            "item": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+            },
+        },
+        {"type": "response.output_text.delta", "delta": "hi"},
+    ]
+    stream = _SocketBackedStream(events, sock)
+    monkeypatch.setattr(codex, "_response_socket", lambda s: sock)
+
+    with pytest.raises(codex.CodexStallError) as exc_info:
+        codex.parse_sse(
+            stream,
+            timeouts=codex.StreamTimeouts(first_byte=60, thinking_idle=30, answering_idle=25),
+        )
+
+    err = exc_info.value
+    assert err.stage == "answering"
+    assert err.idle_timeout == 25
+    assert err.last_event_type == "response.output_text.delta"
+    assert sock.timeouts[0] == 60
+    assert 30 in sock.timeouts
+    assert sock.timeouts[-1] == 25
+
+
+def test_request_maps_first_byte_timeout_to_stall(monkeypatch, tmp_path):
+    import urllib.error
+
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json")))
+
+    def fake_urlopen(request, timeout=None):
+        assert timeout == 11
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(codex.CodexStallError) as exc_info:
+        codex._request(
+            auth,
+            {
+                "model": "gpt-5.6-luna",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            },
+            codex.StreamTimeouts(first_byte=11, thinking_idle=30, answering_idle=30),
+        )
+
+    err = exc_info.value
+    assert err.stage == "first_byte"
+    assert err.idle_timeout == 11
+    assert err.last_event_type is None
