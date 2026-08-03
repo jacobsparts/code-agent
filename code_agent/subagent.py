@@ -161,6 +161,48 @@ def _recv_msg(sock: socket.socket, timeout: Optional[float] = None) -> Any:
     return pickle.loads(b''.join(chunks))
 
 
+_NO_MESSAGE = object()
+
+
+class _IncrementalMessageReceiver:
+    """Retain partial socket frames across non-blocking polls and interrupts."""
+
+    def __init__(self):
+        self._buffer = bytearray()
+        self._payload_size: Optional[int] = None
+
+    def _decode_buffered(self) -> Any:
+        if self._payload_size is None:
+            if len(self._buffer) < 4:
+                return _NO_MESSAGE
+            self._payload_size = struct.unpack('!I', self._buffer[:4])[0]
+            del self._buffer[:4]
+
+        if len(self._buffer) < self._payload_size:
+            return _NO_MESSAGE
+
+        payload = bytes(self._buffer[:self._payload_size])
+        del self._buffer[:self._payload_size]
+        self._payload_size = None
+        return pickle.loads(payload)
+
+    def receive(self, sock: socket.socket) -> Any:
+        message = self._decode_buffered()
+        if message is not _NO_MESSAGE:
+            return message
+
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            self._buffer.extend(chunk)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        return self._decode_buffered()
+
+
 def _wrap_subagent_task(prompt: str) -> str:
     """Wrap a task with explicit REPL-completion instructions.
 
@@ -504,6 +546,7 @@ class Subagent:
         self._conn: Optional[socket.socket] = None
         self._server: Optional[socket.socket] = None
         self._current_response: Optional[SubagentResponse] = None
+        self._receiver = _IncrementalMessageReceiver()
         self._started = False
 
         # Register globally
@@ -573,6 +616,7 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
+        self._receiver = _IncrementalMessageReceiver()
         self._started = True
 
     def _read_process_stderr(self) -> str:
@@ -627,7 +671,9 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
 
         while True:
             try:
-                msg = _recv_msg(self._conn, timeout=0.001)
+                msg = self._receiver.receive(self._conn)
+                if msg is _NO_MESSAGE:
+                    break
 
                 msg_type, msg_data = msg
 

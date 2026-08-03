@@ -2303,11 +2303,12 @@ worker_main(
             transport._server.close()
             transport._server = None
 
-        from code_agent.subagent import _send_msg
+        from code_agent.subagent import _IncrementalMessageReceiver, _send_msg
         _send_msg(transport._conn, "ok")
         fd = transport._conn.fileno()
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        transport._receiver = _IncrementalMessageReceiver()
         transport._started = True
 
 
@@ -2337,7 +2338,7 @@ worker_main(
 
     def _poll(self) -> None:
         import socket
-        from code_agent.subagent import _recv_msg
+        from code_agent.subagent import _NO_MESSAGE
 
         response = self._current_response
         conn = self._transport._conn
@@ -2346,7 +2347,10 @@ worker_main(
 
         while True:
             try:
-                msg_type, data = _recv_msg(conn, timeout=0.001)
+                message = self._transport._receiver.receive(conn)
+                if message is _NO_MESSAGE:
+                    return
+                msg_type, data = message
             except (socket.timeout, BlockingIOError):
                 return
             except ConnectionError as exc:
