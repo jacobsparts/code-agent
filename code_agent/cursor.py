@@ -48,6 +48,7 @@ DEFAULT_TIMEOUT = 30 * 60
 KEY_EXCHANGE_TIMEOUT = 30
 HEARTBEAT_TIMEOUT = 30
 POST_BLOB_PROGRESS_TIMEOUT = 30
+BIDI_APPEND_PIPELINE_DEPTH = 8
 RESPONSE_USAGE_GRACE_TIMEOUT = 3
 USAGE_LOOKUP_ATTEMPTS = 4
 USAGE_LOOKUP_RETRY_DELAY = 1
@@ -93,6 +94,7 @@ ACCESS_TOKEN_REFRESH_MARGIN = 5 * 60
 AGENT_RUNSSE_PATH = "agent.v1.AgentService/RunSSE"
 BIDI_APPEND_PATH = "aiserver.v1.BidiService/BidiAppend"
 FILTERED_USAGE_PATH = "aiserver.v1.DashboardService/GetFilteredUsageEvents"
+AVAILABLE_MODELS_PATH = "aiserver.v1.AiService/AvailableModels"
 
 # Cursor uses this identifier for inference routing/cache affinity.
 # A code-agent process represents one conversation session.
@@ -1669,6 +1671,331 @@ class _PostRequest:
         self.sock = None
 
 
+class _PostPipeline:
+    def __init__(self, client, parts):
+        self.client = client
+        self.selector = client.selector
+        self.parts = parts
+        self.port = self.parts.port or (
+            443 if self.parts.scheme == "https" else 80
+        )
+        self.sock = None
+        self.connected = False
+        self.tls_handshake_done = False
+        self.outgoing = bytearray()
+        self.incoming = bytearray()
+        self.pending = deque()
+        self.closed = False
+        self._reset_response()
+        self._connect()
+
+    def _reset_response(self):
+        self.response_body = bytearray()
+        self.headers_done = False
+        self.status = None
+        self.response_headers = {}
+        self.chunked = False
+        self.content_remaining = None
+        self.chunk_remaining = None
+
+    def _connect(self):
+        addresses = socket.getaddrinfo(
+            self.parts.hostname,
+            self.port,
+            type=socket.SOCK_STREAM,
+        )
+        last_error = None
+        for family, socktype, proto, _, address in addresses:
+            sock = socket.socket(family, socktype, proto)
+            sock.setblocking(False)
+            error = sock.connect_ex(address)
+            if error in (
+                0,
+                errno.EINPROGRESS,
+                errno.EWOULDBLOCK,
+                errno.EALREADY,
+            ):
+                self.sock = sock
+                break
+            last_error = OSError(
+                error, errno.errorcode.get(error, "connect")
+            )
+            sock.close()
+        else:
+            raise last_error or SSEError("No usable address found")
+
+        self.selector.register(
+            self.sock,
+            selectors.EVENT_READ | selectors.EVENT_WRITE,
+            self,
+        )
+
+    def _finish_connect(self):
+        error = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if error:
+            raise OSError(error, errno.errorcode.get(error, "connect"))
+        self.connected = True
+
+        if self.parts.scheme == "https":
+            self.selector.unregister(self.sock)
+            context = self.client.ssl_context or ssl.create_default_context()
+            self.sock = context.wrap_socket(
+                self.sock,
+                server_hostname=self.parts.hostname,
+                do_handshake_on_connect=False,
+            )
+            self.sock.setblocking(False)
+            self.selector.register(
+                self.sock,
+                selectors.EVENT_READ | selectors.EVENT_WRITE,
+                self,
+            )
+        else:
+            self.tls_handshake_done = True
+
+    def _do_tls_handshake(self):
+        try:
+            self.sock.do_handshake()
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return
+        self.tls_handshake_done = True
+
+    def submit(self, parts, body, headers, callback):
+        if self.closed:
+            raise SSEError("Uplink pipeline is closed")
+        body = bytes(body)
+        target = parts.path or "/"
+        if parts.query:
+            target += "?" + parts.query
+
+        default_port = 443 if self.parts.scheme == "https" else 80
+        host = self.parts.hostname
+        if self.port != default_port:
+            host = f"{host}:{self.port}"
+
+        request_headers = {
+            "Host": host,
+            "Content-Length": str(len(body)),
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "stdlib-sse-client/1.0",
+        }
+        request_headers.update(self.client.headers)
+        request_headers.update(headers or {})
+        request = [f"POST {target} HTTP/1.1"]
+        request.extend(
+            f"{name}: {value}" for name, value in request_headers.items()
+        )
+        request.extend(("", ""))
+        self.outgoing.extend(
+            "\r\n".join(request).encode("iso-8859-1") + body
+        )
+        self.pending.append(callback)
+        self._set_interest()
+        return self
+
+    def _set_interest(self):
+        if self.closed or self.sock is None:
+            return
+        events = selectors.EVENT_READ
+        if (
+            not self.connected
+            or not self.tls_handshake_done
+            or self.outgoing
+        ):
+            events |= selectors.EVENT_WRITE
+        self.selector.modify(self.sock, events, self)
+
+    def _send(self):
+        if not self.outgoing:
+            return
+        try:
+            sent = self.sock.send(self.outgoing)
+            del self.outgoing[:sent]
+        except (
+            BlockingIOError,
+            ssl.SSLWantReadError,
+            ssl.SSLWantWriteError,
+        ):
+            pass
+
+    def _receive(self):
+        try:
+            data = self.sock.recv(65536)
+        except (
+            BlockingIOError,
+            ssl.SSLWantReadError,
+            ssl.SSLWantWriteError,
+        ):
+            return
+        if not data:
+            if self.pending:
+                raise SSEError(
+                    "Uplink pipeline closed with responses outstanding"
+                )
+            self.close()
+            return
+
+        self.incoming.extend(data)
+        self._parse_responses()
+
+    def _parse_responses(self):
+        while self.pending and not self.closed:
+            if not self.headers_done:
+                marker = self.incoming.find(b"\r\n\r\n")
+                if marker < 0:
+                    if len(self.incoming) > 65536:
+                        raise SSEError(
+                            "HTTP response headers are too large"
+                        )
+                    return
+                raw_headers = bytes(self.incoming[:marker])
+                del self.incoming[:marker + 4]
+                lines = raw_headers.decode("iso-8859-1").split("\r\n")
+                parts = lines[0].split(" ", 2)
+                if len(parts) < 2 or not parts[1].isdigit():
+                    raise SSEError(
+                        f"Invalid HTTP status line: {lines[0]!r}"
+                    )
+                self.status = int(parts[1])
+                for line in lines[1:]:
+                    if ":" not in line:
+                        raise SSEError(f"Invalid HTTP header: {line!r}")
+                    name, value = line.split(":", 1)
+                    self.response_headers[
+                        name.strip().lower()
+                    ] = value.strip()
+
+                transfer_encoding = self.response_headers.get(
+                    "transfer-encoding", ""
+                )
+                self.chunked = "chunked" in {
+                    item.strip().lower()
+                    for item in transfer_encoding.split(",")
+                }
+                content_length = self.response_headers.get(
+                    "content-length"
+                )
+                if content_length is not None and not self.chunked:
+                    try:
+                        self.content_remaining = int(content_length)
+                    except ValueError:
+                        raise SSEError("Invalid Content-Length")
+                    if self.content_remaining < 0:
+                        raise SSEError("Invalid Content-Length")
+                elif not self.chunked:
+                    raise SSEError(
+                        "Pipelined response requires Content-Length "
+                        "or chunked encoding"
+                    )
+                self.headers_done = True
+
+            if self.chunked:
+                if not self._parse_chunked_body():
+                    return
+            else:
+                count = min(
+                    len(self.incoming), self.content_remaining
+                )
+                self.response_body.extend(self.incoming[:count])
+                del self.incoming[:count]
+                self.content_remaining -= count
+                if self.content_remaining:
+                    return
+
+            self._complete_response()
+
+    def _parse_chunked_body(self):
+        while True:
+            if self.chunk_remaining is None:
+                marker = self.incoming.find(b"\r\n")
+                if marker < 0:
+                    return False
+                line = bytes(self.incoming[:marker])
+                del self.incoming[:marker + 2]
+                try:
+                    self.chunk_remaining = int(
+                        line.split(b";", 1)[0], 16
+                    )
+                except ValueError:
+                    raise SSEError("Invalid chunk size")
+                if self.chunk_remaining == 0:
+                    if len(self.incoming) < 2:
+                        return False
+                    if self.incoming[:2] != b"\r\n":
+                        raise SSEError("Invalid chunk terminator")
+                    del self.incoming[:2]
+                    return True
+
+            needed = self.chunk_remaining + 2
+            if len(self.incoming) < needed:
+                return False
+            if (
+                self.incoming[self.chunk_remaining:needed]
+                != b"\r\n"
+            ):
+                raise SSEError("Invalid chunk terminator")
+            self.response_body.extend(
+                self.incoming[:self.chunk_remaining]
+            )
+            del self.incoming[:needed]
+            self.chunk_remaining = None
+
+    def _complete_response(self):
+        callback = self.pending.popleft()
+        response = {
+            "status": self.status,
+            "headers": dict(self.response_headers),
+            "body": bytes(self.response_body),
+        }
+        closing = (
+            self.response_headers.get("connection", "").lower()
+            == "close"
+        )
+        self._reset_response()
+        if closing:
+            if self.pending:
+                raise SSEError(
+                    "Uplink closed with pipelined responses outstanding"
+                )
+            self.close()
+        if callback is not None:
+            callback(response)
+
+    def run(self, mask):
+        if self.closed or self.sock is None:
+            return
+        if not self.connected:
+            self._finish_connect()
+        if self.closed or self.sock is None:
+            return
+        if not self.tls_handshake_done:
+            self._do_tls_handshake()
+        else:
+            if mask & selectors.EVENT_WRITE:
+                self._send()
+            if (
+                not self.closed
+                and self.sock is not None
+                and mask & selectors.EVENT_READ
+            ):
+                self._receive()
+        if not self.closed and self.sock is not None:
+            self._set_interest()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.sock is not None:
+            try:
+                self.selector.unregister(self.sock)
+            except (KeyError, ValueError):
+                pass
+            self.sock.close()
+            self.sock = None
+        self.client._post_pipeline_closed(self.parts, self)
+
+
 class SSEClient:
     def __init__(
         self, url, callback, headers=None, timeout=None, ssl_context=None,
@@ -1711,6 +2038,7 @@ class SSEClient:
         self.retry = None
         self._posts = set()
         self._idle_post_connections = {}
+        self._post_pipelines = {}
         self._grace_deadline = None
         self._post_blob_deadline = None
         self._post_blob_debug = {}
@@ -2064,13 +2392,26 @@ class SSEClient:
             self._post_connection_key(parts), []
         ).append(sock)
 
+    def _post_pipeline_closed(self, parts, pipeline):
+        key = self._post_connection_key(parts)
+        if self._post_pipelines.get(key) is pipeline:
+            del self._post_pipelines[key]
+
     def post(self, url, body=b"", headers=None, callback=None):
-        """Start a POST request driven by the same selector as the SSE stream."""
+        """Pipeline a POST request on the origin's HTTP/1.1 connection."""
         if self.closed:
             raise SSEError("SSE client is closed")
-        request = _PostRequest(self, url, body, headers, callback)
-        self._posts.add(request)
-        return request
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https"):
+            raise ValueError("URL scheme must be http or https")
+        if not parts.hostname:
+            raise ValueError("URL must include a hostname")
+        key = self._post_connection_key(parts)
+        pipeline = self._post_pipelines.get(key)
+        if pipeline is None or pipeline.closed:
+            pipeline = _PostPipeline(self, parts)
+            self._post_pipelines[key] = pipeline
+        return pipeline.submit(parts, body, headers, callback)
 
     def run_once(self, timeout=None):
         if self.closed:
@@ -2175,6 +2516,10 @@ class SSEClient:
         for request in tuple(self._posts):
             request.close()
         self._posts.clear()
+        pipelines = getattr(self, "_post_pipelines", {})
+        for pipeline in tuple(pipelines.values()):
+            pipeline.close()
+        pipelines.clear()
         idle_connections = getattr(
             self, "_idle_post_connections", {}
         )
@@ -3300,6 +3645,31 @@ def exchange_api_key(
         return json.load(response)
 
 
+def discover_models(
+    token: str,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    client_version: str = DEFAULT_CLIENT_VERSION,
+) -> None:
+    request = Request(
+        urljoin(base_url.rstrip("/") + "/", AVAILABLE_MODELS_PATH),
+        data=bytes.fromhex("28013801"),
+        headers={
+            "Authorization": "Bearer " + token,
+            "Connect-Protocol-Version": "1",
+            "Content-Type": "application/proto",
+            "User-Agent": "connect-es/1.6.1",
+            "x-cursor-client-type": "cli",
+            "x-cursor-client-version": client_version,
+            "x-ghost-mode": "true",
+            "x-request-id": str(uuid.uuid4()),
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=KEY_EXCHANGE_TIMEOUT) as response:
+        response.read()
+
+
 def _token_expiration(payload: Mapping[str, object], exchanged_at: float) -> float:
     for key in ("expiresAt", "expires_at"):
         value = payload.get(key)
@@ -3390,6 +3760,10 @@ def get_access_token(
         token = payload.get("accessToken")
         if not isinstance(token, str) or not token:
             raise ValueError("Cursor key exchange returned no access token")
+        # The official client discovers models immediately after authentication.
+        # This may warm shared account/model routing before generation, but we do
+        # not yet know whether it affects the observed post-idle backend stalls.
+        discover_models(token)
         _write_cached_token(cache_path, token, _token_expiration(payload, now))
         return token
     finally:
@@ -3627,7 +4001,7 @@ class CursorClient:
         append_started = False
         append_seqno = -1
         append_queue = deque()
-        append_in_flight = False
+        append_in_flight = 0
 
         def appended(response):
             append_result.append(response)
@@ -3642,52 +4016,62 @@ class CursorClient:
 
         def pump_append_queue():
             nonlocal append_in_flight
-            if append_in_flight or not append_queue or transport.closed:
-                return
-            (
-                seqno,
-                payload,
-                wrapped_payload,
-                classification,
-                callback,
-            ) = append_queue.popleft()
-            append_in_flight = True
-            _debug_bidi_event(
-                "bidi_append_started",
-                request_id=request_id,
-                conversation_id=conversation_id,
-                append_seqno=seqno,
-                classification=classification,
-                payload_hex=payload.hex(),
-                wrapped_payload_hex=wrapped_payload.hex(),
-            )
-
-            def completed(response):
-                nonlocal append_in_flight
+            while (
+                append_in_flight < BIDI_APPEND_PIPELINE_DEPTH
+                and append_queue
+                and not transport.closed
+            ):
+                (
+                    seqno,
+                    payload,
+                    wrapped_payload,
+                    classification,
+                    callback,
+                ) = append_queue.popleft()
+                append_in_flight += 1
                 _debug_bidi_event(
-                    "bidi_append_completed",
+                    "bidi_append_started",
                     request_id=request_id,
                     conversation_id=conversation_id,
                     append_seqno=seqno,
                     classification=classification,
-                    status=response["status"],
-                    headers=response["headers"],
-                    body_hex=response["body"].hex(),
+                    pipeline_depth=append_in_flight,
+                    payload_hex=payload.hex(),
+                    wrapped_payload_hex=wrapped_payload.hex(),
                 )
-                append_in_flight = False
-                callback(response)
-                pump_append_queue()
 
-            transport.post(
-                append_url,
-                wrapped_payload,
-                headers={
-                    **request_headers,
-                    "Content-Type": "application/proto",
-                    "Accept": "application/proto",
-                },
-                callback=completed,
-            )
+                def completed(
+                    response,
+                    seqno=seqno,
+                    classification=classification,
+                    callback=callback,
+                ):
+                    nonlocal append_in_flight
+                    _debug_bidi_event(
+                        "bidi_append_completed",
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        append_seqno=seqno,
+                        classification=classification,
+                        pipeline_depth=append_in_flight,
+                        status=response["status"],
+                        headers=response["headers"],
+                        body_hex=response["body"].hex(),
+                    )
+                    append_in_flight -= 1
+                    callback(response)
+                    pump_append_queue()
+
+                transport.post(
+                    append_url,
+                    wrapped_payload,
+                    headers={
+                        **request_headers,
+                        "Content-Type": "application/proto",
+                        "Accept": "application/proto",
+                    },
+                    callback=completed,
+                )
 
         def append(payload, callback=appended):
             nonlocal append_seqno

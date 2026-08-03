@@ -75,12 +75,22 @@ def test_access_token_refreshes_and_writes_securely(monkeypatch, tmp_path):
         "access_token": "old",
         "expires_at": time.time() + 299,
     }))
+    events = []
     monkeypatch.setattr(
         cursor,
         "exchange_api_key",
-        lambda key: {"accessToken": "new", "expiresIn": 3600},
+        lambda key: (
+            events.append(("exchange", key))
+            or {"accessToken": "new", "expiresIn": 3600}
+        ),
+    )
+    monkeypatch.setattr(
+        cursor,
+        "discover_models",
+        lambda token: events.append(("discover", token)),
     )
     assert cursor.get_access_token("key", cache_path=str(cache), lock_path=str(lock)) == "new"
+    assert events == [("exchange", "key"), ("discover", "new")]
     saved = json.loads(cache.read_text())
     assert saved["access_token"] == "new"
     assert saved["expires_at"] > time.time() + 3500
@@ -860,6 +870,50 @@ def test_post_response_returns_persistent_socket_to_pool():
     }]
 
 
+def test_post_pipeline_writes_eight_requests_before_responses():
+    callbacks = []
+    pipeline = object.__new__(cursor._PostPipeline)
+    pipeline.client = type("Client", (), {"headers": {}})()
+    pipeline.selector = type(
+        "Selector",
+        (),
+        {"modify": lambda self, sock, events, handler: None},
+    )()
+    pipeline.parts = cursor.urlsplit("https://api.example.test/append")
+    pipeline.port = 443
+    pipeline.sock = object()
+    pipeline.connected = True
+    pipeline.tls_handshake_done = True
+    pipeline.outgoing = bytearray()
+    pipeline.incoming = bytearray()
+    pipeline.pending = cursor.deque()
+    pipeline.closed = False
+    pipeline._reset_response()
+
+    for index in range(8):
+        pipeline.submit(
+            pipeline.parts,
+            f"payload-{index}".encode(),
+            {},
+            lambda response, index=index: callbacks.append(
+                (index, response["status"])
+            ),
+        )
+
+    assert bytes(pipeline.outgoing).count(
+        b"POST /append HTTP/1.1\r\n"
+    ) == 8
+    assert len(pipeline.pending) == 8
+
+    pipeline.incoming.extend(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" * 8
+    )
+    pipeline._parse_responses()
+
+    assert callbacks == [(index, 200) for index in range(8)]
+    assert pipeline.pending == cursor.deque()
+
+
 def test_sse_grace_period_closes_transport(monkeypatch):
     client = object.__new__(cursor.SSEClient)
     client.closed = False
@@ -969,10 +1023,9 @@ def test_latest_blob_response_completion_arms_timeout(monkeypatch):
             self.headers_callback(200, {})
             self.stream_callback(_get_blob_frame(1))
             self.stream_callback(_get_blob_frame(2, b"c" * 32))
-            assert len(blob_callbacks) == 1
+            assert len(blob_callbacks) == 2
             blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
             assert armed == []
-            assert len(blob_callbacks) == 2
             blob_callbacks[1]({"status": 200, "headers": {}, "body": b""})
             assert armed == [cursor.POST_BLOB_PROGRESS_TIMEOUT]
             self.close()
