@@ -164,7 +164,7 @@ class LLMClient:
                         "url": f"data:{MEDIA_TYPES[img[:3]]};base64,{base64.b64encode(img).decode()}"
                     }} for img in images]
                 ]
-            elif breakpoint and isinstance(out.get('content'), str):
+            elif breakpoint and self.model_config.get('explicit_prompt_cache') and isinstance(out.get('content'), str):
                 out['content'] = [{
                     "type": "text",
                     "text": out['content'],
@@ -281,7 +281,7 @@ class LLMClient:
         has_cache_breakpoint = False
         for message in messages:
             role = message.get('role')
-            cache_breakpoint = bool(message.get('_prompt_cache_breakpoint'))
+            cache_breakpoint = bool(message.get('_prompt_cache_breakpoint')) and self.model_config.get('explicit_prompt_cache')
             if role == 'tool':
                 input_items.append({
                     'type': 'function_call_output',

@@ -14,6 +14,9 @@ class Conversation:
         """Annotate projected messages; update continuity for the next call."""
         if self.llm_client is None:
             return messages
+        model_config = getattr(self.llm_client, "model_config", None) or {}
+        if not model_config.get("explicit_prompt_cache"):
+            return messages
         model_name = getattr(self.llm_client, "model_name", None)
         if model_name != self._prompt_cache_model:
             self._prompt_cache = []

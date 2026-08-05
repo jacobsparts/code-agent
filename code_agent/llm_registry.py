@@ -40,6 +40,7 @@ class ModelConfig:
     timeout: int = None
     tools: bool = None
     tool_mode: str = None
+    explicit_prompt_cache: bool = False
 
     @property
     def request_path(self):
@@ -141,7 +142,9 @@ for conf, efforts in (
     for effort in efforts:
         suffix = '' if (effort == 'none' or len(efforts) == 1) else f"-{effort}"
         kwargs = {**conf, "config":{"reasoning_effort": effort}} if effort else conf
-        kwargs.setdefault('config',{})['prompt_cache_key'] = 'jp-code-agent-001'
+        if conf['model'].startswith('gpt-5.6'):
+            kwargs = {**kwargs, 'explicit_prompt_cache': True}
+            kwargs.setdefault('config', {})['prompt_cache_key'] = 'jp-code-agent-001'
         register_model("openai", f"{conf['model']}{suffix}", **kwargs)
 
 

@@ -387,6 +387,7 @@ def test_responses_request_adds_explicit_cache_breakpoints(monkeypatch):
         "host": "api.openai.com",
         "path": "/v1/responses",
         "config": {"prompt_cache_key": "tenant:acme:knowledge-base-v1"},
+        "explicit_prompt_cache": True,
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     client = LLMClient("openai/gpt-5.6-luna")
