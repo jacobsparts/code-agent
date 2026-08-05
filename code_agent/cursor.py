@@ -3243,7 +3243,7 @@ class RunConfig:
     subagent_model_overrides: tuple[bytes, ...] = ()
     can_create_cloud_subagents: bool | None = None
     suppress_subagent_progress_update_tool: bool | None = None
-    client_supports_send_to_user: bool | None = True
+    client_supports_send_to_user: bool | None = False
     extra_fields: tuple[Field, ...] = ()
 
 
@@ -3796,9 +3796,7 @@ class CursorClient:
         self.model = model
         self.tools = tuple(tools)
         self.user_config = user_config or UserMessageConfig()
-        self.run_config = run_config or RunConfig(
-            client_supports_send_to_user=True
-        )
+        self.run_config = run_config or RunConfig()
 
 
     @property
