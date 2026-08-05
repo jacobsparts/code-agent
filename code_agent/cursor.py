@@ -2419,6 +2419,8 @@ class SSEClient:
 
         wait = self.timeout if timeout is None else timeout
         for key, mask in self.selector.select(wait):
+            if self.closed:
+                break
             handler = key.data
             if handler is self:
                 if not self.connected:

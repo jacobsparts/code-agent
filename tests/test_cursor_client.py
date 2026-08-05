@@ -806,6 +806,41 @@ def test_closed_post_ignores_stale_selector_event():
     request.run(selectors.EVENT_READ | selectors.EVENT_WRITE)
 
 
+def test_sse_client_ignores_events_after_callback_closes_transport():
+    client = object.__new__(cursor.SSEClient)
+    client.closed = False
+    client.timeout = None
+    client.sock = type(
+        "Socket",
+        (),
+        {
+            "close": lambda self: None,
+            "recv": lambda self, size: pytest.fail(
+                "closed transport should not receive"
+            ),
+        },
+    )()
+    closer = type("Closer", (), {"run": lambda self, mask: client.close()})()
+    key = lambda data: type("Key", (), {"data": data})()
+    client.selector = type(
+        "Selector",
+        (),
+        {
+            "select": lambda self, wait: [
+                (key(closer), selectors.EVENT_READ),
+                (key(client), selectors.EVENT_READ),
+            ],
+            "unregister": lambda self, sock: None,
+            "close": lambda self: None,
+        },
+    )()
+    client._posts = set()
+    client._post_pipelines = {}
+    client._idle_post_connections = {}
+
+    assert client.run_once() is False
+
+
 def test_post_request_does_not_force_connection_close():
     request = object.__new__(cursor._PostRequest)
     request.parts = cursor.urlsplit("https://api.example.test/append")
