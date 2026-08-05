@@ -27,6 +27,7 @@ def test_tool_call_normalizes_to_python():
         "_tool_call_ids": ["provider-id"],
         "_repl_execute_calls": [{"id": "provider-id", "code": "x = 1"}],
         "_repl_execute_prefix": "",
+        "_repl_execute_content": None,
     }
 
 
@@ -38,10 +39,26 @@ def test_text_and_multiple_calls_are_joined_safely():
     })
     assert result["content"] == "emit(\"I'll inspect it.\")\nx = 1\nprint(x)"
     assert result["_tool_call_ids"] == ["provider-id", "provider-id"]
+    assert result["_repl_execute_content"] == "I'll inspect it."
     assert result["_repl_execute_calls"] == [
         {"id": "provider-id", "code": "x = 1"},
         {"id": "provider-id", "code": "print(x)"},
     ]
+
+
+def test_projection_restores_accompanying_content_without_duplicating_emit():
+    normalized = normalize_openai_repl_response({
+        "role": "assistant",
+        "content": "I'll inspect it.",
+        "tool_calls": [call("print(42)")],
+    })
+
+    result = project_openai_repl_messages([normalized])
+
+    assert result[0]["content"] == "I'll inspect it."
+    assert json.loads(
+        result[0]["tool_calls"][0]["function"]["arguments"]
+    ) == {"code": "print(42)"}
 
 
 def test_raw_python_without_tool_call_is_accepted():

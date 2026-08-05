@@ -90,6 +90,7 @@ def normalize_openai_repl_response(message):
         "_tool_call_ids": [call["id"] for call in calls],
         "_repl_execute_calls": calls,
         "_repl_execute_prefix": f"emit({content!r})" if content else "",
+        "_repl_execute_content": content,
     }
 
 
@@ -165,7 +166,7 @@ def project_openai_repl_messages(messages):
 
         projected.append({
             "role": "assistant",
-            "content": None,
+            "content": message.get("_repl_execute_content"),
             "tool_calls": [{
                 "id": call["id"],
                 "type": "function",
