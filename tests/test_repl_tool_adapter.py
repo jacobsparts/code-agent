@@ -21,14 +21,7 @@ def call(code, name="repl_execute"):
 def test_tool_call_normalizes_to_python():
     assert normalize_openai_repl_response({
         "role": "assistant", "content": None, "tool_calls": [call("x = 1")]
-    }) == {
-        "role": "assistant",
-        "content": "x = 1",
-        "_tool_call_ids": ["provider-id"],
-        "_repl_execute_calls": [{"id": "provider-id", "code": "x = 1"}],
-        "_repl_execute_prefix": "",
-        "_repl_execute_content": None,
-    }
+    }) == {"role": "assistant", "content": "x = 1"}
 
 
 def test_text_and_multiple_calls_are_joined_safely():
@@ -37,16 +30,13 @@ def test_text_and_multiple_calls_are_joined_safely():
         "content": "I'll inspect it.",
         "tool_calls": [call("x = 1"), call("print(x)")],
     })
-    assert result["content"] == "emit(\"I'll inspect it.\")\nx = 1\nprint(x)"
-    assert result["_tool_call_ids"] == ["provider-id", "provider-id"]
-    assert result["_repl_execute_content"] == "I'll inspect it."
-    assert result["_repl_execute_calls"] == [
-        {"id": "provider-id", "code": "x = 1"},
-        {"id": "provider-id", "code": "print(x)"},
-    ]
+    assert result == {
+        "role": "assistant",
+        "content": "emit(\"I'll inspect it.\")\nx = 1\nprint(x)",
+    }
 
 
-def test_projection_restores_accompanying_content_without_duplicating_emit():
+def test_projection_uses_canonical_code_for_accompanying_content():
     normalized = normalize_openai_repl_response({
         "role": "assistant",
         "content": "I'll inspect it.",
@@ -55,10 +45,10 @@ def test_projection_restores_accompanying_content_without_duplicating_emit():
 
     result = project_openai_repl_messages([normalized])
 
-    assert result[0]["content"] == "I'll inspect it."
+    assert result[0]["content"] is None
     assert json.loads(
         result[0]["tool_calls"][0]["function"]["arguments"]
-    ) == {"code": "print(42)"}
+    ) == {"code": "emit(\"I'll inspect it.\")\nprint(42)"}
 
 
 def test_raw_python_without_tool_call_is_accepted():
@@ -116,36 +106,17 @@ def test_projection_uses_stable_calls_and_results():
     }
 
 
-def test_projection_reuses_provider_tool_call_id():
+def test_projection_coalesces_native_calls_without_preserving_provider_shape():
+    normalized = normalize_openai_repl_response({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            call("x = 1"),
+            {**call("print(x)"), "id": "provider-id-2"},
+        ],
+    })
     messages = [
-        {
-            "role": "assistant",
-            "content": "x = 1",
-            "_tool_call_ids": ["provider-call-123"],
-        },
-        {"role": "user", "content": ">>> x = 1\n", "_stdout": ">>> x = 1\n"},
-    ]
-
-    result = project_openai_repl_messages(messages)
-
-    assert result[0]["tool_calls"][0]["id"] == "provider-call-123"
-    assert result[1]["tool_call_id"] == "provider-call-123"
-
-
-def test_projection_returns_one_result_per_native_call_id():
-    messages = [
-        {
-            "role": "assistant",
-            "content": "x = 1\nprint(x)",
-            "_repl_execute_calls": [
-                {"id": "call-1", "code": "x = 1"},
-                {"id": "call-2", "code": "print(x)"},
-            ],
-            "_tool_call_outputs": [
-                ">>> x = 1\n",
-                ">>> print(x)\n1\n",
-            ],
-        },
+        normalized,
         {
             "role": "user",
             "content": ">>> x = 1\n>>> print(x)\n1\n",
@@ -155,16 +126,19 @@ def test_projection_returns_one_result_per_native_call_id():
 
     result = project_openai_repl_messages(messages)
 
-    assert [call["id"] for call in result[0]["tool_calls"]] == ["call-1", "call-2"]
+    assert normalized == {
+        "role": "assistant",
+        "content": "x = 1\nprint(x)",
+    }
+    assert len(result[0]["tool_calls"]) == 1
+    assert result[0]["tool_calls"][0]["id"] == "repl_000001"
+    assert json.loads(
+        result[0]["tool_calls"][0]["function"]["arguments"]
+    ) == {"code": "x = 1\nprint(x)"}
     assert result[1] == {
         "role": "tool",
-        "tool_call_id": "call-1",
-        "content": ">>> x = 1\n",
-    }
-    assert result[2] == {
-        "role": "tool",
-        "tool_call_id": "call-2",
-        "content": ">>> print(x)\n1\n",
+        "tool_call_id": "repl_000001",
+        "content": ">>> x = 1\n>>> print(x)\n1\n",
     }
 
 
@@ -209,6 +183,33 @@ def test_projection_uses_preview_content_instead_of_raw_render_output():
 
     result = project_openai_repl_messages(messages)
 
+    assert result[1] == {
+        "role": "tool",
+        "tool_call_id": "repl_000001",
+        "content": preview,
+    }
+
+
+def test_projection_ignores_legacy_provider_shape_metadata():
+    preview = "[PreviewRef: session://preview/abc123]\n[/PreviewRef]\n"
+    messages = [
+        {
+            "role": "assistant",
+            "content": "print(large_value)",
+            "_tool_call_ids": ["provider-id"],
+            "_repl_execute_calls": [
+                {"id": "provider-id", "code": "print(large_value)"},
+            ],
+            "_tool_call_outputs": ["x" * 200_000],
+            "_repl_execute_prefix": "",
+            "_repl_execute_content": None,
+        },
+        {"role": "user", "content": preview, "_stdout": "x" * 200_000},
+    ]
+
+    result = project_openai_repl_messages(messages)
+
+    assert result[0]["tool_calls"][0]["id"] == "repl_000001"
     assert result[1] == {
         "role": "tool",
         "tool_call_id": "repl_000001",
