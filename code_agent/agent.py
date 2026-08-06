@@ -530,8 +530,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
     def _show_python_header_if_pending(self):
         if getattr(self, '_header_pending', False):
             header = self._section_header("Python", "─", "\x1b[1;94m")
-            print(f"\x1b[1G\x1b[K{header}")
-            self._capture_display_line(strip_ansi(header))
+            self._emit_display_line(f"\x1b[1G\x1b[K{header}", strip_ansi(header))
             self._header_pending = False
             self._repl_printed_header = True
 
@@ -541,8 +540,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             return
         self._show_python_header_if_pending()
         for line in echo.rstrip("\n").split("\n"):
-            print(line, flush=True)
-            self._capture_display_line(line)
+            self._emit_display_line(line, line)
         self._statement_echo_displayed = True
 
     def _compact_edit_echo(self, diff: str, tool: str | None = None) -> str:
@@ -627,6 +625,21 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             )
         return "\n".join(chunks).rstrip() + "\n"
 
+
+    def _emit_display_line(self, colored: str, plain: str | None = None, uncapped: bool = False) -> None:
+        if not uncapped:
+            if self._display_line_count >= self.MAX_DISPLAY_LINES:
+                if not self._display_truncated:
+                    notice = f"{DIM}[display truncated: per-turn limit of {self.MAX_DISPLAY_LINES} lines exceeded]{RESET}"
+                    print(notice, flush=True)
+                    self._capture_display_line(strip_ansi(notice))
+                    self._display_truncated = True
+                return
+            self._display_line_count += 1
+        if plain is None:
+            plain = strip_ansi(colored)
+        print(colored, flush=True)
+        self._capture_display_line(plain)
 
     def _flush_display_capture(self):
         if not self._display_capture:
@@ -2221,6 +2234,9 @@ If you don't know how to proceed:
 
 
     max_output_kb = _get_config_value("code_agent_max_output_kb", 50)  # Large output protection
+    MAX_DISPLAY_LINES = 1000
+    _display_line_count = 0
+    _display_truncated = False
 
     def process_repl_output(self, output: str) -> str:
         """Truncate output if too large - used for both display and model."""
@@ -2250,6 +2266,8 @@ If you don't know how to proceed:
     # REPL output hooks
     def on_repl_execute(self, code) -> None:
         """Called at start of each turn."""
+        self._display_line_count = 0
+        self._display_truncated = False
         if hasattr(self, '_tool_repl'):
             try:
                 self._tool_repl._inject_code('globals().pop("_line_patch_turn_state", None)')
@@ -2300,9 +2318,16 @@ If you don't know how to proceed:
         kind = event.kind
         chunk = event.text
 
+        if kind == "display":
+            kind = event.data["display_kind"]
+            if kind == "spill":
+                for line in chunk.rstrip('\n').split('\n'):
+                    self._emit_display_line(f"{DIM}{line}{RESET}", line, uncapped=True)
+                return
+        elif kind in {"output", "print", "progress", "file_diff"}:
+            return
+
         if kind == "statement_started":
-            if getattr(self, "_statement_echo", None):
-                self._flush_statement_echo()
             self._statement_direct_call = event.data.get("direct_call")
             self._statement_source = event.data.get("source", "")
             self._statement_echo = event.data.get("display_echo", event.data.get("echo", ""))
@@ -2360,8 +2385,7 @@ If you don't know how to proceed:
             self._show_python_header_if_pending()
             if not getattr(self, "_statement_echo_displayed", False):
                 echo_line = self._compact_edit_echo(chunk, tool)
-                print(echo_line, flush=True)
-                self._capture_display_line(echo_line)
+                self._emit_display_line(echo_line, echo_line)
                 self._statement_echo_displayed = True
             for line in chunk.rstrip('\n').split('\n'):
                 if line.startswith('--- ') or line.startswith('+++ '):
@@ -2374,13 +2398,13 @@ If you don't know how to proceed:
                     color = "\x1b[36m"
                 else:
                     color = DIM
-                print(f"{color}{line}{RESET}", flush=True)
-                self._capture_display_line(line)
+                self._emit_display_line(f"{color}{line}{RESET}", line)
             return
 
         if kind == "progress":
             if self.output_hook == self._terminal_output_hook:
-                self.output_hook(chunk.rstrip("\n"), False)
+                for line in chunk.rstrip("\n").split("\n"):
+                    self._emit_display_line(f"\x1b[92m{line}\x1b[0m", line)
             return
 
         if kind in {
@@ -2449,24 +2473,18 @@ If you don't know how to proceed:
             self._flush_statement_echo()
 
         if truncated_at_chars and not truncated_at_lines:
-            print(f"{DIM}{display}...{RESET}", flush=True)
-            print(f"{DIM}({total_lines} lines total){RESET}", flush=True)
-            self._capture_display_line(f"{display}...")
-            self._capture_display_line(f"({total_lines} lines total)")
+            self._emit_display_line(f"{DIM}{display}...{RESET}", f"{display}...")
+            self._emit_display_line(f"{DIM}({total_lines} lines total){RESET}", f"({total_lines} lines total)")
         elif is_truncated:
             for line in display.split('\n'):
-                print(f"{DIM}{line}{RESET}", flush=True)
-                self._capture_display_line(line)
-            print(f"{DIM}... ({total_lines} lines total){RESET}", flush=True)
-            self._capture_display_line(f"... ({total_lines} lines total)")
+                self._emit_display_line(f"{DIM}{line}{RESET}", line)
+            self._emit_display_line(f"{DIM}... ({total_lines} lines total){RESET}", f"... ({total_lines} lines total)")
         elif kind == "print":
             for line in display.split('\n'):
-                print(f"\x1b[33m{line}\x1b[0m", flush=True)
-                self._capture_display_line(line)
+                self._emit_display_line(f"\x1b[33m{line}\x1b[0m", line)
         else:
             for line in display.split('\n'):
-                print(f"{DIM}{line}{RESET}", flush=True)
-                self._capture_display_line(line)
+                self._emit_display_line(f"{DIM}{line}{RESET}", line)
 
     def _truncate_for_display(self, output: str) -> str:
         import re

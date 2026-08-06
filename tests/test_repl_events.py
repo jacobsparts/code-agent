@@ -73,7 +73,8 @@ def test_execute_publishes_statement_boundaries_in_order():
     assert pure_syntax_error is False
     assert corrected_code == "value = 1\nprint(value)"
     assert output.endswith("1\n")
-    assert streamed == events
+    assert [event for event in streamed if event.kind != "display"] == events
+    assert [event.kind for event in streamed if event.kind == "display"] == ["display"]
     assert [event.kind for event in events] == [
         "statement_started",
         "statement_finished",
@@ -107,7 +108,7 @@ def test_dead_tool_repl_worker_restart_is_normal_repl_output():
         assert pure_syntax_error is False
         assert output == notice + ">>> 1\n1\n"
         assert events[0] == ReplEvent(kind="output", text=notice)
-        assert streamed == events
+        assert [event for event in streamed if event.kind != "display"] == events
     finally:
         repl.close()
 

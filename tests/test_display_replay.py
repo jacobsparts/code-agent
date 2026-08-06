@@ -503,7 +503,7 @@ def test_code_agent_no_repl_display_still_prints_progress_emit(capsys):
     agent.repl_display = False
     agent._display_capture = []
 
-    agent.on_repl_event(ReplEvent(kind="progress", text="working\n"))
+    agent.on_repl_event(ReplEvent(kind="display", text="working\n", data={"display_kind": "progress"}))
 
     assert capsys.readouterr().out == "\x1b[92mworking\x1b[0m\n"
     assert agent._display_capture == ["working\n"]

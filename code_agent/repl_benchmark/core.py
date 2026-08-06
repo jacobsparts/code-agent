@@ -445,6 +445,8 @@ class InstrumentedREPLBenchmarkMixin:
                 self._benchmark_metrics["saw_python_state_reuse"] = True
 
     def on_repl_event(self, event: ReplEvent):
+        if event.kind == "display":
+            return
         msg_type = event.kind
         if msg_type == "final_emit":
             msg_type = "emit"

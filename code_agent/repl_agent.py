@@ -239,17 +239,13 @@ _MAX_REPL_OUTPUT_CHARS = 2_000_000
 
 
 class _StatementOutput:
-    """Buffer one statement, spilling oversized output to a worker-side file.
-
-    Buffering intentionally prevents the live streaming that would otherwise
-    occur within a long-running statement.
-    """
-
     def __init__(self, queue: Queue) -> None:
         self.queue = queue
         self.chunks: list[tuple[str, str]] = []
         self.size = 0
         self.file = None
+        self._display_buf = ""
+        self._display_kind = None
 
     def send(self, kind: str, text: str) -> int:
         if self.file is None and self.size + len(text) > _MAX_REPL_OUTPUT_CHARS:
@@ -264,6 +260,23 @@ class _StatementOutput:
         else:
             self.chunks.append((kind, text))
         self.size += len(text)
+        if self._display_kind is None:
+            self._display_kind = kind
+        elif self._display_kind != kind:
+            if self._display_buf:
+                self.queue.put(("display", (self._display_kind, self._display_buf)))
+                self._display_buf = ""
+            self._display_kind = kind
+        combined = self._display_buf + text
+        idx = combined.rfind("\n")
+        if idx != -1:
+            complete = combined[: idx + 1]
+            remainder = combined[idx + 1 :]
+            if complete:
+                self.queue.put(("display", (kind, complete)))
+            self._display_buf = remainder
+        else:
+            self._display_buf = combined
         return len(text)
 
     def write(self, text: str) -> int:
@@ -273,13 +286,16 @@ class _StatementOutput:
         pass
 
     def finish(self) -> None:
+        if self._display_buf:
+            self.queue.put(("display", (self._display_kind, self._display_buf)))
+            self._display_buf = ""
+            self._display_kind = None
         if self.file:
             path = self.file.name
             self.file.close()
-            self.queue.put((
-                "output",
-                f"[large output written to {path} ({self.size / 1_000_000:.1f}MB)]\n",
-            ))
+            spill = f"[large output written to {path} ({self.size / 1_000_000:.1f}MB)]\n"
+            self.queue.put(("output", spill))
+            self.queue.put(("display", ("spill", spill)))
         else:
             for chunk in self.chunks:
                 self.queue.put(chunk)
@@ -1373,7 +1389,12 @@ Call help(function_name) for parameter descriptions.
                 self.on_repl_event(event)
 
         def publish_worker(message_type: str, text: str) -> None:
-            publish(normalize_worker_message(message_type, text))
+            event = normalize_worker_message(message_type, text)
+            if event.kind == "display":
+                if hasattr(self, "on_repl_event"):
+                    self.on_repl_event(event)
+                return
+            publish(event)
 
         previous_publisher = getattr(self, "_active_repl_event_publisher", None)
         self._active_repl_event_publisher = publish

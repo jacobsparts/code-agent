@@ -31,6 +31,9 @@ _WORKER_EVENT_KINDS = {
 
 
 def normalize_worker_message(message_type: str, text: str) -> ReplEvent:
+    if message_type == "display":
+        display_kind, display_text = text
+        return ReplEvent(kind="display", text=display_text, data={"display_kind": display_kind})
     if message_type == "emit":
         return ReplEvent(kind="final_emit", text=text)
     if message_type in _WORKER_EVENT_KINDS:
