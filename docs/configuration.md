@@ -49,10 +49,13 @@ coda --model codex/gpt-5.6-luna
 ```
 
 The transport refreshes expiring access tokens and atomically saves refreshed
-credentials with owner-only permissions. With multiple credentials it refreshes
-quota snapshots older than one hour through the Codex usage endpoint and
-selects an account according to remaining quota and reset time. A single
-credential skips quota preflight.
+credentials with owner-only permissions. If token refresh returns HTTP 401, that
+credential is marked with `"invalid": true` in `codex-auth.json` and ignored by
+later selection until the flag is cleared by a successful refresh. After
+invalidation, credentials are reloaded so another usable credential can be
+selected for retry. With multiple credentials it refreshes quota snapshots older
+than one hour through the Codex usage endpoint and selects an account according
+to remaining quota and reset time. A single credential skips quota preflight.
 
 ## `~/.code-agent/config.py`
 

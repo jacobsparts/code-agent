@@ -57,6 +57,14 @@ class CodexError(Exception):
     pass
 
 
+class CredentialInvalidError(CodexError):
+    """Raised when token refresh returns 401 and the credential is marked invalid."""
+
+    def __init__(self, message: str, *, index: int):
+        super().__init__(message)
+        self.index = index
+
+
 class CodexStallError(CodexError):
     """Raised when a Codex SSE stream stops emitting progress events."""
 
@@ -391,6 +399,13 @@ class CodexAuth:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
+            if exc.code == 401:
+                credential["invalid"] = True
+                self._save_unlocked()
+                raise CredentialInvalidError(
+                    f"Token refresh failed: HTTP {exc.code}: {detail}",
+                    index=index,
+                ) from exc
             raise CodexError(f"Token refresh failed: HTTP {exc.code}: {detail}") from exc
         except (OSError, ValueError) as exc:
             raise CodexError(f"Token refresh failed: {exc}") from exc
@@ -403,6 +418,7 @@ class CodexAuth:
             if isinstance(payload.get(name), str) and payload[name]:
                 tokens[name] = payload[name]
         credential["last_refresh"] = datetime.now(timezone.utc).isoformat()
+        credential.pop("invalid", None)
 
     def refresh(self, timeout: float = 60) -> None:
         observed_access_token = self.access_token
@@ -414,9 +430,13 @@ class CodexAuth:
             self._refresh_credential_unlocked(self.index, timeout)
             self._save_unlocked()
 
-    def ensure_valid(self) -> None:
-        if self.needs_refresh():
-            self.refresh()
+    def ensure_valid(self, timeout: float = 60) -> None:
+        while self.needs_refresh():
+            try:
+                self.refresh(timeout=timeout)
+                return
+            except CredentialInvalidError:
+                self.select_credential(timeout=timeout)
 
     def _usage_request_unlocked(self, index: int, timeout: float = 60) -> dict:
         for attempt in range(2):
@@ -463,11 +483,15 @@ class CodexAuth:
         fetched_at = quota.get("fetched_at") if isinstance(quota, dict) else None
         return not isinstance(fetched_at, (int, float)) or fetched_at < now - 3600
 
+    @staticmethod
+    def _credential_is_invalid(credential: dict) -> bool:
+        return credential.get("invalid") is True
+
     def _choose_credential(self, usable: set[int]):
         normal = []
         reserve = []
         for index, credential in enumerate(self.root["credentials"]):
-            if index not in usable:
+            if index not in usable or self._credential_is_invalid(credential):
                 continue
             effective = _effective_quota(credential)
             if effective is None:
@@ -486,13 +510,21 @@ class CodexAuth:
             root = self._load_unlocked()
             self._select_loaded(root, 0)
             credentials = root["credentials"]
+            usable = {
+                index
+                for index, credential in enumerate(credentials)
+                if not self._credential_is_invalid(credential)
+            }
+            if not usable:
+                raise CodexError("No usable Codex credentials (all marked invalid)")
             if len(credentials) == 1:
                 return 0
 
             now = int(time.time())
-            usable = set(range(len(credentials)))
             errors = []
             for index, credential in enumerate(credentials):
+                if index not in usable:
+                    continue
                 if not self._quota_stale(credential, now):
                     continue
                 try:
@@ -503,13 +535,17 @@ class CodexAuth:
 
             selected = self._choose_credential(usable)
             if selected is None:
-                usable.clear()
+                usable = {
+                    index
+                    for index, credential in enumerate(credentials)
+                    if not self._credential_is_invalid(credential)
+                }
                 errors.clear()
-                for index in range(len(credentials)):
+                for index in sorted(usable):
                     try:
                         self._usage_request_unlocked(index, timeout)
-                        usable.add(index)
                     except CodexError as exc:
+                        usable.discard(index)
                         errors.append(f"credential {index}: {exc}")
                 selected = self._choose_credential(usable)
 
@@ -962,7 +998,7 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts) -> dict:
     auth.select_credential(timeout=timeouts.first_byte)
     encoded = json.dumps(body, separators=(",", ":")).encode()
     for attempt in range(2):
-        auth.ensure_valid()
+        auth.ensure_valid(timeout=timeouts.first_byte)
         headers = _headers(auth)
         request = urllib.request.Request(
             RESPONSES_URL,
@@ -983,7 +1019,10 @@ def _request(auth: CodexAuth, body: dict, timeouts: StreamTimeouts) -> dict:
                 logger.info("---------- FROM LLM ----------")
                 logger.info(detail)
             if exc.code == 401 and attempt == 0:
-                auth.refresh()
+                try:
+                    auth.refresh(timeout=timeouts.first_byte)
+                except CredentialInvalidError:
+                    auth.select_credential(timeout=timeouts.first_byte)
                 continue
             if exc.code == 429:
                 auth.expire_rate_limits()

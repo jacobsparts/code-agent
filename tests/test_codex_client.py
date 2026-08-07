@@ -1170,3 +1170,203 @@ def test_http_429_expires_selected_quota(monkeypatch, tmp_path):
 
     saved = json.loads(path.read_text())
     assert saved["credentials"][0]["rate_limits"]["fetched_at"] == 0
+
+
+
+def test_refresh_401_marks_credential_invalid(monkeypatch, tmp_path):
+    import urllib.error
+
+    path = _auth_file(tmp_path / "auth.json")
+    auth = codex.CodexAuth(str(path))
+
+    def fail(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            401,
+            "unauthorized",
+            {},
+            BytesIO(b'{"error":"invalid_grant"}'),
+        )
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", fail)
+
+    with pytest.raises(codex.CredentialInvalidError, match="Token refresh failed: HTTP 401") as exc_info:
+        auth.refresh()
+
+    assert exc_info.value.index == 0
+    saved = json.loads(path.read_text())
+    assert saved["credentials"][0]["invalid"] is True
+
+
+def test_select_credential_ignores_invalid_credentials(tmp_path):
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="invalid",
+            rate_limits=_quota(now, ("codex_primary", 10, 50)),
+        ),
+        _credential(
+            account_id="usable",
+            rate_limits=_quota(now, ("codex_primary", 20, 100)),
+        ),
+    ]
+    credentials[0]["invalid"] = True
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+
+    assert auth.select_credential() == 1
+    assert auth.account_id == "usable"
+
+
+def test_select_credential_errors_when_all_invalid(tmp_path):
+    credentials = [_credential(account_id="invalid")]
+    credentials[0]["invalid"] = True
+    auth = codex.CodexAuth(str(_auth_file(tmp_path / "auth.json", credentials)))
+
+    with pytest.raises(codex.CodexError, match="all marked invalid"):
+        auth.select_credential()
+
+
+def test_successful_refresh_clears_invalid_flag(monkeypatch, tmp_path):
+    path = _auth_file(tmp_path / "auth.json")
+    auth = codex.CodexAuth(str(path))
+    auth.data["invalid"] = True
+    auth._save()
+
+    class RefreshResponse(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def urlopen(request, timeout=None):
+        return RefreshResponse(json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+        }).encode())
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", urlopen)
+    auth.refresh()
+
+    saved = json.loads(path.read_text())
+    assert "invalid" not in saved["credentials"][0]
+    assert saved["credentials"][0]["tokens"]["access_token"] == "new-access"
+
+
+def test_ensure_valid_switches_credential_after_refresh_401(monkeypatch, tmp_path):
+    import urllib.error
+
+    now = int(codex.time.time())
+    expired = _jwt({"exp": 1, "https://api.openai.com/auth": {"chatgpt_account_id": "bad"}})
+    credentials = [
+        _credential(
+            access_token=expired,
+            account_id="bad",
+            rate_limits=_quota(now, ("codex_primary", 10, 50)),
+        ),
+        _credential(
+            account_id="good",
+            rate_limits=_quota(now, ("codex_primary", 20, 100)),
+        ),
+    ]
+    path = _auth_file(tmp_path / "auth.json", credentials)
+    auth = codex.CodexAuth(str(path))
+    assert auth.index == 0
+
+    def fail_refresh(request, timeout=None):
+        assert request.full_url == codex.REFRESH_URL
+        raise urllib.error.HTTPError(
+            request.full_url,
+            401,
+            "unauthorized",
+            {},
+            BytesIO(b'{"error":"invalid_grant"}'),
+        )
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", fail_refresh)
+    auth.ensure_valid()
+
+    assert auth.index == 1
+    assert auth.account_id == "good"
+    saved = json.loads(path.read_text())
+    assert saved["credentials"][0]["invalid"] is True
+    assert "invalid" not in saved["credentials"][1]
+
+
+def test_request_switches_credential_after_refresh_401(monkeypatch, tmp_path):
+    import urllib.error
+
+    now = int(codex.time.time())
+    credentials = [
+        _credential(
+            account_id="bad",
+            rate_limits=_quota(now, ("codex_primary", 10, 50)),
+        ),
+        _credential(
+            account_id="good",
+            rate_limits=_quota(now, ("codex_primary", 20, 100)),
+        ),
+    ]
+    path = _auth_file(tmp_path / "auth.json", credentials)
+    auth = codex.CodexAuth(str(path))
+    seen_accounts = []
+    events = [
+        {"type": "response.output_text.delta", "delta": "ok"},
+        {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }],
+            },
+        },
+    ]
+    payload = b"".join(
+        f"data: {json.dumps(event)}\n\n".encode() for event in events
+    ) + b"data: [DONE]\n\n"
+
+    def urlopen(request, timeout=None):
+        if request.full_url == codex.REFRESH_URL:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "unauthorized",
+                {},
+                BytesIO(b'{"error":"invalid_grant"}'),
+            )
+        if request.full_url == codex.RESPONSES_URL:
+            account = request.get_header("Chatgpt-account-id") or request.get_header("ChatGPT-Account-ID")
+            # urllib Request normalizes header names; inspect headers dict instead
+            headers = {k.lower(): v for k, v in request.header_items()}
+            account = headers.get("chatgpt-account-id")
+            seen_accounts.append(account)
+            if account == "bad":
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    401,
+                    "unauthorized",
+                    {},
+                    BytesIO(b'{"error":"unauthorized"}'),
+                )
+            return _FakeResponse(payload)
+        raise AssertionError(f"unexpected url: {request.full_url}")
+
+    monkeypatch.setattr(codex.urllib.request, "urlopen", urlopen)
+    response = codex._request(
+        auth,
+        {
+            "model": "gpt-5.6-luna",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": True,
+        },
+        codex.StreamTimeouts(),
+    )
+
+    assert response["output"][0]["content"][0]["text"] == "ok"
+    assert seen_accounts == ["bad", "good"]
+    assert auth.account_id == "good"
+    saved = json.loads(path.read_text())
+    assert saved["credentials"][0]["invalid"] is True
