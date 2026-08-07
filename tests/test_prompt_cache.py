@@ -5,6 +5,62 @@ import sys
 
 from code_agent.client import LLMClient
 from code_agent.conversation import Conversation
+from code_agent.repl_attachment_mixin import ImageAttachment
+
+
+def test_responses_request_projects_private_image_attachment(monkeypatch):
+    config = {
+        "provider": "openai",
+        "model": "gpt-image-capable",
+        "api_key": "key",
+        "api_type": "responses",
+        "tool_mode": "repl_execute",
+        "tools": True,
+        "concurrency": 1,
+        "timeout": 20,
+        "port": 443,
+        "host": "api.openai.com",
+        "path": "/v1/responses",
+        "config": {},
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("openai/gpt-image-capable")
+    image = ImageAttachment(b"png-bytes", "image/png", 2, 3)
+
+    conversation = Conversation(client, "system")
+    conversation.usermsg(
+        "[Attachment: diagram.png, 2×3, image/png]",
+        _attachments={"diagram.png": image},
+    )
+    request = client._responses_request(conversation._messages(), None)
+
+    user = request["input"][1]
+    assert user["content"][0] == {
+        "type": "input_text",
+        "text": "[Attachment: diagram.png, 2×3, image/png]",
+    }
+    assert user["content"][1] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert all(
+        "_media_attachments" not in item
+        for item in request["input"]
+    )
+
+
+def test_provider_response_media_is_removed_from_conversation_history():
+    message = {
+        "role": "assistant",
+        "content": "done",
+        "images": [{"type": "image_url", "image_url": {"url": "data:..."}}],
+        "audio": [b"audio"],
+    }
+
+    result = LLMClient._strip_response_media(message)
+
+    assert result is message
+    assert message == {"role": "assistant", "content": "done"}
 
 
 def test_responses_request_skips_explicit_cache_when_not_opted_in(monkeypatch):

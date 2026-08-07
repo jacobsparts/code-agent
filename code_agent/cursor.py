@@ -4266,8 +4266,8 @@ def _openai_messages(messages):
     for message in messages:
         if not isinstance(message, dict):
             raise TypeError("messages must contain objects")
-        if message.get("images") or message.get("audio"):
-            raise ValueError("Cursor does not support image or audio input")
+        if message.get("audio"):
+            raise ValueError("Cursor does not support audio input")
         role = message.get("role") or "user"
         content = _chat_content_text(message.get("content")) or "[empty]"
 

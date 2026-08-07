@@ -111,7 +111,6 @@ def test_exchange_failure_preserves_cache(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("message", [
-    {"role": "user", "content": "x", "images": [b"image"]},
     {"role": "user", "content": "x", "audio": [b"audio"]},
     {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
 ])

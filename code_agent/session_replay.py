@@ -7,7 +7,13 @@ import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
 from .persisted_preview_state import PersistedPreviewState, PersistedPreviewTransitions
-from .repl_attachment_mixin import MemoryAttachment, decode_attachment_refs
+from .repl_attachment_mixin import (
+    ImageAttachment,
+    MemoryAttachment,
+    TextAttachment,
+    decode_attachment_refs,
+    normalize_message_attachments,
+)
 from .session_message_state import (
     apply_canonical_message_transition,
     coalesce_adjacent_user_messages,
@@ -35,7 +41,9 @@ def _preview_key(path: str) -> str | None:
     return None
 
 
-def render_attachment_content(ref, store=None, session_id: str | None = None, base_dir: str | None = None) -> str:
+def render_attachment_content(ref, store=None, session_id: str | None = None, base_dir: str | None = None):
+    if isinstance(ref, (TextAttachment, ImageAttachment)):
+        return ref
     if isinstance(ref, MemoryAttachment):
         content = ref.content
     elif key := _preview_key(ref):
@@ -47,13 +55,17 @@ def render_attachment_content(ref, store=None, session_id: str | None = None, ba
     else:
         raise FileNotFoundError(ref)
     lines = content.split('\n')
-    return '\n'.join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))
+    return TextAttachment(
+        '\n'.join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))
+    )
 
 
-def _load_attachment_map(refs: dict, missing: list[tuple[str, object]], store=None, session_id: str | None = None, base_dir: str | None = None) -> dict[str, str]:
+def _load_attachment_map(refs: dict, missing: list[tuple[str, object]], store=None, session_id: str | None = None, base_dir: str | None = None) -> dict:
     loaded = {}
     for name, ref in refs.items():
-        if not isinstance(ref, MemoryAttachment) and not _preview_key(ref):
+        if not isinstance(
+            ref, (MemoryAttachment, TextAttachment, ImageAttachment)
+        ) and not _preview_key(ref):
             continue
         try:
             loaded[name] = render_attachment_content(ref, store, session_id, base_dir)
@@ -118,9 +130,8 @@ def _replay_session_into_target(agent, session_id: str, store):
                 snapshot(seq)
                 continue
             msg = copy.deepcopy(raw_message)
-            for key in ("images", "audio"):
-                if msg.get(key):
-                    msg[key] = _decode_media(msg[key])
+            if msg.get("audio"):
+                msg["audio"] = _decode_media(msg["audio"])
             refs = decode_attachment_refs(msg.pop("_attachment_refs", None) or {})
             local_missing = []
             if refs:
@@ -233,7 +244,9 @@ def _replay_session_into_target(agent, session_id: str, store):
         else:
             msg.pop("_attachment_refs", None)
         for name, ref in refs.items():
-            if isinstance(ref, MemoryAttachment):
+            if isinstance(
+                ref, (MemoryAttachment, TextAttachment, ImageAttachment)
+            ):
                 continue
             if _preview_key(ref):
                 if store.get_preview_blob(session_id, _preview_key(ref)) is None:
@@ -241,7 +254,9 @@ def _replay_session_into_target(agent, session_id: str, store):
                     final_missing.append((name, ref))
         if "_attachments" in msg and not msg["_attachments"]:
             del msg["_attachments"]
-    agent.conversation.messages = messages
+    agent.conversation.messages = [
+        normalize_message_attachments(message) for message in messages
+    ]
     agent._persisted_preview_state = persisted_preview_state
     if hasattr(agent, "_reconstruct_observation_counters"):
         agent._reconstruct_observation_counters(messages)

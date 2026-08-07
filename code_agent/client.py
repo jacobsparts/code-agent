@@ -13,7 +13,7 @@ from collections import defaultdict
 
 from .utils import throttle, UsageTracker
 from .llm_registry import get_model_config
-from .conversation import Conversation
+from .conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
 from . import codex, cursor
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, normalize_openai_repl_response, project_openai_repl_messages
@@ -24,14 +24,8 @@ try:
 except AttributeError:
     TCP_KEEPIDLE = getattr(socket, "TCP_KEEPALIVE", None)  # macOS uses TCP_KEEPALIVE
 
-# Message keys passed through to _call_completions and _call_messages
-# in addition to the standard four: 'role', 'content', 'name', 'tool_call_id'
-EXTRA_KEYS = {'images', 'audio'}
-
-MEDIA_TYPES = {
-    b'\xff\xd8\xff': "image/jpeg",
-    b'\x89PN': "image/png",
-}
+# Message keys passed through in addition to the standard public keys.
+EXTRA_KEYS = {'audio'}
 
 def _detect_audio_type(data):
     """Detect audio MIME type from file magic bytes."""
@@ -91,6 +85,26 @@ class LLMClient:
         return [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages]
 
     @staticmethod
+    def _pop_media_attachments(message):
+        media = message.pop(MEDIA_ATTACHMENTS_FIELD, None) or []
+        for item in media:
+            if not isinstance(item, dict):
+                raise BadRequestError("Invalid projected image attachment")
+            if item.get("media_type") not in {"image/png", "image/jpeg"}:
+                raise BadRequestError(
+                    f"Unsupported image media type: {item.get('media_type')}"
+                )
+            if not isinstance(item.get("content"), bytes):
+                raise BadRequestError("Projected image attachment has no binary content")
+        return media
+
+    @staticmethod
+    def _strip_response_media(message):
+        message.pop("images", None)
+        message.pop("audio", None)
+        return message
+
+    @staticmethod
     def _json_size_default(value):
         if isinstance(value, bytes):
             return f"<{len(value)} bytes>"
@@ -146,8 +160,7 @@ class LLMClient:
         Call OpenAI Completions API.
 
         Args:
-            messages: List of message dicts with 'role' and 'content'.
-                      Messages may include 'images' key with list of raw bytes (PNG/JPEG).
+            messages: List of projected message dicts.
             tools: Optional tool specifications.
         """
         # OpenAI Completions API-compatible format
@@ -157,12 +170,15 @@ class LLMClient:
             if out.pop('audio', None):
                 raise BadRequestError("Audio input is not supported by OpenAI completions API")
             breakpoint = out.pop('_prompt_cache_breakpoint', None)
-            if images := out.pop('images', None):
+            if media := self._pop_media_attachments(out):
                 out['content'] = [
                     *([{"type": "text", "text": out['content']}] if out['content'] else []),
                     *[{"type": "image_url", "image_url": {
-                        "url": f"data:{MEDIA_TYPES[img[:3]]};base64,{base64.b64encode(img).decode()}"
-                    }} for img in images]
+                        "url": (
+                            f"data:{item['media_type']};base64,"
+                            f"{base64.b64encode(item['content']).decode()}"
+                        )
+                    }} for item in media]
                 ]
             elif breakpoint and self.model_config.get('explicit_prompt_cache') and isinstance(out.get('content'), str):
                 out['content'] = [{
@@ -263,10 +279,6 @@ class LLMClient:
                         logger.warning(f"stop_reason={stop_reason}, doubling max_tokens to {current_max_tokens}")
                         continue
 
-                # Strip response-only media fields — these are already rendered
-                # in content blocks and would crash re-encoding on the next call
-                for k in ('images', 'audio'):
-                    message.pop(k, None)
                 return message
             finally:
                 conn.close()
@@ -280,6 +292,8 @@ class LLMClient:
         input_items = []
         has_cache_breakpoint = False
         for message in messages:
+            message = dict(message)
+            media = self._pop_media_attachments(message)
             role = message.get('role')
             cache_breakpoint = bool(message.get('_prompt_cache_breakpoint')) and self.model_config.get('explicit_prompt_cache')
             if role == 'tool':
@@ -313,6 +327,13 @@ class LLMClient:
                     blocks.append({'type': 'input_text', 'text': block.get('text', '')})
                 else:
                     blocks.append(dict(block))
+            blocks.extend({
+                'type': 'input_image',
+                'image_url': (
+                    f"data:{item['media_type']};base64,"
+                    f"{base64.b64encode(item['content']).decode()}"
+                ),
+            } for item in media)
             if cache_breakpoint and blocks:
                 blocks[-1] = {
                     **blocks[-1],
@@ -420,6 +441,8 @@ class LLMClient:
     def _call_cursor(self, messages, tools):
         if self.tool_mode != "repl_execute":
             raise TypeError("Cursor transport requires tool_mode='repl_execute'")
+        if any(message.get(MEDIA_ATTACHMENTS_FIELD) for message in messages):
+            raise BadRequestError("Cursor transport does not support image attachments")
         messages = self._public_messages(messages)
         req = {
             "model": self.model_config["model"],
@@ -458,24 +481,26 @@ class LLMClient:
         Call Anthropic Messages API.
 
         Args:
-            messages: List of message dicts with 'role' and 'content'.
-                      Messages may include 'images' key with list of raw bytes (PNG/JPEG).
+            messages: List of projected message dicts.
             tools: Optional tool specifications.
         """
         # Anthropic Messages API-compatible format
-        messages = self._public_messages(messages)
-        for m in messages:
+        prepared = []
+        for message in messages:
+            m = dict(message)
             if m.pop('audio', None):
                 raise BadRequestError("Audio input is not supported by Anthropic Messages API")
-            if images := m.pop('images', None):
+            if media := self._pop_media_attachments(m):
                 m['content'] = [
                     *([{"type": "text", "text": m['content']}] if m['content'] else []),
                     *[{"type": "image", "source": {
                         "type": "base64",
-                        "media_type": MEDIA_TYPES[img[:3]],
-                        "data": base64.b64encode(img).decode()
-                    }} for img in images]
+                        "media_type": item["media_type"],
+                        "data": base64.b64encode(item["content"]).decode()
+                    }} for item in media]
                 ]
+            prepared.append(m)
+        messages = self._public_messages(prepared)
         system_message = None
         _messages = []
         for msg in messages:
@@ -548,15 +573,16 @@ class LLMClient:
         Call Gemini native generateContent API.
 
         Args:
-            messages: List of message dicts with 'role' and 'content'.
-                      Messages may include 'images' key with list of raw bytes (PNG/JPEG).
+            messages: List of projected message dicts.
                       Messages may include 'audio' key with list of raw bytes
                       (WAV/MP3/FLAC/OGG/AIFF/AAC).
             tools: Optional tool specifications.
         """
         contents = []
         system_parts = []
-        for m in messages:
+        for original in messages:
+            m = dict(original)
+            media = self._pop_media_attachments(m)
             role = m['role']
             if role == 'system':
                 system_parts.append({"text": m['content']})
@@ -577,12 +603,11 @@ class LLMClient:
             parts = []
             if m.get('content'):
                 parts.append({"text": m['content']})
-            if images := m.pop('images', None):
-                for img in images:
-                    parts.append({"inlineData": {
-                        "mimeType": MEDIA_TYPES[img[:3]],
-                        "data": base64.b64encode(img).decode()
-                    }})
+            for item in media:
+                parts.append({"inlineData": {
+                    "mimeType": item["media_type"],
+                    "data": base64.b64encode(item["content"]).decode()
+                }})
             if audio := m.pop('audio', None):
                 for aud in audio:
                     parts.append({"inlineData": {
@@ -694,20 +719,20 @@ class LLMClient:
             messages = self._strip_tool_metadata(messages)
         size_tools = [REPL_EXECUTE_TOOL] if self.tool_mode == "repl_execute" else tools
         self._validate_context_budget(self._input_bytes(messages, size_tools))
-        if self.model_config['api_type'] == "completions":
-            return self._call_completions(messages, tools)
-        elif self.model_config['api_type'] == "responses":
-            return self._call_responses(messages, tools)
-        elif self.model_config['api_type'] == "messages":
-            return self._call_messages(messages, tools)
-        elif self.model_config['api_type'] == "cursor":
-            return self._call_cursor(messages, tools)
-        elif self.model_config['api_type'] == "codex":
-            return self._call_codex(messages, tools)
-        elif self.model_config['api_type'] == "gemini":
-            return self._call_gemini(messages, tools)
-        else:
-            raise NotImplementedError(self.model_config['api_type'])
+        api_type = self.model_config['api_type']
+        callers = {
+            "completions": self._call_completions,
+            "responses": self._call_responses,
+            "messages": self._call_messages,
+            "cursor": self._call_cursor,
+            "codex": self._call_codex,
+            "gemini": self._call_gemini,
+        }
+        try:
+            caller = callers[api_type]
+        except KeyError:
+            raise NotImplementedError(api_type)
+        return self._strip_response_media(caller(messages, tools))
 
     @staticmethod
     def _sleep_backoff(attempt, base=15):

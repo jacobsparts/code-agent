@@ -5,6 +5,10 @@ import hmac
 import pickle
 import re
 import secrets
+from code_agent.repl_attachment_mixin import (
+    iter_placeholders,
+    render_attachment_placeholder,
+)
 from dataclasses import dataclass
 
 from code_agent.persisted_preview_state import PersistedPreviewState
@@ -956,19 +960,20 @@ def _attachment_placeholders(messages: list[dict]) -> list[str]:
     seen = set()
     placeholders = []
     for msg in messages:
-        for match in re.finditer(r"\[Attachment: ([^\]\n]+)\]", msg.get("content") or ""):
-            name = match.group(1)
+        content = msg.get("content") or ""
+        for match, parsed in iter_placeholders(content):
+            name = parsed["name"]
             if name not in seen:
                 seen.add(name)
-                placeholders.append(f"[Attachment: {name}]")
-        for name in (msg.get("_attachments") or {}):
+                placeholders.append(match.group(0))
+        for name, value in (msg.get("_attachments") or {}).items():
             if name not in seen:
                 seen.add(name)
-                placeholders.append(f"[Attachment: {name}]")
+                placeholders.append(render_attachment_placeholder(name, value))
         for name in (msg.get("_attachment_refs") or {}):
             if name not in seen:
                 seen.add(name)
-                placeholders.append(f"[Attachment: {name}]")
+                placeholders.append(render_attachment_placeholder(name))
     return placeholders
 
 

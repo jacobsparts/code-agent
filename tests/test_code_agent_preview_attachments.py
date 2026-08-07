@@ -4,7 +4,14 @@ import re
 import pytest
 
 from code_agent.agent import CodeAgent
-from code_agent.conversation import Conversation
+from code_agent.conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
+from code_agent.repl_attachment_mixin import (
+    ImageAttachment,
+    TextAttachment,
+    iter_placeholders,
+    make_image_attachment,
+    render_attachment_placeholder,
+)
 from code_agent.repl_events import ReplEvent
 from code_agent.session_message_state import reduce_canonical_message_events
 from code_agent.session_store import SessionStore
@@ -675,16 +682,42 @@ def test_context_pressure_notice_combines_with_expanded_context():
     assert "Warn the user that the context window is nearly exhausted" not in notices
 
 
+def test_attachment_listing_supports_typed_text_and_image_values():
+    text = TextAttachment("hello")
+    image = ImageAttachment(
+        content=b"12345678",
+        media_type="image/png",
+        width=2,
+        height=3,
+    )
+
+    assert CodeAgent._attachment_listing("notes.txt", text) == (
+        "notes.txt (0.0KB)"
+    )
+    assert CodeAgent._attachment_listing("diagram.png", image) == (
+        "diagram.png (image/png, 2×3, 0.0KB)"
+    )
+
+
 def test_dynamic_context_inventory_is_current_and_precedes_guidance():
     agent = make_agent()
     agent.llm_client.model_config["context_constraint"] = 100
     agent.llm_client.usage_tracker.input_tokens_per_byte = {
         agent.llm_client.model_name: 1.0
     }
+    image = ImageAttachment(
+        content=b"12345678",
+        media_type="image/png",
+        width=2,
+        height=3,
+    )
     agent.conversation.usermsg(
-        "x" * 200 + "\n[PreviewRef: session://preview/abc]\nsummary\n[/PreviewRef]",
-        _attachments={"notes.py": "body"},
-        images=[b"\x89PNGdata"],
+        (
+            "x" * 200
+            + "\n[Attachment: diagram.png, 2×3, image/png]"
+            + "\n[PreviewRef: session://preview/abc]\nsummary\n[/PreviewRef]"
+        ),
+        _attachments={"notes.py": "body", "diagram.png": image},
     )
     agent._expanded_preview_refs = {"session://preview/abc": {"numbered": False}}
     agent._preview_blob_content = lambda uri: "preview body"
@@ -693,7 +726,7 @@ def test_dynamic_context_inventory_is_current_and_precedes_guidance():
     notice = agent._context_management_ephemeral()
 
     assert "- file: notes.py (4 bytes)" in notice
-    assert "- image: image 1 (8 bytes)" in notice
+    assert "- image: diagram.png (8 bytes)" in notice
     assert "- expanded preview: session://preview/abc (12 bytes)" in notice
     assert "Attached context size: 24 bytes." in notice
     assert notice.index("Current attached context:") < notice.index("Context usage is")
@@ -1021,7 +1054,7 @@ def test_resume_session_materializes_persisted_attachment_refs(tmp_path):
     assert agent.resume_session(session_id) is True
     assert "persisted.py" in agent.list_attachments()
     assert "persisted.py" in agent._current_file_context_names()
-    assert "print('persisted')" in agent.list_attachments()["persisted.py"]
+    assert "print('persisted')" in agent.list_attachments()["persisted.py"].content
 def make_persistent_agent(tmp_path):
     agent = CodeAgent()
     agent._ensure_setup()
@@ -1031,7 +1064,7 @@ def make_persistent_agent(tmp_path):
     return agent
 
 
-_VIEW_CONTENT_EVENT_KINDS = {"read", "read_partial", "read_attach"}
+_VIEW_CONTENT_EVENT_KINDS = {"read", "read_image", "read_partial", "read_attach"}
 
 
 def _run_view_code(agent, code, *, start_attempt=True):
@@ -1063,6 +1096,163 @@ def _commit_view_attachments(agent, events, content="[view committed]"):
     finally:
         agent._suspend_persistence = previous
     return llm_output
+
+
+
+def _png_bytes(width=2, height=3):
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+    )
+
+
+def _jpeg_bytes(width=4, height=5):
+    return (
+        b"\xff\xd8"
+        + b"\xff\xc0\x00\x0b\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\x01\x01\x11\x00"
+        + b"\xff\xd9"
+    )
+
+
+@pytest.mark.parametrize(
+    ("data", "name", "media_type", "width", "height"),
+    [
+        (_png_bytes(), "misleading.txt", "image/png", 2, 3),
+        (_jpeg_bytes(), "misleading.bin", "image/jpeg", 4, 5),
+    ],
+)
+def test_view_detects_images_by_magic_bytes(
+    tmp_path, data, name, media_type, width, height
+):
+    path = tmp_path / name
+    path.write_bytes(data)
+    agent = make_persistent_agent(tmp_path)
+
+    _, pure_syntax_error, events, _ = _run_view_code(
+        agent, f"view({str(path)!r})"
+    )
+    assert pure_syntax_error is False
+    assert [event.kind for event in _content_events(events)] == [
+        "read_attach",
+        "read_image",
+    ]
+
+    llm_output = agent.build_output_for_llm(events)
+    expected = f"[Attachment: {path}, {width}×{height}, {media_type}]"
+    assert expected in llm_output
+    attachment = agent._read_attachments[str(path)]
+    assert attachment == ImageAttachment(data, media_type, width, height)
+
+    agent._suspend_persistence = True
+    agent.usermsg(llm_output, _user_content=llm_output)
+    projected = agent.conversation._messages()[-1]
+    assert expected in projected["content"]
+    assert projected[MEDIA_ATTACHMENTS_FIELD] == [{
+        "name": str(path),
+        "media_type": media_type,
+        "content": data,
+        "width": width,
+        "height": height,
+    }]
+
+
+def test_invalid_png_signature_has_clear_decode_error(tmp_path):
+    path = tmp_path / "broken.dat"
+    path.write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
+    agent = make_persistent_agent(tmp_path)
+
+    _, pure_syntax_error, events, _ = _run_view_code(
+        agent, f"view({str(path)!r})"
+    )
+    assert pure_syntax_error is False
+    with pytest.raises(ValueError, match="Unable to decode image attachment"):
+        agent.build_output_for_llm(events)
+
+
+def test_image_placeholder_parser_supports_commas_and_stable_media_order():
+    first = make_image_attachment(_png_bytes(7, 8))
+    second = make_image_attachment(_jpeg_bytes(9, 10))
+    first_name = "screen, final.png"
+    second_name = "other image.jpg"
+    first_placeholder = render_attachment_placeholder(first_name, first)
+    second_placeholder = render_attachment_placeholder(second_name, second)
+    content = f"{second_placeholder}\n{first_placeholder}"
+
+    parsed = [item for _, item in iter_placeholders(content)]
+    assert [item["name"] for item in parsed] == [second_name, first_name]
+
+    conversation = Conversation(DummyClient(), "system")
+    conversation.usermsg(
+        content,
+        _attachments={
+            first_name: first,
+            second_name: second,
+            "missing-placeholder.png": first,
+            "notes.txt": TextAttachment("rendered notes"),
+        },
+    )
+    projected = conversation._messages()[-1]
+    assert projected["content"] == content
+    assert [item["name"] for item in projected[MEDIA_ATTACHMENTS_FIELD]] == [
+        second_name,
+        first_name,
+    ]
+
+
+def test_text_and_image_attachments_materialize_differently():
+    image = make_image_attachment(_png_bytes())
+    image_placeholder = render_attachment_placeholder("diagram.png", image)
+    conversation = Conversation(DummyClient(), "system")
+    conversation.usermsg(
+        f"[Attachment: notes.txt]\n{image_placeholder}",
+        _attachments={
+            "notes.txt": TextAttachment("    1→hello"),
+            "diagram.png": image,
+        },
+    )
+
+    projected = conversation._messages()[-1]
+    assert projected["content"] == f"    1→hello\n{image_placeholder}"
+    assert projected[MEDIA_ATTACHMENTS_FIELD][0]["content"] == image.content
+
+
+
+def test_typed_image_attachment_persists_and_replays(tmp_path):
+    from code_agent.session_replay import replay_session_into_agent
+
+    image = make_image_attachment(_png_bytes(11, 12))
+    placeholder = render_attachment_placeholder("persisted.png", image)
+    agent = make_persistent_agent(tmp_path)
+    message = {
+        "role": "user",
+        "content": placeholder,
+        "_attachments": {"persisted.png": image},
+        "_attachment_refs": {"persisted.png": image},
+    }
+    agent._persist_message(message)
+
+    class ReplayAgent:
+        def __init__(self):
+            self.conversation = Conversation(DummyClient(), "system")
+            self._expanded_preview_refs = {}
+
+        def _configure_conversation(self, conversation):
+            pass
+
+    replayed = ReplayAgent()
+    replay_session_into_agent(replayed, agent._session_id, agent._session_store)
+    replayed_message = replayed.conversation.messages[-1]
+
+    assert replayed_message["content"] == placeholder
+    assert replayed_message["_attachments"]["persisted.png"] == image
+    assert replayed_message["_attachment_refs"]["persisted.png"] == image
+    projected = replayed.conversation._messages()[-1]
+    assert projected[MEDIA_ATTACHMENTS_FIELD][0]["content"] == image.content
 
 
 def test_view_full_file_already_in_context_emits_notice(tmp_path):
@@ -1157,7 +1347,7 @@ def test_view_reposition_attached_moves_to_newest_context(tmp_path):
     assert len(placements) == 1
     index, message = placements[0]
     assert index == len(agent.conversation.messages) - 1
-    assert "print('move')" in message["_attachments"][file_path]
+    assert "print('move')" in message["_attachments"][file_path].content
 
 
 def test_view_deny_reposition_unattached(tmp_path):
@@ -1691,8 +1881,8 @@ def test_auto_refresh_uses_last_same_turn_write_for_attached_file(tmp_path):
 
 
     assert output == f">>> view({path!r})\n[Attachment: {path}]\n"
-    assert "second" in agent._read_attachments[path]
-    assert "first" not in agent._read_attachments[path]
+    assert "second" in agent._read_attachments[path].content
+    assert "first" not in agent._read_attachments[path].content
 
 
 def test_auto_refresh_skips_when_file_explicitly_viewed_after_write(tmp_path):
@@ -1712,7 +1902,7 @@ def test_auto_refresh_skips_when_file_explicitly_viewed_after_write(tmp_path):
 
 
     assert output == f"[Attachment: {path}]\n"
-    assert agent._read_attachments[path] == "    1→viewed"
+    assert agent._read_attachments[path] == TextAttachment("    1→viewed")
 
 
 def test_auto_refresh_after_explicit_view_uses_later_write(tmp_path):
@@ -1731,5 +1921,5 @@ def test_auto_refresh_after_explicit_view_uses_later_write(tmp_path):
     ])
 
     assert output == f"[Attachment: {path}]\n>>> view({path!r})\n[Attachment: {path}]\n"
-    assert "written" in agent._read_attachments[path]
-    assert "viewed" not in agent._read_attachments[path]
+    assert "written" in agent._read_attachments[path].content
+    assert "viewed" not in agent._read_attachments[path].content

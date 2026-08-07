@@ -30,9 +30,16 @@ from pathlib import Path
 from queue import Empty
 from code_agent.repl_agent import REPLAgent
 from code_agent.repl_events import ReplEvent
-from code_agent.repl_attachment_mixin import REPLAttachmentMixin
 from code_agent.mcp_mixin import MCPMixin
-from code_agent.repl_attachment_mixin import MemoryAttachment, encode_attachment_refs
+from code_agent.repl_attachment_mixin import (
+    REPLAttachmentMixin,
+    ImageAttachment,
+    MemoryAttachment,
+    TextAttachment,
+    encode_attachment_refs,
+    make_image_attachment,
+    render_attachment_placeholder,
+)
 
 from code_agent.cli import CLIMixin
 from code_agent.llm_registry import ModelNotFoundError
@@ -657,7 +664,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
 
         msg = {}
         for key, value in message.items():
-            if key in {'images', 'audio'}:
+            if key == 'audio':
                 msg[key] = encode_media(value)
             elif key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary', '_observations', '_observation_transition'}:
                 msg[key] = copy.deepcopy(value)
@@ -693,9 +700,8 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             new_msg["_stdout"] = kwargs['_stdout']
         if kwargs.get('_attachment_refs'):
             new_msg["_attachment_refs"] = copy.deepcopy(kwargs['_attachment_refs'])
-        for key in ('images', 'audio'):
-            if kwargs.get(key):
-                new_msg[key] = kwargs[key]
+        if kwargs.get('audio'):
+            new_msg['audio'] = kwargs['audio']
         if latest_segment is not None:
             new_msg["_render_segments"] = [{k: v for k, v in latest_segment.items() if k != "_event_seq"}]
         seq = self._append_session_event("message_added", {"message": self._sanitize_message_for_persistence(new_msg)})
@@ -888,7 +894,13 @@ def _code_agent_send_rg_available():
             refs = msg.get('_attachment_refs') or {}
             attachments = msg.setdefault('_attachments', {}) if refs else {}
             for name, ref in refs.items():
-                if isinstance(ref, MemoryAttachment) or is_preview_uri(ref) or name in attachments:
+                if (
+                    isinstance(
+                        ref, (MemoryAttachment, TextAttachment, ImageAttachment)
+                    )
+                    or is_preview_uri(ref)
+                    or name in attachments
+                ):
                     continue
                 key = (name, ref)
                 if key not in loaded:
@@ -940,7 +952,7 @@ def _code_agent_send_rg_available():
             )
         )
 
-    def list_attachments(self, include_session_blobs: bool = True, include_auto_context: bool = True, include_memory: bool = False) -> dict[str, str]:
+    def list_attachments(self, include_session_blobs: bool = True, include_auto_context: bool = True, include_memory: bool = False) -> dict[str, TextAttachment | ImageAttachment]:
         attachments = super().list_attachments()
         if not include_memory:
             attachments = {
@@ -987,7 +999,10 @@ def _code_agent_send_rg_available():
         for msg in getattr(self.conversation, "messages", []):
             content = msg.get("content", "")
             for name, attachment in (msg.get("_attachments") or {}).items():
-                content = content.replace(f"[Attachment: {name}]", attachment)
+                if isinstance(attachment, TextAttachment):
+                    content = content.replace(
+                        render_attachment_placeholder(name), attachment.content
+                    )
             render_preview_refs(content, expanded, self._preview_blob_content, rendered)
         has_coalesced_messages = any(
             msg.get("_coalesced")
@@ -1135,7 +1150,10 @@ def _code_agent_send_rg_available():
         marker = f"[Attachment: {path}]"
         prospective_content = current_output + marker + "\n"
         for name, attachment in getattr(self, "_read_attachments", {}).items():
-            prospective_content = prospective_content.replace(f"[Attachment: {name}]", attachment)
+            if isinstance(attachment, TextAttachment):
+                prospective_content = prospective_content.replace(
+                    render_attachment_placeholder(name), attachment.content
+                )
         prospective_content = prospective_content.replace(marker, content)
         messages.append({"role": "user", "content": prospective_content})
         try:
@@ -1271,6 +1289,28 @@ def _code_agent_send_rg_available():
             if msg_type == "read_partial":
                 partial_read_path = chunk.strip()
                 continue
+            if msg_type == "read_image" and attach_path:
+                flush_statement()
+                path = attach_path
+                attach_path = None
+                if path in unviewed_files:
+                    self._clear_pending_full_view(path)
+                    continue
+                try:
+                    payload = json.loads(chunk)
+                    attachment = make_image_attachment(
+                        base64.b64decode(payload["content"], validate=True)
+                    )
+                except Exception as exc:
+                    self._clear_pending_full_view(path)
+                    raise ValueError(
+                        f"Unable to decode image attachment {path!r}: {exc}"
+                    ) from exc
+                self._invalidate_attachment(path)
+                self._read_attachments[path] = attachment
+                attachment_read_order[path] = event_order
+                result.append(render_attachment_placeholder(path, attachment) + "\n")
+                continue
             if msg_type == "read" and attach_path:
                 flush_statement()
                 path = attach_path
@@ -1286,9 +1326,9 @@ def _code_agent_send_rg_available():
                     result.append(error)
                     continue
                 self._invalidate_attachment(path)
-                self._read_attachments[path] = content
+                self._read_attachments[path] = TextAttachment(content)
                 attachment_read_order[path] = event_order
-                result.append(f"[Attachment: {path}]\n")
+                result.append(render_attachment_placeholder(path) + "\n")
                 continue
             if msg_type == "read" and partial_read_path:
                 partial_read_path = None
@@ -1337,8 +1377,11 @@ def _code_agent_send_rg_available():
             lines = content.split('\n')
             formatted = '\n'.join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))
             self._invalidate_attachment(attached_name)
-            self._read_attachments[attached_name] = formatted
-            result.append(f">>> view({attached_name!r})\n[Attachment: {attached_name}]\n")
+            self._read_attachments[attached_name] = TextAttachment(formatted)
+            result.append(
+                f">>> view({attached_name!r})\n"
+                f"{render_attachment_placeholder(attached_name)}\n"
+            )
 
         return "".join(result)
 
@@ -1444,41 +1487,6 @@ def _code_agent_send_rg_available():
 
         pending.add(key)
         return {"action": "attach"}
-
-    @REPLAgent.tool
-    def view_images(self,
-            files: list[str | bytes] = "List of image filepaths or binary data",
-            notes: str = "Observations, objectives, what to look for"
-        ):
-        '''Load images into context for visual analysis on next turn.'''
-        images = []
-        total_bytes = 0
-
-        if not isinstance(files, list):
-            files = [files]
-
-        for data in files:
-            # Stub reads files in REPL, so we should only get bytes here
-            if not isinstance(data, bytes):
-                raise TypeError(f"Expected bytes, got {type(data).__name__}")
-
-            # Validate JPEG or PNG
-            if len(data) < 4:
-                raise ValueError("Invalid image data (too short)")
-
-            is_jpeg = data.startswith(b'\xff\xd8\xff')
-            is_png = data.startswith(b'\x89PNG')
-
-            if not (is_jpeg or is_png):
-                raise ValueError(f"Unsupported image format ({len(data)} bytes) - only JPEG and PNG supported")
-
-            images.append(data)
-            total_bytes += len(data)
-
-        self._pending_images = getattr(self, '_pending_images', []) + images
-        return f"{len(images)} image(s) queued ({total_bytes // 1000}KB) - {notes}"
-
-    view_images._tool_files_param = "files"
 
     @staticmethod
     def _valid_positive_int(value) -> int | None:
@@ -1590,16 +1598,42 @@ def _code_agent_send_rg_available():
             return ""
         return eligible_rollup_line([list(group) for group in eligibility.groups])
 
+    @staticmethod
+    def _attachment_size_bytes(content) -> int | None:
+        if isinstance(content, ImageAttachment):
+            return len(content.content)
+        if isinstance(content, TextAttachment):
+            return len(content.content.encode("utf-8"))
+        return None
+
+    @classmethod
+    def _attachment_listing(cls, name: str, content) -> str:
+        size = cls._attachment_size_bytes(content)
+        size_text = f"{size / 1000:.1f}KB" if size is not None else "unknown size"
+        if isinstance(content, ImageAttachment):
+            return (
+                f"{name} ({content.media_type}, "
+                f"{content.width}×{content.height}, {size_text})"
+            )
+        return f"{name} ({size_text})"
+
+
     def _current_context_inventory(self, extra=None) -> list[dict]:
         items = {}
         attachments = self.list_attachments(include_auto_context=False)
         for name, content in attachments.items():
             if self._is_memory_attachment_name(name):
                 continue
+            kind = (
+                "image"
+                if isinstance(content, ImageAttachment)
+                else "expanded preview" if is_preview_uri(name) else "file"
+            )
+            size = self._attachment_size_bytes(content)
             items[name] = {
-                "kind": "expanded preview" if is_preview_uri(name) else "file",
+                "kind": kind,
                 "name": name,
-                "bytes": len(content.encode("utf-8")) if isinstance(content, str) else None,
+                "bytes": size,
             }
         for uri, content in self._expanded_preview_context().items():
             items[uri] = {
@@ -1615,16 +1649,6 @@ def _code_agent_send_rg_available():
                 "name": name,
                 "bytes": len(content.encode("utf-8")) if isinstance(content, str) else None,
             }
-        image_index = 0
-        for message in getattr(self.conversation, "messages", []):
-            for image in message.get("images") or []:
-                image_index += 1
-                name = f"image {image_index}"
-                items[f"__image_{image_index}"] = {
-                    "kind": "image",
-                    "name": name,
-                    "bytes": len(image) if isinstance(image, bytes) else None,
-                }
         return list(items.values())
 
     def _context_inventory_ephemeral(self, items, accounting=None) -> str | None:
@@ -1781,7 +1805,7 @@ def _code_agent_send_rg_available():
 
 
     def usermsg(self, content, **kwargs):
-        """Override to attach pending images and read-attachments."""
+        """Override to attach pending explicit refs and read attachments."""
         output_for = getattr(self, "_pending_repl_output_for", None)
         if output_for is not None and kwargs.get("_repl_output") is True:
             kwargs["_repl_output_for"] = output_for
@@ -1796,13 +1820,13 @@ def _code_agent_send_rg_available():
             existing.update(pending)
             kwargs['_attachments'] = existing
             refs = kwargs.get('_attachment_refs', {})
-            for name in pending:
-                refs.setdefault(name, name)
+            for name, value in pending.items():
+                refs.setdefault(
+                    name,
+                    value if isinstance(value, ImageAttachment) else name,
+                )
             kwargs['_attachment_refs'] = refs
             self._read_attachments = {}
-        if pending := getattr(self, '_pending_images', None):
-            kwargs['images'] = kwargs.get('images', []) + pending
-            self._pending_images = []
         before_len = len(self.conversation.messages)
         result = super().usermsg(content, **kwargs)
         if len(self.conversation.messages) > before_len:
@@ -2414,6 +2438,7 @@ If you don't know how to proceed:
             "tool_returned",
             "tool_failed",
             "read_attach",
+            "read_image",
             "read_partial",
             "file_written",
         }:
@@ -3220,8 +3245,10 @@ Return only the replacement user prompt text.
                     else:
                         self._display_text(f"{DIM}Attachments/context:{RESET}", kind="status")
                         for name, content in attachments.items():
-                            size_kb = len(content) / 1000
-                            self._display_text(f"{DIM}  {name} ({size_kb:.1f}KB){RESET}", kind="status")
+                            listing = self._attachment_listing(name, content)
+                            self._display_text(
+                                f"{DIM}  {listing}{RESET}", kind="status"
+                            )
                         for name, content in expanded.items():
                             size_kb = len(content) / 1000
                             line_count = len(content.split("\n"))
@@ -3707,6 +3734,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
 
         prefix = "session://preview/"
         is_preview_uri = isinstance(file_path, str) and file_path.startswith(prefix)
+        is_image = False
         if numbered is None:
             numbered = not is_preview_uri
         path = Path(file_path).expanduser()
@@ -3735,12 +3763,26 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 _send_output("preview_expand", f"Expanded preview: {file_path} (full content is now available in current context)\n")
                 return
         else:
-            content = path.read_text()
+            raw_content = path.read_bytes()
+            is_image = (
+                raw_content.startswith(b"\x89PNG\r\n\x1a\n")
+                or raw_content.startswith(b"\xff\xd8\xff")
+            )
+            if is_image:
+                content = None
+            else:
+                content = raw_content.decode()
 
-        all_lines = content.split('\n')
-        total_lines = len(content.splitlines())
-        is_partial = offset is not None or limit is not None
-        attach_full = not is_partial
+        if not is_preview_uri and is_image:
+            all_lines = []
+            total_lines = 0
+            is_partial = False
+            attach_full = True
+        else:
+            all_lines = content.split('\n')
+            total_lines = len(content.splitlines())
+            is_partial = offset is not None or limit is not None
+            attach_full = not is_partial
 
         if not is_preview_uri:
             import json as _json
@@ -3753,7 +3795,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                     "reposition": bool(reposition),
                     "is_partial": bool(is_partial),
                     "line_count": total_lines,
-                    "char_count": len(content),
+                    "char_count": len(raw_content) if is_image else len(content),
                 },
                 "request_id": _decision_req_id,
             }))
@@ -3778,6 +3820,17 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 limit = None
             elif action == "partial":
                 attach_full = False
+
+        if not is_preview_uri and is_image:
+            if not attach_full:
+                raise ValueError("Image attachments require a full view")
+            import base64 as _base64
+            import json as _json
+            _send_output("read_attach", file_path + "\n")
+            _send_output("read_image", _json.dumps({
+                "content": _base64.b64encode(raw_content).decode("ascii"),
+            }) + "\n")
+            return
 
         if attach_full:
             start = 0

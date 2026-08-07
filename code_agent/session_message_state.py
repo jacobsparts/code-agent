@@ -35,11 +35,10 @@ def coalesce_adjacent_user_messages(messages: list[dict]) -> list[dict]:
                 previous["_stdout"] = stdout
             if message.get("_user_content") is not None:
                 previous["_user_content"] = message["_user_content"]
-            for key in ("images", "audio"):
-                if message.get(key):
-                    previous[key] = (previous.get(key) or []) + copy.deepcopy(
-                        message[key]
-                    )
+            if message.get("audio"):
+                previous["audio"] = (previous.get("audio") or []) + copy.deepcopy(
+                    message["audio"]
+                )
             for key in ("_attachment_refs", "_attachments"):
                 if message.get(key):
                     values = previous.get(key) or {}

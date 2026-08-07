@@ -1,16 +1,16 @@
 """Code-agent transcript viewer."""
 
 from .pager import pager_ui
+from code_agent.conversation import materialize_attachments
 
 
 def _llm_visible_message(msg: dict) -> dict:
     out = {k: v for k, v in msg.items() if not k.startswith("_")}
     attachments = msg.get("_attachments") or {}
     if attachments:
-        content = str(out.get("content") or "")
-        for name, value in attachments.items():
-            content = content.replace(f"[Attachment: {name}]", str(value))
-        out["content"] = content
+        out["content"], _ = materialize_attachments(
+            str(out.get("content") or ""), attachments
+        )
     return out
 
 

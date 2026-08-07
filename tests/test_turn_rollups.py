@@ -1673,7 +1673,6 @@ def test_code_agent_usermsg_persists_before_context_projection():
     agent._last_was_repl_output = False
     agent._pending_explicit_attachment_refs = {}
     agent._read_attachments = {}
-    agent._pending_images = []
     seen = []
 
     class EstimatingClient:
