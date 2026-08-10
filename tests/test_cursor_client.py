@@ -119,6 +119,50 @@ def test_cursor_rejects_media(message):
         cursor._openai_messages([message])
 
 
+def test_cursor_preserves_empty_user_message():
+    prompt, history = cursor._openai_messages([
+        {"role": "user", "content": ""},
+    ])
+
+    assert prompt == ""
+    assert history == []
+
+
+def test_cursor_moves_latest_tool_result_to_user_prompt():
+    messages = [
+        {"role": "user", "content": "Run the tool."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "repl_execute",
+                    "arguments": json.dumps({"code": "print('ok')"}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "content": "ok",
+            "tool_call_id": "call-1",
+            "name": "repl_execute",
+        },
+    ]
+
+    prompt, history = cursor._openai_messages(messages)
+
+    assert prompt == "ok"
+    assert history[-1] == {
+        "role": "tool",
+        "content": "Input received.",
+        "tool_call_id": "call-1",
+        "tool_name": "repl_execute",
+    }
+    assert history[1]["content"] == ""
+
+
 def test_cursor_client_adapter(monkeypatch):
     config = {
         "provider": "cursor",
