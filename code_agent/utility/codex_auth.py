@@ -423,6 +423,7 @@ def save_credential(auth: dict, path: str = CRED_FILE) -> str:
             match["last_refresh"] = auth["last_refresh"]
             if "email" in auth:
                 match["email"] = auth["email"]
+            match.pop("invalid", None)
 
         f.seek(0)
         f.truncate()
