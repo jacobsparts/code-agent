@@ -258,6 +258,36 @@ def test_overlay_subagent_response_tracks_overlay_protocol():
     assert "+++ foo.txt" in resp.diff()
 
 
+def test_foreground_interrupt_reports_backgrounded_overlay_task(monkeypatch, capsys):
+    agent = OverlaySubagent.__new__(OverlaySubagent)
+    agent._current_response = None
+    agent.max_turns = 50
+    agent._transport = MagicMock()
+    agent._transport._conn = MagicMock()
+    monkeypatch.setattr(agent, "_ensure_started", MagicMock())
+    monkeypatch.setattr(
+        "code_agent.subagent._send_msg",
+        MagicMock(),
+    )
+
+    def interrupt(_response, _timeout=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(OverlaySubagentResponse, "wait", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.send("keep working")
+
+    response = agent.last
+    assert response is not None
+    assert not response._done
+    assert agent._current_response is response
+    assert capsys.readouterr().out == (
+        "\nOverlay subagent task is still running in the background. "
+        "Use subagent.last to inspect or wait for it.\n"
+    )
+
+
 def test_snapshot_capacity_enforces_byte_and_inode_limits(tmp_path):
     from code_agent.overlay_subagent import validate_snapshot_capacity
 

@@ -2333,7 +2333,14 @@ worker_main(
             "max_turns": max_turns or self.max_turns,
         }))
         if not bg:
-            response.wait(timeout)
+            try:
+                response.wait(timeout)
+            except KeyboardInterrupt:
+                print(
+                    "\nOverlay subagent task is still running in the background. "
+                    "Use subagent.last to inspect or wait for it."
+                )
+                raise
         return response
 
     def _poll(self) -> None:

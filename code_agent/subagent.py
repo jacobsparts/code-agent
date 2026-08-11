@@ -722,6 +722,8 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
             bg: If True, return immediately without waiting.
             max_turns: Override max turns for this task.
             timeout: Seconds to wait; None waits indefinitely (ignored if bg=True).
+                Ctrl+C interrupts only this foreground wait; the task continues
+                and remains available through ``last`` or ``wait()``.
 
         Returns:
             SubagentResponse object. Its .result is the final text response.
@@ -747,8 +749,10 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
         try:
             response.wait(timeout)
         except KeyboardInterrupt:
-            response._set_error("Subagent task interrupted by KeyboardInterrupt.")
-            self._cleanup_after_interrupt()
+            print(
+                "\nSubagent task is still running in the background. "
+                "Use subagent.last to inspect or wait for it."
+            )
             raise
         return response
 

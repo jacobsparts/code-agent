@@ -97,3 +97,37 @@ def test_incremental_receiver_preserves_partial_frame_when_interrupted(monkeypat
     finally:
         reader.close()
         writer.close()
+
+def test_foreground_interrupt_detaches_without_stopping_subagent(monkeypatch, capsys):
+    agent = Subagent()
+    agent._started = True
+    agent._proc = MagicMock()
+    agent._proc.poll.return_value = None
+    agent._conn = MagicMock()
+    cleanup = MagicMock()
+    agent._cleanup_after_interrupt = cleanup
+
+    monkeypatch.setattr("code_agent.subagent._send_msg", MagicMock())
+
+    def interrupt(_response, _timeout=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(SubagentResponse, "wait", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.send("keep working")
+
+    response = agent.last
+    assert response is not None
+    assert not response._done
+    assert agent._current_response is response
+    cleanup.assert_not_called()
+    assert agent._proc.poll() is None
+    assert capsys.readouterr().out == (
+        "\nSubagent task is still running in the background. "
+        "Use subagent.last to inspect or wait for it.\n"
+    )
+
+    agent._conn = None
+    agent._proc = None
+    agent._started = False
