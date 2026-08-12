@@ -4642,7 +4642,11 @@ def chat_completions(api_key: str, body: dict) -> dict:
         for call in result.tool_calls
         if isinstance(call, ToolCall)
     ]
-    message = {"role": "assistant", "content": result.text or None}
+    #message = {"role": "assistant", "content": result.text or None}
+    message = {
+        "role": "assistant",
+        "content": None if tool_calls else (result.text or None),
+    }
     if tool_calls:
         message["tool_calls"] = tool_calls
     response = {
