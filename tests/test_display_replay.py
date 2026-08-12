@@ -564,6 +564,27 @@ def test_code_agent_observe_statement_is_quiet_without_result(capsys):
 
     assert capsys.readouterr().out == ""
     assert agent._display_capture == []
+    assert agent._turn_output_started is True
+    assert agent._header_pending is True
+
+
+def test_code_agent_clears_working_status_when_llm_call_completes():
+    from code_agent.agent import CodeAgentBase
+
+    class Console:
+        def __init__(self):
+            self.cleared = 0
+
+        def clear_line(self):
+            self.cleared += 1
+
+    agent = CodeAgentBase.__new__(CodeAgentBase)
+    agent.repl_display = True
+    agent._cli_console = Console()
+
+    agent.on_llm_call_complete()
+
+    assert agent.console.cleared == 1
 
 
 def test_configured_models_accepts_string_and_list(monkeypatch):

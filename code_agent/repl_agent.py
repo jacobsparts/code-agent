@@ -1052,7 +1052,11 @@ Call help(function_name) for parameter descriptions.
                         self._start_assistant_execution_attempt()
                     try:
                         try:
-                            resp = self._llm_text_call_with_context_recovery(messages)
+                            try:
+                                resp = self._llm_text_call_with_context_recovery(messages)
+                            finally:
+                                if hasattr(self, "on_llm_call_complete"):
+                                    self.on_llm_call_complete()
                         except ReplExecuteResponseError as exc:
                             native_retry += 1
                             if native_retry >= max_syntax_retries:

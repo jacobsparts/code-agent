@@ -2359,18 +2359,14 @@ If you don't know how to proceed:
             self._statement_had_diff = False
             self._statement_print_uses_variable = False
 
-            if (
-                not getattr(self, '_turn_output_started', False)
-                and self._statement_direct_call != "observe"
-            ):
+            if not getattr(self, '_turn_output_started', False):
                 self._turn_output_started = True
                 if (
                     self.repl_display
                     and not getattr(self, '_in_user_repl', False)
+                    and not getattr(self, '_repl_printed_header', False)
                 ):
-                    self.console.clear_line()
-                    if not getattr(self, '_repl_printed_header', False):
-                        self._header_pending = True
+                    self._header_pending = True
 
             if self._statement_direct_call == "print":
                 try:
@@ -2584,6 +2580,10 @@ If you don't know how to proceed:
         self._statement_echo_displayed = False
         self._statement_had_diff = False
         self._statement_print_uses_variable = False
+
+    def on_llm_call_complete(self) -> None:
+        if self.repl_display:
+            self.console.clear_line()
 
     def on_repl_events_complete(self, events: list[ReplEvent]) -> None:
         self._turn_number = getattr(self, '_turn_number', 1) + 1
