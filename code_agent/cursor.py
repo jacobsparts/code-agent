@@ -67,6 +67,12 @@ CURSOR_MODEL_CALIBRATION = {
         "input_cost": 2.0,
         "cache_read_cost": 0.5,
     },
+    "cursor-grok-4.6-high": {
+        "system_prompt_tokens": 11_199,
+        "variable_tokens_per_byte": 0.24834437086092714,
+        "input_cost": 2.0,
+        "cache_read_cost": 0.5,
+    },
     "kimi-k3-high": {
         "system_prompt_tokens": 15_042,
         "variable_tokens_per_byte": 0.205204021289178,
@@ -100,7 +106,7 @@ AVAILABLE_MODELS_PATH = "aiserver.v1.AiService/AvailableModels"
 # A code-agent process represents one conversation session.
 _SESSION_CONVERSATION_ID = str(uuid.uuid4())
 
-DEBUG = True
+DEBUG = False
 
 
 def _debug_bidi_event(event: str, **details) -> None:
