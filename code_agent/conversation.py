@@ -1,6 +1,7 @@
 import json
 from .preview_refs import render_preview_refs
 from .repl_attachment_mixin import (
+    AudioAttachment,
     ImageAttachment,
     TextAttachment,
     iter_placeholders,
@@ -33,15 +34,16 @@ def materialize_attachments(content: str, attachments: dict) -> tuple[str, list[
             parts.append(value.content)
         else:
             parts.append(match.group(0))
-            if isinstance(value, ImageAttachment) and name not in seen:
+            if isinstance(value, (ImageAttachment, AudioAttachment)) and name not in seen:
                 seen.add(name)
-                media.append({
+                item = {
                     "name": name,
                     "media_type": value.media_type,
                     "content": value.content,
-                    "width": value.width,
-                    "height": value.height,
-                })
+                }
+                if isinstance(value, ImageAttachment):
+                    item.update(width=value.width, height=value.height)
+                media.append(item)
         end = match.end()
     parts.append(content[end:])
     return "".join(parts), media

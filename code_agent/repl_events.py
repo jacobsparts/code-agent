@@ -23,7 +23,7 @@ _WORKER_EVENT_KINDS = {
     "preview_expand",
     "read",
     "read_attach",
-    "read_image",
+    "read_media",
     "read_partial",
     "file_diff",
     "file_written",

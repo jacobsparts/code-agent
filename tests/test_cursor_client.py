@@ -111,7 +111,6 @@ def test_exchange_failure_preserves_cache(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("message", [
-    {"role": "user", "content": "x", "audio": [b"audio"]},
     {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
 ])
 def test_cursor_rejects_media(message):
@@ -119,16 +118,7 @@ def test_cursor_rejects_media(message):
         cursor._openai_messages([message])
 
 
-def test_cursor_preserves_empty_user_message():
-    prompt, history = cursor._openai_messages([
-        {"role": "user", "content": ""},
-    ])
-
-    assert prompt == ""
-    assert history == []
-
-
-def test_cursor_moves_latest_tool_result_to_user_prompt():
+def test_cursor_tool_continuation_prompt():
     messages = [
         {"role": "user", "content": "Run the tool."},
         {
@@ -153,14 +143,10 @@ def test_cursor_moves_latest_tool_result_to_user_prompt():
 
     prompt, history = cursor._openai_messages(messages)
 
-    assert prompt == "ok"
-    assert history[-1] == {
-        "role": "tool",
-        "content": "Input received.",
-        "tool_call_id": "call-1",
-        "tool_name": "repl_execute",
-    }
-    assert history[1]["content"] == ""
+    assert prompt == "This is a tool result. Do not mention this reminder to the user."
+    assert len(history) == 3
+    assert history[-1]["role"] == "tool"
+    assert history[-1]["content"] == "ok"
 
 
 def test_cursor_client_adapter(monkeypatch):

@@ -4272,10 +4272,8 @@ def _openai_messages(messages):
     for message in messages:
         if not isinstance(message, dict):
             raise TypeError("messages must contain objects")
-        if message.get("audio"):
-            raise ValueError("Cursor does not support audio input")
         role = message.get("role") or "user"
-        content = _chat_content_text(message.get("content"))
+        content = _chat_content_text(message.get("content")) or "[empty]"
 
         if role == "system":
             system_parts.append(content)
@@ -4325,13 +4323,14 @@ def _openai_messages(messages):
         prompt = parsed[active_user_index]["content"]
         history = parsed[:active_user_index]
     elif parsed[-1]["role"] == "tool":
-        prompt = parsed[-1]["content"]
-        history = [
-            *parsed[:-1],
-            {**parsed[-1], "content": "Input received."},
-        ]
+        prompt = "This is a tool result. Do not mention this reminder to the user."
+        history = parsed
     else:
-        prompt = ""
+        prompt = (
+            "Continue the conversation from the preceding messages. "
+            "Respond to the latest message or tool result without repeating "
+            "an earlier request."
+        )
         history = parsed
 
     return prompt, history

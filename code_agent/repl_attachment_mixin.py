@@ -44,12 +44,30 @@ class ImageAttachment:
     height: int
 
 
+@dataclass(frozen=True)
+class AudioAttachment:
+    content: bytes
+    media_type: str
+
+
 class ImageDecodeError(ValueError):
     """Raised when a file looks like a supported image but cannot be parsed."""
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SIGNATURE = b"\xff\xd8\xff"
+
+
+def detect_audio_media_type(data: bytes) -> str | None:
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:3] == b"ID3":
+        return "audio/mpeg"
+    if len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0:
+        return "audio/mpeg"
+    return None
 
 
 def detect_image_media_type(data: bytes) -> str | None:
@@ -127,16 +145,31 @@ def make_image_attachment(data: bytes) -> ImageAttachment:
     )
 
 
-def normalize_attachment_value(value) -> TextAttachment | ImageAttachment:
+def make_audio_attachment(data: bytes) -> AudioAttachment:
+    media_type = detect_audio_media_type(data)
+    if media_type is None:
+        raise ValueError("unsupported audio format")
+    return AudioAttachment(bytes(data), media_type)
+
+
+def make_media_attachment(data: bytes) -> ImageAttachment | AudioAttachment:
+    if detect_image_media_type(data):
+        return make_image_attachment(data)
+    if detect_audio_media_type(data):
+        return make_audio_attachment(data)
+    raise ValueError("unsupported media format")
+
+
+def normalize_attachment_value(value) -> TextAttachment | ImageAttachment | AudioAttachment:
     """Normalize an attachment at the message boundary."""
-    if isinstance(value, (TextAttachment, ImageAttachment)):
+    if isinstance(value, (TextAttachment, ImageAttachment, AudioAttachment)):
         return value
     if isinstance(value, (bytes, bytearray)):
-        return make_image_attachment(value)
+        return make_media_attachment(value)
     return TextAttachment(value if isinstance(value, str) else str(value))
 
 
-def normalize_attachments(attachments) -> dict[str, TextAttachment | ImageAttachment]:
+def normalize_attachments(attachments) -> dict[str, TextAttachment | ImageAttachment | AudioAttachment]:
     return {
         name: normalize_attachment_value(value)
         for name, value in (attachments or {}).items()
@@ -163,6 +196,9 @@ _IMAGE_SUFFIX_RE = re.compile(
     r", (?P<width>[1-9][0-9]*)\u00d7(?P<height>[1-9][0-9]*), "
     r"(?P<media_type>image/[A-Za-z0-9][A-Za-z0-9.+-]*)$"
 )
+_AUDIO_SUFFIX_RE = re.compile(
+    r", (?P<media_type>audio/[A-Za-z0-9][A-Za-z0-9.+-]*)$"
+)
 
 _PLACEHOLDER_RE = re.compile(r"\[Attachment: (?P<body>[^\]\n]+)\]")
 
@@ -171,6 +207,8 @@ def render_attachment_placeholder(name: str, value=None) -> str:
     """Render an attachment placeholder, including image metadata when present."""
     if isinstance(value, ImageAttachment):
         name = f"{name}, {value.width}\u00d7{value.height}, {value.media_type}"
+    elif isinstance(value, AudioAttachment):
+        name = f"{name}, {value.media_type}"
     return f"[Attachment: {name}]"
 
 
@@ -181,19 +219,26 @@ def iter_placeholders(content: str):
     for match in _PLACEHOLDER_RE.finditer(content):
         body = match.group("body")
         suffix = _IMAGE_SUFFIX_RE.search(body)
-        if suffix is None:
-            parsed = {
-                "name": body,
-                "media_type": None,
-                "width": None,
-                "height": None,
-            }
-        else:
+        if suffix is not None:
             parsed = {
                 "name": body[:suffix.start()],
                 "media_type": suffix.group("media_type"),
                 "width": int(suffix.group("width")),
                 "height": int(suffix.group("height")),
+            }
+        elif (suffix := _AUDIO_SUFFIX_RE.search(body)) is not None:
+            parsed = {
+                "name": body[:suffix.start()],
+                "media_type": suffix.group("media_type"),
+                "width": None,
+                "height": None,
+            }
+        else:
+            parsed = {
+                "name": body,
+                "media_type": None,
+                "width": None,
+                "height": None,
             }
         yield match, parsed
 
@@ -211,6 +256,12 @@ def encode_attachment_ref(ref):
             "width": ref.width,
             "height": ref.height,
         }
+    if isinstance(ref, AudioAttachment):
+        return {
+            "__audio_attachment__": True,
+            "content": base64.b64encode(ref.content).decode("ascii"),
+            "media_type": ref.media_type,
+        }
     return ref
 
 
@@ -227,6 +278,11 @@ def decode_attachment_ref(ref):
             media_type=ref.get("media_type") or "",
             width=ref.get("width") or 0,
             height=ref.get("height") or 0,
+        )
+    if ref.get("__audio_attachment__"):
+        return AudioAttachment(
+            content=base64.b64decode(ref.get("content") or ""),
+            media_type=ref.get("media_type") or "",
         )
     return ref
 
@@ -257,14 +313,17 @@ class REPLAttachmentMixin:
 
         Args:
             name: Identifier for this attachment (used as filename in synthetic read)
-            content: Text, bytes for a supported image, a typed attachment value,
+            content: Text, bytes for supported media, a typed attachment value,
                 or dict/list content (dicts/lists are JSON-serialized)
         """
         if isinstance(content, (dict, list)):
             content = json.dumps(content, indent=2)
 
+        attachment = self._render_attachment(name, content)
+        if isinstance(attachment, (ImageAttachment, AudioAttachment)):
+            self.llm_client.validate_media_type(attachment.media_type)
         self._invalidate_attachment(name)
-        self._pending_attachments[name] = self._render_attachment(name, content)
+        self._pending_attachments[name] = attachment
 
     def detach(self, name: str):
         """
@@ -276,7 +335,7 @@ class REPLAttachmentMixin:
         self._invalidate_attachment(name)
         self._pending_attachments.pop(name, None)
 
-    def list_attachments(self) -> dict[str, TextAttachment | ImageAttachment]:
+    def list_attachments(self) -> dict[str, TextAttachment | ImageAttachment | AudioAttachment]:
         """Get currently active attachments as typed values."""
         active = {}
         for msg in self.conversation.messages:
@@ -296,10 +355,10 @@ class REPLAttachmentMixin:
 
     def _render_attachment(self, name: str, content):
         """Build a typed attachment value, numbering lines for text content."""
-        if isinstance(content, (TextAttachment, ImageAttachment)):
+        if isinstance(content, (TextAttachment, ImageAttachment, AudioAttachment)):
             return content
         if isinstance(content, (bytes, bytearray)):
-            return make_image_attachment(content)
+            return make_media_attachment(content)
         lines = str(content).split('\n')
         return TextAttachment(
             '\n'.join(f"{i+1:>5}→{line}" for i, line in enumerate(lines))

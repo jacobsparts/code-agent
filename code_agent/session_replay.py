@@ -1,5 +1,4 @@
 import ast
-import base64
 import contextlib
 import copy
 import re
@@ -8,6 +7,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from .persisted_preview_state import PersistedPreviewState, PersistedPreviewTransitions
 from .repl_attachment_mixin import (
+    AudioAttachment,
     ImageAttachment,
     MemoryAttachment,
     TextAttachment,
@@ -42,7 +42,7 @@ def _preview_key(path: str) -> str | None:
 
 
 def render_attachment_content(ref, store=None, session_id: str | None = None, base_dir: str | None = None):
-    if isinstance(ref, (TextAttachment, ImageAttachment)):
+    if isinstance(ref, (TextAttachment, ImageAttachment, AudioAttachment)):
         return ref
     if isinstance(ref, MemoryAttachment):
         content = ref.content
@@ -64,7 +64,7 @@ def _load_attachment_map(refs: dict, missing: list[tuple[str, object]], store=No
     loaded = {}
     for name, ref in refs.items():
         if not isinstance(
-            ref, (MemoryAttachment, TextAttachment, ImageAttachment)
+            ref, (MemoryAttachment, TextAttachment, ImageAttachment, AudioAttachment)
         ) and not _preview_key(ref):
             continue
         try:
@@ -76,14 +76,6 @@ def _load_attachment_map(refs: dict, missing: list[tuple[str, object]], store=No
 
 def _coalesce_user_messages(messages: list[dict]) -> list[dict]:
     return coalesce_adjacent_user_messages(messages)
-
-
-def _decode_media(value):
-    if isinstance(value, dict) and "__b64__" in value:
-        return base64.b64decode(value["__b64__"])
-    if isinstance(value, list):
-        return [_decode_media(item) for item in value]
-    return value
 
 
 def _replay_session_into_target(agent, session_id: str, store):
@@ -130,8 +122,6 @@ def _replay_session_into_target(agent, session_id: str, store):
                 snapshot(seq)
                 continue
             msg = copy.deepcopy(raw_message)
-            if msg.get("audio"):
-                msg["audio"] = _decode_media(msg["audio"])
             refs = decode_attachment_refs(msg.pop("_attachment_refs", None) or {})
             local_missing = []
             if refs:
@@ -245,7 +235,7 @@ def _replay_session_into_target(agent, session_id: str, store):
             msg.pop("_attachment_refs", None)
         for name, ref in refs.items():
             if isinstance(
-                ref, (MemoryAttachment, TextAttachment, ImageAttachment)
+                ref, (MemoryAttachment, TextAttachment, ImageAttachment, AudioAttachment)
             ):
                 continue
             if _preview_key(ref):

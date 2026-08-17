@@ -4,11 +4,14 @@ import re
 import pytest
 
 from code_agent.agent import CodeAgent
+from code_agent.client import BadRequestError
 from code_agent.conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
 from code_agent.repl_attachment_mixin import (
+    AudioAttachment,
     ImageAttachment,
     TextAttachment,
     iter_placeholders,
+    make_audio_attachment,
     make_image_attachment,
     render_attachment_placeholder,
 )
@@ -1064,7 +1067,7 @@ def make_persistent_agent(tmp_path):
     return agent
 
 
-_VIEW_CONTENT_EVENT_KINDS = {"read", "read_image", "read_partial", "read_attach"}
+_VIEW_CONTENT_EVENT_KINDS = {"read", "read_media", "read_partial", "read_attach"}
 
 
 def _run_view_code(agent, code, *, start_attempt=True):
@@ -1119,6 +1122,35 @@ def _jpeg_bytes(width=4, height=5):
     )
 
 
+def _wav_bytes():
+    return b"RIFF\x04\x00\x00\x00WAVEdata"
+
+
+def _mp3_bytes():
+    return b"ID3\x04\x00\x00audio"
+
+
+@pytest.mark.parametrize(
+    ("data", "media_type"),
+    [
+        (_wav_bytes(), "audio/wav"),
+        (_mp3_bytes(), "audio/mpeg"),
+        (b"\xff\xfbframe", "audio/mpeg"),
+    ],
+)
+def test_audio_detection_and_placeholder_round_trip(data, media_type):
+    attachment = make_audio_attachment(data)
+    assert attachment == AudioAttachment(data, media_type)
+    placeholder = render_attachment_placeholder("clip, final.mp3", attachment)
+    assert placeholder == f"[Attachment: clip, final.mp3, {media_type}]"
+    assert list(iter_placeholders(placeholder))[0][1] == {
+        "name": "clip, final.mp3",
+        "media_type": media_type,
+        "width": None,
+        "height": None,
+    }
+
+
 @pytest.mark.parametrize(
     ("data", "name", "media_type", "width", "height"),
     [
@@ -1139,7 +1171,7 @@ def test_view_detects_images_by_magic_bytes(
     assert pure_syntax_error is False
     assert [event.kind for event in _content_events(events)] == [
         "read_attach",
-        "read_image",
+        "read_media",
     ]
 
     llm_output = agent.build_output_for_llm(events)
@@ -1161,6 +1193,89 @@ def test_view_detects_images_by_magic_bytes(
     }]
 
 
+@pytest.mark.parametrize(
+    ("data", "media_type"),
+    [(_wav_bytes(), "audio/wav"), (_mp3_bytes(), "audio/mpeg")],
+)
+def test_view_detects_audio_and_projects_attachment(tmp_path, data, media_type):
+    path = tmp_path / "clip.bin"
+    path.write_bytes(data)
+    agent = make_persistent_agent(tmp_path)
+
+    _, pure_syntax_error, events, _ = _run_view_code(
+        agent, f"view({str(path)!r})"
+    )
+    assert pure_syntax_error is False
+    assert [event.kind for event in _content_events(events)] == [
+        "read_attach",
+        "read_media",
+    ]
+
+    llm_output = agent.build_output_for_llm(events)
+    expected = f"[Attachment: {path}, {media_type}]"
+    assert expected in llm_output
+    assert agent._read_attachments[str(path)] == AudioAttachment(data, media_type)
+
+    agent._suspend_persistence = True
+    agent.usermsg(llm_output, _user_content=llm_output)
+    assert agent.conversation._messages()[-1][MEDIA_ATTACHMENTS_FIELD] == [{
+        "name": str(path),
+        "media_type": media_type,
+        "content": data,
+    }]
+
+
+class _RejectAudioClient:
+    on_retry = None
+
+    def conversation(self, system):
+        return Conversation(self, system)
+
+    def call(self, messages, tools=None):
+        return {"role": "assistant", "content": "ok"}
+
+    def validate_media_type(self, media_type):
+        if media_type.startswith("audio/"):
+            raise BadRequestError(f"transport does not support {media_type} attachments")
+
+
+def test_attach_rejects_audio_before_mutating_existing_attachment(tmp_path):
+    agent = make_persistent_agent(tmp_path)
+    existing = TextAttachment("old")
+    agent.conversation.messages.append({
+        "role": "user",
+        "content": "[Attachment: clip.wav]",
+        "_attachments": {"clip.wav": existing},
+    })
+    agent._llm_client = _RejectAudioClient()
+
+    with pytest.raises(BadRequestError, match="does not support audio/wav"):
+        agent.attach("clip.wav", _wav_bytes())
+
+    assert agent.conversation.messages[-1]["_attachments"]["clip.wav"] is existing
+    assert "clip.wav" not in agent._pending_attachments
+
+
+def test_view_rejects_audio_before_conversation_mutation(tmp_path):
+    path = tmp_path / "clip.wav"
+    path.write_bytes(_wav_bytes())
+    agent = make_persistent_agent(tmp_path)
+    agent._llm_client = _RejectAudioClient()
+
+    _, pure_syntax_error, events, _ = _run_view_code(
+        agent, f"view({str(path)!r})"
+    )
+    assert pure_syntax_error is False
+    with pytest.raises(BadRequestError, match="does not support audio/wav"):
+        agent.build_output_for_llm(events)
+
+    assert not getattr(agent, "_read_attachments", {})
+    assert all(
+        str(path) not in message.get("_attachments", {})
+        for message in agent.conversation.messages
+    )
+
+
 def test_invalid_png_signature_has_clear_decode_error(tmp_path):
     path = tmp_path / "broken.dat"
     path.write_bytes(b"\x89PNG\r\n\x1a\ntruncated")
@@ -1170,7 +1285,7 @@ def test_invalid_png_signature_has_clear_decode_error(tmp_path):
         agent, f"view({str(path)!r})"
     )
     assert pure_syntax_error is False
-    with pytest.raises(ValueError, match="Unable to decode image attachment"):
+    with pytest.raises(ValueError, match="Unable to decode media attachment"):
         agent.build_output_for_llm(events)
 
 

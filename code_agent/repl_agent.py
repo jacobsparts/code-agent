@@ -848,9 +848,6 @@ Important:
                     sep_stdout = "" if prev_stdout.endswith("\n") else "\n"
                     last_msg['_stdout'] = prev_stdout + sep_stdout + content + "\n"
 
-                # If new content has audio, append it too.
-                if 'audio' in kwargs:
-                    last_msg['audio'] = last_msg.get('audio', []) + kwargs['audio']
                 if '_attachments' in kwargs:
                     attachments = last_msg.get('_attachments', {})
                     attachments.update(kwargs['_attachments'])

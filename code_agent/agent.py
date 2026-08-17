@@ -33,11 +33,12 @@ from code_agent.repl_events import ReplEvent
 from code_agent.mcp_mixin import MCPMixin
 from code_agent.repl_attachment_mixin import (
     REPLAttachmentMixin,
+    AudioAttachment,
     ImageAttachment,
     MemoryAttachment,
     TextAttachment,
     encode_attachment_refs,
-    make_image_attachment,
+    make_media_attachment,
     render_attachment_placeholder,
 )
 
@@ -655,18 +656,9 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         self._display_capture = []
 
     def _sanitize_message_for_persistence(self, message: dict) -> dict:
-        def encode_media(value):
-            if isinstance(value, bytes):
-                return {"__b64__": base64.b64encode(value).decode("ascii")}
-            if isinstance(value, list):
-                return [encode_media(item) for item in value]
-            return copy.deepcopy(value)
-
         msg = {}
         for key, value in message.items():
-            if key == 'audio':
-                msg[key] = encode_media(value)
-            elif key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary', '_observations', '_observation_transition'}:
+            if key in {'role', 'content', '_stdout', '_user_content', 'name', 'tool_call_id', '_synthetic', '_render_segments', '_final_result', '_emit_value', '_pinned_coalesce', '_virtual_interaction_boundary', '_observations', '_observation_transition'}:
                 msg[key] = copy.deepcopy(value)
 
         refs = message.get('_attachment_refs')
@@ -700,8 +692,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             new_msg["_stdout"] = kwargs['_stdout']
         if kwargs.get('_attachment_refs'):
             new_msg["_attachment_refs"] = copy.deepcopy(kwargs['_attachment_refs'])
-        if kwargs.get('audio'):
-            new_msg['audio'] = kwargs['audio']
         if latest_segment is not None:
             new_msg["_render_segments"] = [{k: v for k, v in latest_segment.items() if k != "_event_seq"}]
         seq = self._append_session_event("message_added", {"message": self._sanitize_message_for_persistence(new_msg)})
@@ -896,7 +886,7 @@ def _code_agent_send_rg_available():
             for name, ref in refs.items():
                 if (
                     isinstance(
-                        ref, (MemoryAttachment, TextAttachment, ImageAttachment)
+                        ref, (MemoryAttachment, TextAttachment, ImageAttachment, AudioAttachment)
                     )
                     or is_preview_uri(ref)
                     or name in attachments
@@ -952,7 +942,7 @@ def _code_agent_send_rg_available():
             )
         )
 
-    def list_attachments(self, include_session_blobs: bool = True, include_auto_context: bool = True, include_memory: bool = False) -> dict[str, TextAttachment | ImageAttachment]:
+    def list_attachments(self, include_session_blobs: bool = True, include_auto_context: bool = True, include_memory: bool = False) -> dict[str, TextAttachment | ImageAttachment | AudioAttachment]:
         attachments = super().list_attachments()
         if not include_memory:
             attachments = {
@@ -1289,7 +1279,7 @@ def _code_agent_send_rg_available():
             if msg_type == "read_partial":
                 partial_read_path = chunk.strip()
                 continue
-            if msg_type == "read_image" and attach_path:
+            if msg_type == "read_media" and attach_path:
                 flush_statement()
                 path = attach_path
                 attach_path = None
@@ -1298,14 +1288,19 @@ def _code_agent_send_rg_available():
                     continue
                 try:
                     payload = json.loads(chunk)
-                    attachment = make_image_attachment(
+                    attachment = make_media_attachment(
                         base64.b64decode(payload["content"], validate=True)
                     )
                 except Exception as exc:
                     self._clear_pending_full_view(path)
                     raise ValueError(
-                        f"Unable to decode image attachment {path!r}: {exc}"
+                        f"Unable to decode media attachment {path!r}: {exc}"
                     ) from exc
+                try:
+                    self.llm_client.validate_media_type(attachment.media_type)
+                except Exception:
+                    self._clear_pending_full_view(path)
+                    raise
                 self._invalidate_attachment(path)
                 self._read_attachments[path] = attachment
                 attachment_read_order[path] = event_order
@@ -1600,7 +1595,7 @@ def _code_agent_send_rg_available():
 
     @staticmethod
     def _attachment_size_bytes(content) -> int | None:
-        if isinstance(content, ImageAttachment):
+        if isinstance(content, (ImageAttachment, AudioAttachment)):
             return len(content.content)
         if isinstance(content, TextAttachment):
             return len(content.content.encode("utf-8"))
@@ -1615,6 +1610,8 @@ def _code_agent_send_rg_available():
                 f"{name} ({content.media_type}, "
                 f"{content.width}×{content.height}, {size_text})"
             )
+        if isinstance(content, AudioAttachment):
+            return f"{name} ({content.media_type}, {size_text})"
         return f"{name} ({size_text})"
 
 
@@ -1627,6 +1624,7 @@ def _code_agent_send_rg_available():
             kind = (
                 "image"
                 if isinstance(content, ImageAttachment)
+                else "audio" if isinstance(content, AudioAttachment)
                 else "expanded preview" if is_preview_uri(name) else "file"
             )
             size = self._attachment_size_bytes(content)
@@ -1823,7 +1821,7 @@ def _code_agent_send_rg_available():
             for name, value in pending.items():
                 refs.setdefault(
                     name,
-                    value if isinstance(value, ImageAttachment) else name,
+                    value if isinstance(value, (ImageAttachment, AudioAttachment)) else name,
                 )
             kwargs['_attachment_refs'] = refs
             self._read_attachments = {}
@@ -2434,7 +2432,7 @@ If you don't know how to proceed:
             "tool_returned",
             "tool_failed",
             "read_attach",
-            "read_image",
+            "read_media",
             "read_partial",
             "file_written",
         }:
@@ -3734,7 +3732,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
 
         prefix = "session://preview/"
         is_preview_uri = isinstance(file_path, str) and file_path.startswith(prefix)
-        is_image = False
+        is_media = False
         if numbered is None:
             numbered = not is_preview_uri
         path = Path(file_path).expanduser()
@@ -3764,16 +3762,26 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                 return
         else:
             raw_content = path.read_bytes()
-            is_image = (
+            is_media = (
                 raw_content.startswith(b"\x89PNG\r\n\x1a\n")
                 or raw_content.startswith(b"\xff\xd8\xff")
+                or (
+                    raw_content.startswith(b"RIFF")
+                    and raw_content[8:12] == b"WAVE"
+                )
+                or raw_content.startswith(b"ID3")
+                or (
+                    len(raw_content) >= 2
+                    and raw_content[0] == 0xFF
+                    and raw_content[1] & 0xE0 == 0xE0
+                )
             )
-            if is_image:
+            if is_media:
                 content = None
             else:
                 content = raw_content.decode()
 
-        if not is_preview_uri and is_image:
+        if not is_preview_uri and is_media:
             all_lines = []
             total_lines = 0
             is_partial = False
@@ -3795,7 +3803,7 @@ class CodeAgent(MCPMixin, CodeAgentBase):
                     "reposition": bool(reposition),
                     "is_partial": bool(is_partial),
                     "line_count": total_lines,
-                    "char_count": len(raw_content) if is_image else len(content),
+                    "char_count": len(raw_content) if is_media else len(content),
                 },
                 "request_id": _decision_req_id,
             }))
@@ -3821,13 +3829,13 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             elif action == "partial":
                 attach_full = False
 
-        if not is_preview_uri and is_image:
+        if not is_preview_uri and is_media:
             if not attach_full:
-                raise ValueError("Image attachments require a full view")
+                raise ValueError("Media attachments require a full view")
             import base64 as _base64
             import json as _json
             _send_output("read_attach", file_path + "\n")
-            _send_output("read_image", _json.dumps({
+            _send_output("read_media", _json.dumps({
                 "content": _base64.b64encode(raw_content).decode("ascii"),
             }) + "\n")
             return

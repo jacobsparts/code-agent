@@ -25,19 +25,7 @@ except AttributeError:
     TCP_KEEPIDLE = getattr(socket, "TCP_KEEPALIVE", None)  # macOS uses TCP_KEEPALIVE
 
 # Message keys passed through in addition to the standard public keys.
-EXTRA_KEYS = {'audio'}
-
-def _detect_audio_type(data):
-    """Detect audio MIME type from file magic bytes."""
-    if data[:4] == b'RIFF': return "audio/wav"
-    if data[:4] == b'fLaC': return "audio/flac"
-    if data[:4] == b'OggS': return "audio/ogg"
-    if data[:4] == b'FORM': return "audio/aiff"
-    if data[:3] == b'ID3' or data[:2] in (b'\xff\xfb', b'\xff\xf3', b'\xff\xf2'):
-        return "audio/mp3"
-    if data[:2] in (b'\xff\xf1', b'\xff\xf9'):
-        return "audio/aac"
-    raise ValueError(f"Unsupported audio format (magic: {data[:4].hex()})")
+EXTRA_KEYS = set()
 
 logger = logging.getLogger('code_agent')
 
@@ -48,6 +36,18 @@ class ContextOverflowError(Exception): pass
 CONTEXT_INPUT_BUFFER = 4_000
 CONTEXT_OUTPUT_HEADROOM = 16_000
 TOKEN_RATIO_EMA_ALPHA = 0.2
+
+IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg"}
+AUDIO_MEDIA_TYPES = {"audio/wav", "audio/mpeg"}
+
+TRANSPORT_MEDIA_TYPES = {
+    "completions": IMAGE_MEDIA_TYPES | AUDIO_MEDIA_TYPES,
+    "responses": IMAGE_MEDIA_TYPES,
+    "messages": IMAGE_MEDIA_TYPES,
+    "gemini": IMAGE_MEDIA_TYPES | AUDIO_MEDIA_TYPES,
+    "cursor": set(),
+    "codex": IMAGE_MEDIA_TYPES,
+}
 
 
 
@@ -84,24 +84,28 @@ class LLMClient:
     def _public_messages(messages):
         return [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages]
 
-    @staticmethod
-    def _pop_media_attachments(message):
+    def validate_media_type(self, media_type):
+        if not isinstance(media_type, str) or "/" not in media_type:
+            raise BadRequestError("Invalid media attachment type")
+        api_type = self.model_config["api_type"]
+        if media_type not in TRANSPORT_MEDIA_TYPES.get(api_type, set()):
+            raise BadRequestError(
+                f"{api_type} transport does not support {media_type} attachments"
+            )
+
+    def _pop_media_attachments(self, message):
         media = message.pop(MEDIA_ATTACHMENTS_FIELD, None) or []
         for item in media:
             if not isinstance(item, dict):
-                raise BadRequestError("Invalid projected image attachment")
-            if item.get("media_type") not in {"image/png", "image/jpeg"}:
-                raise BadRequestError(
-                    f"Unsupported image media type: {item.get('media_type')}"
-                )
+                raise BadRequestError("Invalid projected media attachment")
+            self.validate_media_type(item.get("media_type"))
             if not isinstance(item.get("content"), bytes):
-                raise BadRequestError("Projected image attachment has no binary content")
+                raise BadRequestError("Projected media attachment has no binary content")
         return media
 
     @staticmethod
     def _strip_response_media(message):
         message.pop("images", None)
-        message.pop("audio", None)
         return message
 
     @staticmethod
@@ -167,19 +171,23 @@ class LLMClient:
         prepared = []
         for m in messages:
             out = dict(m)
-            if out.pop('audio', None):
-                raise BadRequestError("Audio input is not supported by OpenAI completions API")
             breakpoint = out.pop('_prompt_cache_breakpoint', None)
             if media := self._pop_media_attachments(out):
-                out['content'] = [
-                    *([{"type": "text", "text": out['content']}] if out['content'] else []),
-                    *[{"type": "image_url", "image_url": {
-                        "url": (
-                            f"data:{item['media_type']};base64,"
-                            f"{base64.b64encode(item['content']).decode()}"
-                        )
-                    }} for item in media]
-                ]
+                blocks = []
+                if out['content']:
+                    blocks.append({"type": "text", "text": out['content']})
+                for item in media:
+                    encoded = base64.b64encode(item['content']).decode()
+                    if item['media_type'].startswith('image/'):
+                        blocks.append({"type": "image_url", "image_url": {
+                            "url": f"data:{item['media_type']};base64,{encoded}"
+                        }})
+                    else:
+                        blocks.append({"type": "input_audio", "input_audio": {
+                            "data": encoded,
+                            "format": "wav" if item['media_type'] == "audio/wav" else "mp3",
+                        }})
+                out['content'] = blocks
             elif breakpoint and self.model_config.get('explicit_prompt_cache') and isinstance(out.get('content'), str):
                 out['content'] = [{
                     "type": "text",
@@ -441,9 +449,12 @@ class LLMClient:
     def _call_cursor(self, messages, tools):
         if self.tool_mode != "repl_execute":
             raise TypeError("Cursor transport requires tool_mode='repl_execute'")
-        if any(message.get(MEDIA_ATTACHMENTS_FIELD) for message in messages):
-            raise BadRequestError("Cursor transport does not support image attachments")
-        messages = self._public_messages(messages)
+        prepared = []
+        for message in messages:
+            message = dict(message)
+            self._pop_media_attachments(message)
+            prepared.append(message)
+        messages = self._public_messages(prepared)
         req = {
             "model": self.model_config["model"],
             "messages": messages,
@@ -488,8 +499,6 @@ class LLMClient:
         prepared = []
         for message in messages:
             m = dict(message)
-            if m.pop('audio', None):
-                raise BadRequestError("Audio input is not supported by Anthropic Messages API")
             if media := self._pop_media_attachments(m):
                 m['content'] = [
                     *([{"type": "text", "text": m['content']}] if m['content'] else []),
@@ -574,9 +583,7 @@ class LLMClient:
 
         Args:
             messages: List of projected message dicts.
-                      Messages may include 'audio' key with list of raw bytes
-                      (WAV/MP3/FLAC/OGG/AIFF/AAC).
-            tools: Optional tool specifications.
+                          tools: Optional tool specifications.
         """
         contents = []
         system_parts = []
@@ -608,12 +615,6 @@ class LLMClient:
                     "mimeType": item["media_type"],
                     "data": base64.b64encode(item["content"]).decode()
                 }})
-            if audio := m.pop('audio', None):
-                for aud in audio:
-                    parts.append({"inlineData": {
-                        "mimeType": _detect_audio_type(aud),
-                        "data": base64.b64encode(aud).decode()
-                    }})
             contents.append({"role": "user", "parts": parts})
         # Merge consecutive same-role messages (required by Gemini API)
         merged = []

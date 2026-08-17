@@ -3,9 +3,11 @@ import os
 import subprocess
 import sys
 
-from code_agent.client import LLMClient
-from code_agent.conversation import Conversation
-from code_agent.repl_attachment_mixin import ImageAttachment
+import pytest
+
+from code_agent.client import BadRequestError, LLMClient
+from code_agent.conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
+from code_agent.repl_attachment_mixin import AudioAttachment, ImageAttachment
 
 
 def test_responses_request_projects_private_image_attachment(monkeypatch):
@@ -49,12 +51,132 @@ def test_responses_request_projects_private_image_attachment(monkeypatch):
     )
 
 
+class _Response:
+    status = 200
+    headers = {}
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+
+class _Connection:
+    requests = []
+    response_payload = {}
+
+    def __init__(self, *args, **kwargs):
+        self.sock = self
+
+    def connect(self):
+        pass
+
+    def setsockopt(self, *args):
+        pass
+
+    def request(self, method, path, body, headers):
+        self.requests.append(json.loads(body))
+
+    def getresponse(self):
+        return _Response(self.response_payload)
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("api_type", "response_payload", "expected"),
+    [
+        (
+            "completions",
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "UklGRgQAAABXQVZFZGF0YQ==", "format": "wav"},
+            },
+        ),
+        (
+            "gemini",
+            {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+            {
+                "inlineData": {
+                    "mimeType": "audio/wav",
+                    "data": "UklGRgQAAABXQVZFZGF0YQ==",
+                },
+            },
+        ),
+    ],
+)
+def test_audio_attachment_transport_payload(
+    monkeypatch, api_type, response_payload, expected
+):
+    config = {
+        "model": "audio-model",
+        "api_key": "key",
+        "api_type": api_type,
+        "tool_mode": None,
+        "tools": False,
+        "concurrency": 1,
+        "timeout": 20,
+        "port": 443,
+        "host": "example.test",
+        "path": "/v1",
+        "config": {},
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    monkeypatch.setattr("code_agent.client.http.client.HTTPSConnection", _Connection)
+    monkeypatch.setattr("code_agent.client.throttle", lambda *args: None)
+    _Connection.requests = []
+    _Connection.response_payload = response_payload
+    client = LLMClient("test/audio-model")
+    media = {
+        "name": "clip.wav",
+        "media_type": "audio/wav",
+        "content": b"RIFF\x04\x00\x00\x00WAVEdata",
+    }
+
+    client._call([{
+        "role": "user",
+        "content": "listen",
+        MEDIA_ATTACHMENTS_FIELD: [media],
+    }])
+
+    request = _Connection.requests[0]
+    if api_type == "completions":
+        assert request["messages"][0]["content"][1] == expected
+    else:
+        assert request["contents"][0]["parts"][1] == expected
+
+
+@pytest.mark.parametrize("api_type", ["responses", "messages", "cursor", "codex"])
+def test_transport_rejects_unsupported_audio_generically(monkeypatch, api_type):
+    config = {
+        "model": "text-model",
+        "api_type": api_type,
+        "concurrency": 1,
+        "timeout": 20,
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("test/text-model")
+
+    with pytest.raises(
+        BadRequestError,
+        match=rf"{api_type} transport does not support audio/wav attachments",
+    ):
+        client._pop_media_attachments({
+            MEDIA_ATTACHMENTS_FIELD: [{
+                "media_type": "audio/wav",
+                "content": b"audio",
+            }]
+        })
+
+
 def test_provider_response_media_is_removed_from_conversation_history():
     message = {
         "role": "assistant",
         "content": "done",
         "images": [{"type": "image_url", "image_url": {"url": "data:..."}}],
-        "audio": [b"audio"],
     }
 
     result = LLMClient._strip_response_media(message)
