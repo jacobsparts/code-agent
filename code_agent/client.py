@@ -32,6 +32,7 @@ logger = logging.getLogger('code_agent')
 class BadRequestError(Exception): pass
 class MaxTokensError(Exception): pass
 class ContextOverflowError(Exception): pass
+class EmptyResponseError(Exception): pass
 
 CONTEXT_INPUT_BUFFER = 4_000
 CONTEXT_OUTPUT_HEADROOM = 16_000
@@ -745,7 +746,11 @@ class LLMClient:
     def text_call(self, messages, retry=3, attempt=0):
         try:
             with self.concurrency_lock:
-                return self._call(messages)
+                response = self._call(messages)
+                content = response.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise EmptyResponseError("LLM returned an empty response")
+                return response
         except (ContextOverflowError, ReplExecuteResponseError):
             raise
         except Exception as e:

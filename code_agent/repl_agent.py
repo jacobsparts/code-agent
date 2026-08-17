@@ -1085,10 +1085,8 @@ Call help(function_name) for parameter descriptions.
                     except BadRequestError:
                         raise
 
-                    content = (resp.get('content') or '').strip()
+                    content = resp['content'].strip()
                     resp['content'] = content
-                    if not content:
-                        break
 
                     output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)
 
@@ -1157,9 +1155,6 @@ Call help(function_name) for parameter descriptions.
             self.conversation.messages.append(resp)
             if hasattr(self, '_on_assistant_message_committed'):
                 self._on_assistant_message_committed(resp)
-
-            if not content:
-                continue
 
             # Feed output back to LLM as the REPL response.
             output_for_llm = self.build_output_for_llm(events)
