@@ -126,7 +126,6 @@ def test_audio_attachment_transport_payload(
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     monkeypatch.setattr("code_agent.client.http.client.HTTPSConnection", _Connection)
-    monkeypatch.setattr("code_agent.client.throttle", lambda *args: None)
     _Connection.requests = []
     _Connection.response_payload = response_payload
     client = LLMClient("test/audio-model")

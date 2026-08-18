@@ -14,8 +14,13 @@ class ProviderConfig:
     host: str
     path: str
     port: int = 443
-    tpm: int = 60
-    concurrency: int = 5
+    rpm: float = None
+    concurrency: int = None
+    admission_pool: str = None
+    admission_burst: float = None
+    admission_claim_window: float = 0.1
+    admission_lease_grace: float = 30.0
+    admission_queue_timeout: float = None
     timeout: int = 120
     tools: bool = False
     api_type: str = "completions"
@@ -126,7 +131,7 @@ list_models = registry.list_models
 register_provider("openai",
     host="api.openai.com",
     path="/v1/responses",
-    tpm=100,
+    rpm=100,
     concurrency=30,
     timeout=300,
     tools=True,
@@ -153,7 +158,7 @@ register_provider(
     "codex",
     host=None,
     path=None,
-    tpm=60,
+    rpm=60,
     concurrency=5,
     timeout=300,
     tools=True,
@@ -189,7 +194,7 @@ register_provider(
     "cursor",
     host=None,
     path=None,
-    tpm=60,
+    rpm=60,
     concurrency=5,
     tools=True,
     api_type="cursor",
@@ -228,7 +233,7 @@ register_model(
 register_provider("anthropic",
     host="api.anthropic.com",
     path="/v1/messages",
-    tpm=100,
+    rpm=100,
     concurrency=30,
     timeout=300,
     tools=True,
@@ -280,7 +285,7 @@ def gemini_cost_transform(prompt_tokens, cached_tokens, completion_tokens, reaso
 register_provider("google",
     host="generativelanguage.googleapis.com",
     path="/v1beta",
-    tpm=5,
+    rpm=5,
     concurrency=3,
     timeout=None,
     tools=True,
@@ -309,7 +314,7 @@ register_model("google","gemini-3.6-flash",
 register_provider("xai",
     host="api.x.ai",
     path="/v1/chat/completions",
-    tpm=1000,
+    rpm=1000,
     concurrency=50,
     timeout=300,
     tools=False,

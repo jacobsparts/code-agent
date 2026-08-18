@@ -608,7 +608,7 @@ register_provider(
     path="/v1/chat/completions",
     port={port},
     timeout=10,
-    tpm=1000,
+    rpm=1000,
     concurrency=5,
     tools=False,
     api_type="completions",

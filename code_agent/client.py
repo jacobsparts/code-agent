@@ -5,13 +5,15 @@ import json
 import http.client
 import socket
 import urllib.parse
-import threading
 import time
 import logging
 import base64
+import contextlib
 from collections import defaultdict
 
-from .utils import throttle, UsageTracker
+from .provider_admission import ProviderAdmission
+
+from .utils import UsageTracker
 from .llm_registry import get_model_config
 from .conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
 from . import codex, cursor
@@ -67,7 +69,9 @@ class LLMClient:
         self.model_config = get_model_config(model_name)
         timeout = self.model_config.get('timeout')
         self.timeout = 3600 if timeout is None else timeout
-        self.concurrency_lock = threading.BoundedSemaphore(self.model_config.get('concurrency',10))
+        self.provider_admission = ProviderAdmission.from_model_config(
+            model_name, self.model_config
+        )
         self.native = self.model_config.get('tools') if native is None else native
         self.tool_mode = self.model_config.get('tool_mode')
         self.on_retry = None
@@ -234,7 +238,6 @@ class LLMClient:
             body = json.dumps(req)
             request_path = self.model_config.get('request_path', self.model_config['path'])
             try:
-                throttle(self.model_config['host'], self.model_config.get('tpm', 5))
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug("----------- TO LLM -----------")
                     logger.debug(f"POST {request_path} {headers}")
@@ -426,7 +429,6 @@ class LLMClient:
             'Authorization': f"Bearer {self.model_config['api_key']}",
         }
         try:
-            throttle(self.model_config['host'], self.model_config.get('tpm', 5))
             request_path = self.model_config.get('request_path', self.model_config['path'])
             body = json.dumps(req)
             if logger.isEnabledFor(logging.DEBUG):
@@ -462,10 +464,6 @@ class LLMClient:
             "tools": [REPL_EXECUTE_TOOL],
             **self.model_config.get("config", {}),
         }
-        throttle(
-            self.model_config["provider"],
-            self.model_config.get("tpm", 5),
-        )
         response_json = cursor.chat_completions(
             self.model_config["api_key"],
             req,
@@ -480,10 +478,6 @@ class LLMClient:
 
     def _call_codex(self, messages, tools):
         req = self._responses_request(messages, tools)
-        throttle(
-            self.model_config["provider"],
-            self.model_config.get("tpm", 5),
-        )
         # Stage idle budgets live in code_agent.codex (60s/30s/30s).
         # Do not impose a total wall-clock timeout here.
         return self._parse_responses_result(codex.responses(req))
@@ -541,7 +535,6 @@ class LLMClient:
         }
         body = json.dumps(req)
         try:
-            throttle(self.model_config['host'], self.model_config.get('tpm', 5))
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("----------- TO LLM -----------")
                 logger.debug(f"POST {self.model_config['path']} {headers}")
@@ -660,7 +653,6 @@ class LLMClient:
         }
         body = json.dumps(req)
         try:
-            throttle(self.model_config['host'], self.model_config.get('tpm', 5))
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("----------- TO LLM -----------")
                 logger.debug(f"POST {path} {headers}")
@@ -745,7 +737,12 @@ class LLMClient:
 
     def text_call(self, messages, retry=3, attempt=0):
         try:
-            with self.concurrency_lock:
+            context = (
+                self.provider_admission.admitted()
+                if self.provider_admission is not None
+                else contextlib.nullcontext()
+            )
+            with context:
                 response = self._call(messages)
                 content = response.get("content")
                 if not isinstance(content, str) or not content.strip():

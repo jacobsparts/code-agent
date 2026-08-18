@@ -156,14 +156,12 @@ def test_cursor_client_adapter(monkeypatch):
         "api_key": "key",
         "api_type": "cursor",
         "tool_mode": "repl_execute",
-        "tpm": 17,
+        "rpm": 17,
         "tools": True,
         "concurrency": 1,
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     monkeypatch.setattr("code_agent.utils.get_model_config", lambda name: config)
-    throttled = []
-    monkeypatch.setattr("code_agent.client.throttle", lambda key, tpm: throttled.append((key, tpm)))
     captured = {}
     def chat(api_key, body):
         captured.update(api_key=api_key, body=body)
@@ -199,7 +197,6 @@ def test_cursor_client_adapter(monkeypatch):
     assert captured["body"]["model"] == "composer-2.5"
     assert captured["body"]["tools"] == [REPL_EXECUTE_TOOL]
     assert "timeout" not in captured["body"]
-    assert throttled == [("cursor", 17)]
     assert result["content"] == "emit('ok', release=True)"
     assert result["_stop_reason"] == "tool_calls"
     assert client.usage_tracker.history[history_length:] == [(

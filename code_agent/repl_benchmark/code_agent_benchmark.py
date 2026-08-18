@@ -435,7 +435,7 @@ def build_code_agent_test_env(
             '    path="/v1/chat/completions",',
             f"    port={port},",
             "    timeout=10,",
-            "    tpm=1000,",
+            "    rpm=1000,",
             "    concurrency=5,",
             "    tools=False,",
             '    api_type="completions",',

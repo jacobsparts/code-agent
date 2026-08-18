@@ -458,7 +458,7 @@ def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
         "api_key": None,
         "api_type": "codex",
         "tool_mode": None,
-        "tpm": 17,
+        "rpm": 17,
         "tools": True,
         "concurrency": 1,
         "timeout": 20,
@@ -480,7 +480,6 @@ def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
         }
 
     monkeypatch.setattr(codex, "responses", complete)
-    monkeypatch.setattr("code_agent.client.throttle", lambda *args: None)
     client = LLMClient("codex/gpt-5.6-luna")
     result = client._call([{"role": "user", "content": "hello"}])
     assert captured["body"]["input"] == [{
@@ -499,7 +498,7 @@ def test_codex_client_adapter(monkeypatch, tmp_path):
         "api_key": None,
         "api_type": "codex",
         "tool_mode": "repl_execute",
-        "tpm": 17,
+        "rpm": 17,
         "tools": True,
         "concurrency": 1,
         "timeout": 20,
@@ -528,7 +527,6 @@ def test_codex_client_adapter(monkeypatch, tmp_path):
         }
 
     monkeypatch.setattr(codex, "responses", complete)
-    monkeypatch.setattr("code_agent.client.throttle", lambda *args: None)
     client = LLMClient("codex/gpt-5.6-luna-xhigh")
     result = client._call([{"role": "user", "content": "hello"}])
     assert captured["body"]["model"] == "gpt-5.6-luna"

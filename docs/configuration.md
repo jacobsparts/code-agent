@@ -80,8 +80,10 @@ The following functions are injected into the config's namespace before it runs:
 | `port` | Port, default `443` |
 | `api_type` | `"completions"` (OpenAI-compatible) or `"messages"` (Anthropic) |
 | `timeout` | Request timeout in seconds |
-| `tpm` | Requests per minute limit |
-| `concurrency` | Max concurrent requests |
+| `rpm` | Host-wide requests-per-minute limit |
+| `concurrency` | Strict host-wide active-request limit; enables admission when configured |
+| `admission_pool` | Optional explicit quota-pool identity shared across models/processes |
+| `admission_burst` | Optional accumulated request allowance for bursts; defaults to `concurrency` |
 | `tools` | Whether this provider supports native tool calls |
 
 ### `register_model` parameters
