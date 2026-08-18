@@ -65,10 +65,10 @@ def _get_config_value(attr_name, default):
 
 
 def _configured_models() -> list[str]:
-    value = _get_config_value("code_agent_model", "sonnet")
+    value = _get_config_value("code_agent_model", None)
     if isinstance(value, list):
-        return value or ["sonnet"]
-    return [value]
+        return value
+    return [value] if value else []
 
 
 VIEW_PROMOTE_MAX_LINES = 2000
@@ -93,7 +93,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
     """Code assistant with Python REPL execution."""
 
     model_choices = _configured_models()
-    model = model_choices[0]
+    model = model_choices[0] if model_choices else None
     worker_host = "local"
     worker_target = None
     session_heartbeat_interval = 300
@@ -127,7 +127,11 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         if hasattr(self, "_conversation"):
             self._configure_conversation(self._conversation)
 
-        self.llm_client.on_retry = self.on_retry
+    @property
+    def llm_client(self):
+        client = super().llm_client
+        client.on_retry = self.on_retry
+        return client
 
     def _set_model(self, new_model: str) -> bool:
         from code_agent.llm_registry import resolve_model_name
@@ -4605,7 +4609,7 @@ def main():
         epilog="""
 Examples:
   coda                                # Start with default settings
-  coda --model sonnet                 # Use Claude
+  coda --model <model>                # Select an LLM model
   coda --max-turns 50                 # Limit conversation turns
   coda --resume                       # Open session picker on startup
   coda --resume <session_id>          # Resume specific session directly
@@ -4616,8 +4620,8 @@ Examples:
     configured_models = _configured_models()
     parser.add_argument(
         "--model", "-m",
-        default=configured_models[0],
-        help="LLM model to use (default from config or sonnet)"
+        default=configured_models[0] if configured_models else None,
+        help="LLM model to use (required unless code_agent_model is configured)"
     )
     parser.add_argument(
         "--max-turns",
@@ -4679,6 +4683,9 @@ Examples:
 
     args = parser.parse_args()
 
+    if not args.model:
+        parser.error("--model is required unless code_agent_model is configured")
+
     if args.non_interactive and args.prompt is None:
         parser.error("--non-interactive requires --prompt")
 
@@ -4700,6 +4707,8 @@ Examples:
         get_model_config(args.model)
         configured_models = [resolve_model_name(model) for model in configured_models]
         args.model = resolve_model_name(args.model)
+        if not configured_models:
+            configured_models = [args.model]
     except ModelNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)

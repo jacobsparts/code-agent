@@ -74,7 +74,7 @@ not be used as the normal lifecycle mechanism.
 
 ## Model Configuration
 
-    agent = Subagent()  # Uses parent's model when loaded via /subagents; otherwise config default
+    agent = Subagent()  # Requires a parent-supplied or configured model before use
     agent = Subagent(model="opus")
 
 ## Response model
@@ -109,18 +109,18 @@ except ImportError:
     import pickle
 
 
-def _configured_default_model() -> str:
+def _configured_default_model() -> Optional[str]:
     try:
         from code_agent.config import get_user_config
         config = get_user_config()
         value = getattr(config, "code_agent_model", None) if config else None
         if isinstance(value, list):
-            return value[0] if value else "sonnet"
+            return value[0] if value else None
         if value:
             return value
     except Exception:
         pass
-    return "sonnet"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +556,11 @@ class Subagent:
         """Start the subprocess if not already running."""
         if self._started and self._proc and self._proc.poll() is None:
             return
+        if not self.model:
+            raise ValueError(
+                "Subagent model is required unless code_agent_model is configured "
+                "or a parent agent supplies one"
+            )
 
         if self._proc:
             self._cleanup()

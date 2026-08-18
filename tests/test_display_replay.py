@@ -601,6 +601,32 @@ def test_configured_models_accepts_string_and_list(monkeypatch):
     assert agent_module._configured_models() == ["model-a", "model-b"]
 
 
+def test_configured_models_has_no_implicit_default(monkeypatch):
+    from code_agent import agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_get_config_value", lambda name, default: default)
+    assert agent_module._configured_models() == []
+
+    monkeypatch.setattr(agent_module, "_get_config_value", lambda name, default: [])
+    assert agent_module._configured_models() == []
+
+
+def test_code_agent_construction_does_not_create_model_client(monkeypatch):
+    from code_agent.agent import CodeAgent
+    from code_agent import base_agent
+
+    monkeypatch.setattr(
+        base_agent,
+        "LLMClient",
+        lambda model: (_ for _ in ()).throw(AssertionError("client constructed")),
+    )
+    agent = CodeAgent()
+    try:
+        assert not hasattr(agent, "_llm_client")
+    finally:
+        agent.close()
+
+
 def test_endpoint_registry_resolves_aliases_and_hides_them_from_error_list():
     from code_agent.llm_registry import EndpointRegistry, ModelNotFoundError
 

@@ -14,8 +14,23 @@ from code_agent.subagent import (
     WORKER_CODE,
     _IncrementalMessageReceiver,
     _NO_MESSAGE,
+    _configured_default_model,
     _subagents,
 )
+
+
+def test_subagent_has_no_implicit_default_model(monkeypatch):
+    monkeypatch.setattr("code_agent.config.get_user_config", lambda: None)
+    monkeypatch.setattr(Subagent, "default_model", None)
+
+    agent = Subagent()
+    try:
+        assert _configured_default_model() is None
+        assert agent.model is None
+        with pytest.raises(ValueError, match="Subagent model is required"):
+            agent._ensure_started()
+    finally:
+        agent.close()
 
 
 def test_worker_uses_code_agent_interaction_and_output_hooks():
