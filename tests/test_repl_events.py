@@ -143,6 +143,11 @@ def test_statement_output_spills_over_limit(monkeypatch):
     repl = ToolREPL(echo=False)
     repl.inject_builtins()
     try:
+        agent._execute_with_tool_handling(
+            repl,
+            "import code_agent.repl_agent as _repl_agent\n"
+            "_repl_agent._MAX_REPL_OUTPUT_CHARS = 10",
+        )
         output, _, events, _ = agent._execute_with_tool_handling(repl, "print('x' * 11)")
         path = output.split("written to ", 1)[1].split(" (", 1)[0]
         assert output == f">>> print('x' * 11)\n[large output written to {path} (0.0MB)]\n"

@@ -1,3 +1,5 @@
+from . import process_safety as _process_safety
+
 __version__ = "0.1.0"
 
 __all__ = [
