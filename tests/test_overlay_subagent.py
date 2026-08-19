@@ -214,6 +214,9 @@ def test_recursive_worker_code_attaches_skill_and_gates_child_construction():
     compile(worker_code, "<overlay-worker>", "exec")
     assert 'if runtime_config["recursive"]:' in worker_code
     assert 'agent.attach_skill("overlay_subagent_worker")' in worker_code
+    assert "from code_agent.overlay_subagent import _overlay_tool_worker_main" in worker_code
+    assert "repl_transport = StdioSubprocessTransport" in worker_code
+    assert "def _overlay_tool_worker_main(" not in worker_code
     worker_skill = Path("code_agent/skills/overlay_subagent_worker.md").read_text()
     assert worker_skill.startswith("# Recursive overlay subagent orchestration")
     assert "# Overlay subagents with isolated, reviewable file changes" not in worker_skill

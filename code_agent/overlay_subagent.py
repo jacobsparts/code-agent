@@ -1129,6 +1129,17 @@ def set_parent_death_signal(expected_parent_pid: int, runtime_id: str = "") -> N
         )
 
 
+def _overlay_tool_worker_main(*args, **kwargs):
+    owner_pid = os.getppid()
+    set_parent_death_signal(
+        owner_pid,
+        os.environ.get("CODE_AGENT_OVERLAY_RUNTIME_ID", ""),
+    )
+    from code_agent.repl_agent import _tool_worker_main
+
+    return _tool_worker_main(*args, **kwargs)
+
+
 def start_parent_liveness_monitor(
     liveness_fd: int,
     expected_parent_pid: int,
@@ -1613,22 +1624,11 @@ def _build_overlay_worker_code() -> str:
         configure_death_signal=False,
     )
 
-    # ToolREPL uses multiprocessing fork. Fork clears PDEATHSIG and removes the
-    # monitor thread, so re-arm both protections in every ToolREPL child.
+    # ToolREPL uses multiprocessing spawn, so its target must be a module-level
+    # callable. Re-arm PDEATHSIG in the spawned child.
+    os.environ["CODE_AGENT_OVERLAY_RUNTIME_ID"] = _overlay_runtime_id
     import code_agent.repl_agent as _overlay_repl_agent
-    _ordinary_tool_worker_main = _overlay_repl_agent._tool_worker_main
-
-    def _overlay_tool_worker_main(*args, **kwargs):
-        tool_owner_pid = os.getppid()
-        set_parent_death_signal(tool_owner_pid, _overlay_runtime_id)
-        start_parent_liveness_monitor(
-            _overlay_liveness_fd,
-            tool_owner_pid,
-            lambda: None,
-            runtime_id=_overlay_runtime_id,
-            configure_death_signal=False,
-        )
-        return _ordinary_tool_worker_main(*args, **kwargs)
+    from code_agent.overlay_subagent import _overlay_tool_worker_main
 
     _overlay_repl_agent._tool_worker_main = _overlay_tool_worker_main
 
@@ -1638,6 +1638,7 @@ def _build_overlay_worker_code() -> str:
     code = code.replace(
         "    from code_agent.agent import CodeAgent",
         """    from code_agent.agent import CodeAgent
+    from code_agent.tools.transports import StdioSubprocessTransport
     from code_agent.overlay_subagent import (
         _WorkerOverlayOwner,
         _overlay_repl_code,
@@ -1646,6 +1647,14 @@ def _build_overlay_worker_code() -> str:
         materialize_submitted_files,
         submitted_files_to_payload,
     )""",
+        1,
+    )
+    code = code.replace(
+        """        interactive = True
+        welcome_message = """"",
+        """        repl_transport = StdioSubprocessTransport
+        interactive = True
+        welcome_message = """"",
         1,
     )
     code = code.replace(
