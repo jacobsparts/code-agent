@@ -41,52 +41,77 @@ def _join_python(parts):
     return "\n".join(part.rstrip("\n") for part in parts if part != "")
 
 
-def normalize_openai_repl_response(message):
-    content = message.get("content")
-    tool_calls = message.get("tool_calls") or []
+def repl_response_to_text(message):
+    blocks = message["content"]
+    calls = []
+    for block in blocks:
+        kind = block["type"]
+        if kind == "tool_call":
+            calls.append(block)
+        elif kind not in ("text", "commentary"):
+            raise NotImplementedError(
+                f"Unknown REPL response content type: {kind!r}"
+            )
 
-    if not tool_calls:
-        text = content or ""
+    if not calls:
+        text = _join_python(
+            block["text"] for block in blocks
+        )
         if not text:
             raise ReplExecuteResponseError(
                 "Response must include a repl_execute tool call with valid Python."
             )
         if _python_source(text):
-            return {"role": "assistant", "content": text}
+            return {**message, "content": [{"type": "text", "text": text}]}
         raise ReplExecuteResponseError(
             "Response without a repl_execute tool call must be valid Python. "
             "Use repl_execute with emit(...) for prose responses."
         )
 
     parts = []
-    if content:
-        parts.append(f"emit({content!r})")
+    for block in blocks:
+        kind = block["type"]
+        if kind == "text":
+            if block["text"]:
+                parts.append(f"emit({block['text']!r})")
+        elif kind == "commentary":
+            if block["text"]:
+                parts.append("# " + "\n# ".join(block["text"].split("\n")))
+        elif kind == "tool_call":
+            if block["name"] != "repl_execute":
+                raise ReplExecuteResponseError(
+                    f"Unexpected native tool: {block['name']!r}"
+                )
+            code = block["args"]["code"]
+            if not isinstance(code, str):
+                raise ReplExecuteResponseError("repl_execute code must be a string")
+            parts.append(code)
+        else:
+            raise NotImplementedError(
+                f"Unknown REPL response content type: {kind!r}"
+            )
 
-    for call in tool_calls:
-        function = call.get("function")
-        if not isinstance(function, dict):
-            raise ReplExecuteResponseError("Invalid native tool call: missing function object")
-        name = function.get("name")
-        if name != "repl_execute":
-            raise ReplExecuteResponseError(f"Unexpected native tool: {name!r}")
-        arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except (TypeError, ValueError) as exc:
-                raise ReplExecuteResponseError("Invalid repl_execute arguments JSON") from exc
-        if not isinstance(arguments, dict):
-            raise ReplExecuteResponseError("repl_execute arguments must be an object")
-        code = arguments.get("code")
-        if not isinstance(code, str):
-            raise ReplExecuteResponseError("repl_execute code must be a string")
-        parts.append(code)
-
-    return {"role": "assistant", "content": _join_python(parts)}
+    text = _join_python(parts)
+    if not _python_source(text):
+        raise ReplExecuteResponseError(
+            "repl_execute response must produce valid Python."
+        )
+    return {**message, "content": [{"type": "text", "text": text}]}
 
 
-def _project_non_assistant_message(message):
-    return {k: v for k, v in message.items() if k != "tool_calls"}
+def _message_text(message):
+    text = []
+    for block in message["content"]:
+        kind = block["type"]
+        if kind == "text":
+            text.append(block["text"])
+        elif kind == "attachment":
+            continue
+        else:
+            raise NotImplementedError(
+                f"Unknown REPL history content type: {kind!r}"
+            )
+    return "\n".join(text)
 
 
 def _strip_leading_input_echo(output, human_input):
@@ -111,31 +136,37 @@ def _split_repl_output_and_input(message, preceding_human_input=None):
     if human is not None and not inputs:
         inputs = [human]
 
-    output = message.get("content", "")
+    output = _message_text(message)
     for value in reversed(inputs):
         suffix = value + "\n"
         if output.endswith(suffix):
             before = output[:-len(suffix)]
             output = before.rstrip("\n") + ("\n" if before else "")
-    return _strip_leading_input_echo(
-        output, preceding_human_input
-    ), inputs
+    attachments = [
+        block for block in message["content"]
+        if block["type"] == "attachment"
+    ]
+    return (
+        _strip_leading_input_echo(output, preceding_human_input),
+        inputs,
+        attachments,
+    )
 
 
-def project_openai_repl_messages(messages):
+def project_repl_tool_history(messages):
     projected = []
     call_number = 0
     index = 0
-    pending_human_input = None
+    pending_user_input = None
 
     while index < len(messages):
         message = messages[index]
-        role = message.get("role")
+        role = message["role"]
 
         if role != "assistant":
-            projected.append(_project_non_assistant_message(message))
+            projected.append(message)
             if role == "user":
-                pending_human_input = message.get("_user_content", message.get("content"))
+                pending_user_input = message.get("_user_content", _message_text(message))
             index += 1
             continue
 
@@ -143,34 +174,43 @@ def project_openai_repl_messages(messages):
         call_id = f"repl_{call_number:06d}"
         projected.append({
             "role": "assistant",
-            "content": None,
-            "tool_calls": [{
+            "content": [{
+                "type": "tool_call",
                 "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": "repl_execute",
-                    "arguments": json.dumps({
-                        "code": message.get("content") or "",
-                    }),
-                },
+                "name": "repl_execute",
+                "args": {"code": _message_text(message)},
             }],
         })
 
         output = ""
         human_inputs = []
-        if index + 1 < len(messages) and messages[index + 1].get("role") == "user":
-            output, human_inputs = _split_repl_output_and_input(
+        attachments = []
+        if index + 1 < len(messages) and messages[index + 1]["role"] == "user":
+            output, human_inputs, attachments = _split_repl_output_and_input(
                 messages[index + 1],
-                pending_human_input,
+                pending_user_input,
             )
             index += 1
         projected.append({
             "role": "tool",
+            "content": [{"type": "text", "text": output}],
             "tool_call_id": call_id,
-            "content": output,
+            "name": "repl_execute",
         })
-        projected.extend({"role": "user", "content": value} for value in human_inputs)
-        pending_human_input = human_inputs[-1] if human_inputs else None
+        recovered = [{
+            "role": "user",
+            "content": [{"type": "text", "text": value}],
+        } for value in human_inputs]
+        if attachments:
+            if recovered:
+                recovered[-1]["content"].extend(attachments)
+            else:
+                recovered.append({
+                    "role": "user",
+                    "content": attachments,
+                })
+        projected.extend(recovered)
+        pending_user_input = human_inputs[-1] if human_inputs else None
         index += 1
 
     return projected

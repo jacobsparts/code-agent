@@ -1,175 +1,133 @@
-import json
-
 import pytest
 
+from code_agent.client import legacy_to_transport_messages
 from code_agent.repl_tool_adapter import (
-    REPL_EXECUTE_TOOL,
     ReplExecuteResponseError,
-    normalize_openai_repl_response,
-    project_openai_repl_messages,
+    project_repl_tool_history,
+    repl_response_to_text,
 )
 
 
-def call(code, name="repl_execute"):
+def text(value):
+    return {"type": "text", "text": value}
+
+
+def repl_call(code):
     return {
-        "id": "provider-id",
-        "type": "function",
-        "function": {"name": name, "arguments": json.dumps({"code": code})},
+        "type": "tool_call",
+        "id": "provider-call",
+        "name": "repl_execute",
+        "args": {"code": code},
     }
 
 
-def test_tool_call_normalizes_to_python():
-    assert normalize_openai_repl_response({
-        "role": "assistant", "content": None, "tool_calls": [call("x = 1")]
-    }) == {"role": "assistant", "content": "x = 1"}
-
-
-def test_text_and_multiple_calls_are_joined_safely():
-    result = normalize_openai_repl_response({
+def test_legacy_assistant_projects_text_before_flat_tool_calls():
+    projected = legacy_to_transport_messages([{
         "role": "assistant",
-        "content": "I'll inspect it.",
-        "tool_calls": [call("x = 1"), call("print(x)")],
+        "content": "before tool",
+        "tool_calls": [{
+            "id": "call",
+            "type": "function",
+            "function": {
+                "name": "read",
+                "arguments": '{"file_path": "app.py"}',
+            },
+        }],
+        "_event_seq": 7,
+        "unknown": "discard",
+    }])[0]
+
+    assert [block["type"] for block in projected["content"]] == [
+        "text", "tool_call",
+    ]
+    assert projected["content"][1]["args"] == {"file_path": "app.py"}
+    assert projected["_event_seq"] == 7
+    assert "unknown" not in projected
+
+
+def test_transport_repl_response_preserves_executable_block_order():
+    result = repl_response_to_text({
+        "role": "assistant",
+        "content": [
+            text("working"),
+            {"type": "commentary", "text": "checking"},
+            repl_call("x = 1"),
+            repl_call("print(x)"),
+        ],
     })
-    assert result == {
+
+    source = result["content"][0]["text"]
+    assert source.index("emit(") < source.index("# checking")
+    assert source.index("# checking") < source.index("x = 1")
+    assert source.index("x = 1") < source.index("print(x)")
+
+
+def test_transport_repl_response_requires_python_without_a_call():
+    assert repl_response_to_text({
         "role": "assistant",
-        "content": "emit(\"I'll inspect it.\")\nx = 1\nprint(x)",
-    }
+        "content": [text("x = 1")],
+    })["content"] == [text("x = 1")]
 
-
-def test_projection_uses_canonical_code_for_accompanying_content():
-    normalized = normalize_openai_repl_response({
-        "role": "assistant",
-        "content": "I'll inspect it.",
-        "tool_calls": [call("print(42)")],
-    })
-
-    result = project_openai_repl_messages([normalized])
-
-    assert result[0]["content"] is None
-    assert json.loads(
-        result[0]["tool_calls"][0]["function"]["arguments"]
-    ) == {"code": "emit(\"I'll inspect it.\")\nprint(42)"}
-
-
-def test_raw_python_without_tool_call_is_accepted():
-    assert normalize_openai_repl_response({
-        "role": "assistant", "content": "x = 1"
-    })["content"] == "x = 1"
-
-
-def test_plain_text_without_tool_call_is_rejected():
-    text = 'A "quoted" answer\nwith Unicode: café'
-    with pytest.raises(ReplExecuteResponseError, match="must be valid Python"):
-        normalize_openai_repl_response({
-            "role": "assistant", "content": text
-        })
-
-
-@pytest.mark.parametrize("content", [None, ""])
-def test_empty_response_without_tool_call_is_rejected(content):
-    with pytest.raises(ReplExecuteResponseError, match="must include a repl_execute tool call"):
-        normalize_openai_repl_response({
-            "role": "assistant", "content": content
-        })
-
-
-@pytest.mark.parametrize("tool_call", [
-    call("x = 1", name="other"),
-    {"function": {"name": "repl_execute", "arguments": "{"}},
-    {"function": {"name": "repl_execute", "arguments": "{}"}},
-    {"function": {"name": "repl_execute", "arguments": '{"code": 1}'}},
-])
-def test_invalid_calls_raise(tool_call):
     with pytest.raises(ReplExecuteResponseError):
-        normalize_openai_repl_response({
-            "role": "assistant", "content": None, "tool_calls": [tool_call]
+        repl_response_to_text({
+            "role": "assistant",
+            "content": [text("not Python prose")],
         })
 
 
-def test_projection_uses_stable_calls_and_results():
-    messages = [
+def project_legacy(messages):
+    return project_repl_tool_history(legacy_to_transport_messages(messages))
+
+
+def test_repl_history_uses_stable_synthetic_calls_and_results():
+    projected = project_legacy([
         {"role": "system", "content": "system"},
         {"role": "user", "content": "task"},
         {"role": "assistant", "content": "x = 1", "_private": True},
-        {"role": "user", "content": ">>> x = 1\n", "_stdout": ">>> x = 1\n"},
+        {"role": "user", "content": ">>> x = 1\n", "_stdout": "ignored"},
         {"role": "assistant", "content": "print(x)"},
+    ])
+
+    calls = [
+        message["content"][0]
+        for message in projected
+        if message["role"] == "assistant"
     ]
-    result = project_openai_repl_messages(messages)
-    assert result[2]["tool_calls"][0]["id"] == "repl_000001"
-    assert json.loads(result[2]["tool_calls"][0]["function"]["arguments"]) == {"code": "x = 1"}
-    assert result[3] == {
-        "role": "tool", "tool_call_id": "repl_000001", "content": ">>> x = 1\n"
-    }
-    assert result[4]["tool_calls"][0]["id"] == "repl_000002"
-    assert result[5] == {
-        "role": "tool", "tool_call_id": "repl_000002", "content": ""
-    }
-
-
-def test_projection_coalesces_native_calls_without_preserving_provider_shape():
-    normalized = normalize_openai_repl_response({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            call("x = 1"),
-            {**call("print(x)"), "id": "provider-id-2"},
-        ],
-    })
-    messages = [
-        normalized,
-        {
-            "role": "user",
-            "content": ">>> x = 1\n>>> print(x)\n1\n",
-            "_stdout": ">>> x = 1\n>>> print(x)\n1\n",
-        },
+    results = [
+        message for message in projected if message["role"] == "tool"
     ]
-
-    result = project_openai_repl_messages(messages)
-
-    assert normalized == {
-        "role": "assistant",
-        "content": "x = 1\nprint(x)",
-    }
-    assert len(result[0]["tool_calls"]) == 1
-    assert result[0]["tool_calls"][0]["id"] == "repl_000001"
-    assert json.loads(
-        result[0]["tool_calls"][0]["function"]["arguments"]
-    ) == {"code": "x = 1\nprint(x)"}
-    assert result[1] == {
-        "role": "tool",
-        "tool_call_id": "repl_000001",
-        "content": ">>> x = 1\n>>> print(x)\n1\n",
-    }
+    assert [call["id"] for call in calls] == ["repl_000001", "repl_000002"]
+    assert [result["tool_call_id"] for result in results] == [
+        call["id"] for call in calls
+    ]
+    assert calls[0]["args"]["code"] == "x = 1"
+    assert results[-1]["content"] == [text("")]
 
 
-def test_projection_splits_appended_human_input():
-    messages = [
+def test_repl_history_recovers_appended_user_input():
+    projected = project_legacy([
         {"role": "assistant", "content": "emit('done', release=True)"},
         {
             "role": "user",
             "content": ">>> emit('done', release=True)\ndone\nnext task\n",
-            "_stdout": ">>> emit('done', release=True)\ndone\nnext task\n",
             "_user_content": "next task",
             "_render_segments": [
-                {"type": "stdout", "content": ">>> emit('done', release=True)\ndone\n"},
+                {
+                    "type": "stdout",
+                    "content": ">>> emit('done', release=True)\ndone\n",
+                },
                 {"type": "input", "content": "next task"},
             ],
         },
-    ]
-    result = project_openai_repl_messages(messages)
-    assert result[1]["role"] == "tool"
-    assert result[1]["content"].endswith("done\n")
-    assert result[2] == {"role": "user", "content": "next task"}
+    ])
+
+    assert projected[1]["content"][0]["text"].endswith("done\n")
+    assert projected[2]["content"] == [text("next task")]
 
 
-def test_projection_uses_preview_content_instead_of_raw_render_output():
-    preview = (
-        "[PreviewRef: session://preview/abc123]\n"
-        "(1 line, 200000 chars)\n"
-        "large output...\n"
-        "[/PreviewRef]\n"
-    )
-    messages = [
+def test_repl_history_uses_preview_instead_of_raw_output():
+    preview = "[PreviewRef: session://preview/example]\n[/PreviewRef]\n"
+    projected = project_legacy([
         {"role": "assistant", "content": "print(large_value)"},
         {
             "role": "user",
@@ -179,102 +137,35 @@ def test_projection_uses_preview_content_instead_of_raw_render_output():
                 {"type": "stdout", "content": "x" * 200_000},
             ],
         },
-    ]
+    ])
 
-    result = project_openai_repl_messages(messages)
-
-    assert result[1] == {
-        "role": "tool",
-        "tool_call_id": "repl_000001",
-        "content": preview,
-    }
+    assert projected[1]["content"] == [text(preview)]
 
 
-def test_projection_ignores_legacy_provider_shape_metadata():
-    preview = "[PreviewRef: session://preview/abc123]\n[/PreviewRef]\n"
-    messages = [
-        {
-            "role": "assistant",
-            "content": "print(large_value)",
-            "_tool_call_ids": ["provider-id"],
-            "_repl_execute_calls": [
-                {"id": "provider-id", "code": "print(large_value)"},
-            ],
-            "_tool_call_outputs": ["x" * 200_000],
-            "_repl_execute_prefix": "",
-            "_repl_execute_content": None,
-        },
-        {"role": "user", "content": preview, "_stdout": "x" * 200_000},
-    ]
-
-    result = project_openai_repl_messages(messages)
-
-    assert result[0]["tool_calls"][0]["id"] == "repl_000001"
-    assert result[1] == {
-        "role": "tool",
-        "tool_call_id": "repl_000001",
-        "content": preview,
-    }
-
-
-def test_projection_uses_preview_content_and_recovers_human_input():
-    preview = (
-        "[PreviewRef: session://preview/abc123]\n"
-        "(1 line, 200000 chars)\n"
-        "large output...\n"
-        "[/PreviewRef]\n"
+def test_repl_history_preserves_release_output_before_user_input():
+    output = (
+        '>>> emit("done", release=True)\n'
+        'done\n'
     )
-    messages = [
-        {"role": "assistant", "content": "emit('done', release=True)"},
+    projected = project_legacy([
+        {"role": "assistant", "content": 'emit("done", release=True)'},
         {
             "role": "user",
-            "content": preview + "next task\n",
-            "_stdout": "x" * 200_000 + "next task\n",
-            "_user_content": "next task",
-            "_render_segments": [
-                {"type": "stdout", "content": "x" * 200_000},
-                {"type": "input", "content": "next task"},
-            ],
-        },
-    ]
-
-    result = project_openai_repl_messages(messages)
-
-    assert result[1]["content"] == preview
-    assert result[2] == {"role": "user", "content": "next task"}
-
-
-def test_projection_preserves_synthetic_release_output_before_first_real_input():
-    final_output = (
-        '>>> emit("Today is Friday, July 17, 2026.", release=True)\n'
-        'Today is Friday, July 17, 2026.\n'
-    )
-    messages = [
-        {"role": "assistant", "content": 'emit("Today is Friday, July 17, 2026.", release=True)'},
-        {
-            "role": "user",
-            "content": final_output + "hi\n",
-            "_stdout": final_output + "hi\n",
+            "content": output + "hi\n",
             "_user_content": "hi",
             "_render_segments": [
-                {"type": "stdout", "content": final_output},
+                {"type": "stdout", "content": output},
                 {"type": "input", "content": "hi"},
             ],
         },
-    ]
+    ])
 
-    result = project_openai_repl_messages(messages)
-
-    assert result[1] == {
-        "role": "tool",
-        "tool_call_id": "repl_000001",
-        "content": final_output,
-    }
-    assert result[2] == {"role": "user", "content": "hi"}
+    assert projected[1]["content"] == [text(output)]
+    assert projected[2]["content"] == [text("hi")]
 
 
-def test_projection_strips_echoed_preceding_human_input_from_tool_result():
-    messages = [
+def test_repl_history_strips_echoed_preceding_user_input():
+    projected = project_legacy([
         {
             "role": "user",
             "content": "What's today's date?\n",
@@ -286,24 +177,73 @@ def test_projection_strips_echoed_preceding_human_input_from_tool_result():
         {"role": "assistant", "content": "print('2026-07-13')"},
         {
             "role": "user",
-            "content": "What's today's date?\n>>> print('2026-07-13')\n2026-07-13\n",
-            "_stdout": "What's today's date?\n>>> print('2026-07-13')\n2026-07-13\n",
+            "content": (
+                "What's today's date?\n"
+                ">>> print('2026-07-13')\n2026-07-13\n"
+            ),
             "_render_segments": [{
                 "type": "stdout",
-                "content": "What's today's date?\n>>> print('2026-07-13')\n2026-07-13\n",
+                "content": (
+                    "What's today's date?\n"
+                    ">>> print('2026-07-13')\n2026-07-13\n"
+                ),
             }],
         },
+    ])
+
+    assert projected[2]["content"] == [
+        text(">>> print('2026-07-13')\n2026-07-13\n")
     ]
 
-    result = project_openai_repl_messages(messages)
 
-    assert result[2] == {
-        "role": "tool",
-        "tool_call_id": "repl_000001",
-        "content": ">>> print('2026-07-13')\n2026-07-13\n",
+def test_repl_history_preserves_attachments_on_recovered_user_input():
+    attachment = {
+        "type": "attachment",
+        "media_type": "image/png",
+        "data_type": "bytes",
+        "data": b"image",
     }
+    projected = project_repl_tool_history([
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "print('done')"}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "done\nnext task\n"},
+                attachment,
+            ],
+            "_user_content": "next task",
+            "_render_segments": [
+                {"type": "stdout", "content": "done\n"},
+                {"type": "input", "content": "next task"},
+            ],
+        },
+    ])
+
+    assert projected[2]["content"] == [
+        {"type": "text", "text": "next task"},
+        attachment,
+    ]
 
 
-def test_schema_is_exactly_one_function():
-    assert REPL_EXECUTE_TOOL["function"]["name"] == "repl_execute"
-    assert REPL_EXECUTE_TOOL["function"]["parameters"]["additionalProperties"] is False
+def test_repl_history_ignores_obsolete_provider_metadata():
+    preview = "[PreviewRef: session://preview/example]\n[/PreviewRef]\n"
+    projected = project_legacy([
+        {
+            "role": "assistant",
+            "content": "print(large_value)",
+            "_tool_call_ids": ["provider-id"],
+            "_repl_execute_calls": [{
+                "id": "provider-id",
+                "code": "different_code()",
+            }],
+            "_tool_call_outputs": ["raw output"],
+        },
+        {"role": "user", "content": preview, "_stdout": "raw output"},
+    ])
+
+    assert projected[0]["content"][0]["id"] == "repl_000001"
+    assert projected[0]["content"][0]["args"]["code"] == "print(large_value)"
+    assert projected[1]["content"] == [text(preview)]

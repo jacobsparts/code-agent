@@ -5,9 +5,169 @@ import sys
 
 import pytest
 
-from code_agent.client import BadRequestError, LLMClient
+from code_agent.client import LLMClient, legacy_to_transport_messages
 from code_agent.conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
 from code_agent.repl_attachment_mixin import AudioAttachment, ImageAttachment
+
+
+def test_mixed_legacy_attachments_preserve_order_into_completions(monkeypatch):
+    config = {
+        "model": "media-model",
+        "api_type": "completions",
+        "concurrency": 1,
+        "timeout": 20,
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("test/media-model")
+    messages = legacy_to_transport_messages([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "first"},
+            {"type": "input_file", "file_id": "file_123"},
+            {
+                "type": "image_url",
+                "media_type": "image/png",
+                "image_url": {"url": "https://example.test/image.png"},
+            },
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "YXVkaW8=", "format": "wav"},
+            },
+            {"type": "text", "text": "last"},
+        ],
+        MEDIA_ATTACHMENTS_FIELD: [{
+            "media_type": "image/png",
+            "content": b"binary-image",
+        }],
+    }])
+
+    assert [
+        (block["type"], block.get("data_type"))
+        for block in messages[0]["content"]
+    ] == [
+        ("text", None),
+        ("attachment", "provider_id"),
+        ("attachment", "url"),
+        ("attachment", "bytes"),
+        ("text", None),
+        ("attachment", "bytes"),
+    ]
+    assert messages[0]["content"][3]["data"] == b"audio"
+    assert messages[0]["content"][-1]["data"] == b"binary-image"
+
+    projected = client._completions_messages(messages)[0]["content"]
+    assert [block["type"] for block in projected] == [
+        "text", "input_file", "image_url", "input_audio", "text", "image_url",
+    ]
+
+
+def test_unknown_legacy_and_transport_types_raise(monkeypatch):
+    with pytest.raises(NotImplementedError, match="Unknown legacy content type"):
+        legacy_to_transport_messages([{
+            "role": "user",
+            "content": [{"type": "future_media"}],
+        }])
+
+    config = {
+        "model": "media-model",
+        "api_type": "completions",
+        "concurrency": 1,
+        "timeout": 20,
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("test/media-model")
+    with pytest.raises(NotImplementedError, match="Unknown transport content type"):
+        client._completions_messages([{
+            "role": "user",
+            "content": [{"type": "future_transport"}],
+        }])
+
+
+def test_unknown_responses_output_types_raise(monkeypatch):
+    config = {
+        "model": "media-model",
+        "api_type": "responses",
+        "concurrency": 1,
+        "timeout": 20,
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("test/media-model")
+
+    with pytest.raises(NotImplementedError, match="Unknown Responses output type"):
+        client._parse_responses_result({
+            "output": [{"type": "future_output"}],
+        })
+
+
+def test_anthropic_and_gemini_project_binary_and_filepath_attachments(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "image.png"
+    path.write_bytes(b"file-image")
+    attachment = {
+        "type": "attachment",
+        "media_type": "image/png",
+        "data_type": "bytes",
+        "data": b"image",
+    }
+
+    config = {
+        "model": "media-model",
+        "api_type": "messages",
+        "concurrency": 1,
+        "timeout": 20,
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    anthropic = LLMClient("test/media-model")
+    assert anthropic._anthropic_attachment(attachment)["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": "aW1hZ2U=",
+    }
+
+    config["api_type"] = "gemini"
+    gemini = LLMClient("test/media-model")
+    attachment = {
+        **attachment,
+        "data_type": "filepath",
+        "data": str(path),
+    }
+    assert gemini._gemini_attachment(attachment) == {
+        "inlineData": {
+            "mimeType": "image/png",
+            "data": "ZmlsZS1pbWFnZQ==",
+        },
+    }
+
+
+def test_responses_attachment_output_decodes_to_transport(monkeypatch):
+    config = {
+        "model": "media-model",
+        "api_type": "responses",
+        "concurrency": 1,
+        "timeout": 20,
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("test/media-model")
+
+    result = client._parse_responses_result({
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{
+                "type": "input_file",
+                "file_id": "file_result",
+                "media_type": "application/pdf",
+            }],
+        }],
+    })
+
+    assert result["content"] == [{
+        "type": "attachment",
+        "media_type": "application/pdf",
+        "data_type": "provider_id",
+        "data": "file_result",
+    }]
 
 
 def test_responses_request_projects_private_image_attachment(monkeypatch):
@@ -34,7 +194,9 @@ def test_responses_request_projects_private_image_attachment(monkeypatch):
         "[Attachment: diagram.png, 2×3, image/png]",
         _attachments={"diagram.png": image},
     )
-    request = client._responses_request(conversation._messages(), None)
+    request = client._responses_request(
+        legacy_to_transport_messages(conversation._messages()), None
+    )
 
     user = request["input"][1]
     assert user["content"][0] == {
@@ -98,7 +260,12 @@ class _Connection:
         ),
         (
             "gemini",
-            {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+            {
+                "candidates": [{
+                    "content": {"parts": [{"text": "ok"}]},
+                    "finishReason": "STOP",
+                }],
+            },
             {
                 "inlineData": {
                     "mimeType": "audio/wav",
@@ -125,7 +292,7 @@ def test_audio_attachment_transport_payload(
         "config": {},
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
-    monkeypatch.setattr("code_agent.client.http.client.HTTPSConnection", _Connection)
+    monkeypatch.setattr("code_agent.client.DeadlineHTTPSConnection", _Connection)
     _Connection.requests = []
     _Connection.response_payload = response_payload
     client = LLMClient("test/audio-model")
@@ -148,8 +315,18 @@ def test_audio_attachment_transport_payload(
         assert request["contents"][0]["parts"][1] == expected
 
 
-@pytest.mark.parametrize("api_type", ["responses", "messages", "cursor", "codex"])
-def test_transport_rejects_unsupported_audio_generically(monkeypatch, api_type):
+@pytest.mark.parametrize(
+    ("api_type", "projector"),
+    [
+        ("responses", "_responses_attachment"),
+        ("messages", "_anthropic_attachment"),
+        ("cursor", "_openai_attachment"),
+        ("codex", "_responses_attachment"),
+    ],
+)
+def test_transport_rejects_unsupported_audio_generically(
+    monkeypatch, api_type, projector
+):
     config = {
         "model": "text-model",
         "api_type": api_type,
@@ -158,30 +335,43 @@ def test_transport_rejects_unsupported_audio_generically(monkeypatch, api_type):
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     client = LLMClient("test/text-model")
-
-    with pytest.raises(
-        BadRequestError,
-        match=rf"{api_type} transport does not support audio/wav attachments",
-    ):
-        client._pop_media_attachments({
-            MEDIA_ATTACHMENTS_FIELD: [{
-                "media_type": "audio/wav",
-                "content": b"audio",
-            }]
-        })
-
-
-def test_provider_response_media_is_removed_from_conversation_history():
-    message = {
-        "role": "assistant",
-        "content": "done",
-        "images": [{"type": "image_url", "image_url": {"url": "data:..."}}],
+    attachment = {
+        "type": "attachment",
+        "media_type": "audio/wav",
+        "data_type": "bytes",
+        "data": b"audio",
     }
 
-    result = LLMClient._strip_response_media(message)
+    with pytest.raises(NotImplementedError):
+        getattr(client, projector)(attachment)
 
-    assert result is message
-    assert message == {"role": "assistant", "content": "done"}
+
+def test_openai_response_image_decodes_then_legacy_projection_raises():
+    from code_agent.client import (
+        _openai_compatible_message_to_transport_blocks,
+        transport_to_legacy_message,
+    )
+
+    blocks = _openai_compatible_message_to_transport_blocks({
+        "role": "assistant",
+        "content": "done",
+        "images": [{
+            "type": "image_url",
+            "image_url": {"url": "https://example.test/result.png"},
+        }],
+    })
+
+    assert blocks[1] == {
+        "type": "attachment",
+        "media_type": None,
+        "data_type": "url",
+        "data": "https://example.test/result.png",
+    }
+    with pytest.raises(NotImplementedError, match="cannot store attachment"):
+        transport_to_legacy_message({
+            "role": "assistant",
+            "content": blocks,
+        })
 
 
 def test_responses_request_skips_explicit_cache_when_not_opted_in(monkeypatch):
@@ -205,12 +395,12 @@ def test_responses_request_skips_explicit_cache_when_not_opted_in(monkeypatch):
     request = client._responses_request([
         {
             "role": "system",
-            "content": "stable instructions",
+            "content": [{"type": "text", "text": "stable instructions"}],
             "_prompt_cache_breakpoint": True,
         },
         {
             "role": "user",
-            "content": "cached-looking",
+            "content": [{"type": "text", "text": "cached-looking"}],
             "_prompt_cache_breakpoint": True,
         },
     ], None)

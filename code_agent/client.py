@@ -99,7 +99,7 @@ from .llm_registry import get_model_config
 from .conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
 from . import codex, cursor
 from .streaming import wrap_chat_completions_streaming_response
-from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, normalize_openai_repl_response, project_openai_repl_messages
+from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, repl_response_to_text, project_repl_tool_history
 
 # Define TCP keepalive constants for cross-platform compatibility
 try:
@@ -139,7 +139,218 @@ def _parse_completions_response(response_json):
     if 'choices' not in response_json:
         raise Exception(f"choices missing from response: {response_json}")
     choice = response_json['choices'][0]
-    return choice.get('message', {}), choice.get('finish_reason'), response_json.get('usage')
+    return choice['message'], choice.get('finish_reason'), response_json.get('usage')
+
+
+# Transitional compatibility projections. Remove with the legacy Conversation shape.
+def _attachment(media_type, data_type, data):
+    return {
+        'type': 'attachment',
+        'media_type': media_type,
+        'data_type': data_type,
+        'data': data,
+    }
+
+
+def _legacy_content_block(block):
+    kind = block['type']
+    if kind in ('text', 'input_text', 'output_text'):
+        return {'type': 'text', 'text': block['text']}
+    if kind == 'input_file':
+        return _attachment(
+            block.get('media_type'),
+            'provider_id',
+            block['file_id'],
+        )
+    if kind == 'image_url':
+        image_url = block['image_url']
+        return _attachment(
+            block.get('media_type'),
+            'url',
+            image_url['url'] if isinstance(image_url, dict) else image_url,
+        )
+    if kind == 'input_audio':
+        audio = block['input_audio']
+        media_type = {
+            'wav': 'audio/wav',
+            'mp3': 'audio/mpeg',
+        }.get(audio['format'])
+        if media_type is None:
+            raise NotImplementedError(
+                f"Unknown input_audio format: {audio['format']!r}"
+            )
+        return _attachment(
+            media_type,
+            'bytes',
+            base64.b64decode(audio['data']),
+        )
+    raise NotImplementedError(f"Unknown legacy content type: {kind!r}")
+
+
+def legacy_to_transport_messages(messages):
+    projected = []
+    for message in messages:
+        blocks = []
+        content = message['content']
+        if isinstance(content, str):
+            if content:
+                blocks.append({'type': 'text', 'text': content})
+        elif content is not None:
+            blocks.extend(_legacy_content_block(block) for block in content)
+        for item in message.get(MEDIA_ATTACHMENTS_FIELD) or []:
+            if not isinstance(item, dict):
+                raise BadRequestError("Invalid projected media attachment")
+            data = item.get('content')
+            if not isinstance(data, bytes):
+                raise BadRequestError(
+                    "Projected media attachment has no binary content"
+                )
+            blocks.append(_attachment(item.get('media_type'), 'bytes', data))
+        if message['role'] == 'assistant':
+            for call in message.get('tool_calls') or []:
+                function = call['function']
+                blocks.append({
+                    'type': 'tool_call',
+                    'id': call['id'],
+                    'name': function['name'],
+                    'args': json.loads(function['arguments']),
+                })
+        projected_message = {
+            'role': message['role'],
+            'content': blocks,
+        }
+        for key in ('tool_call_id', 'name'):
+            if key in message:
+                projected_message[key] = message[key]
+        projected_message.update({
+            key: value
+            for key, value in message.items()
+            if key.startswith('_') and key != MEDIA_ATTACHMENTS_FIELD
+        })
+        projected.append(projected_message)
+    return projected
+
+
+def _text_only_content(blocks, context):
+    text = []
+    for block in blocks:
+        kind = block['type']
+        if kind == 'text':
+            text.append(block['text'])
+        else:
+            raise NotImplementedError(
+                f"Unknown {context} content type: {kind!r}"
+            )
+    return '\n'.join(text)
+
+
+def _apply_native_policy(messages, native):
+    projected = []
+    for message in messages:
+        if not native and message['role'] == 'tool':
+            text = _text_only_content(
+                message['content'], 'tool result'
+            )
+            projected.append({
+                'role': 'user',
+                'content': [{
+                    'type': 'text',
+                    'text': f"{message.get('name', 'tool')}: {text}",
+                }],
+            })
+            continue
+        content = []
+        for block in message['content']:
+            kind = block['type']
+            if kind == 'tool_call':
+                continue
+            if kind in (
+                'text', 'commentary', 'reasoning', 'attachment',
+            ):
+                content.append(block)
+            else:
+                raise NotImplementedError(
+                    f"Unknown transport content type: {kind!r}"
+                )
+        projected.append({**message, 'content': content})
+    return projected
+
+
+def transport_to_legacy_message(message):
+    text = []
+    calls = []
+    for block in message['content']:
+        if block['type'] == 'text':
+            text.append(block['text'])
+        elif block['type'] == 'commentary':
+            text.append('# ' + '\n# '.join(block['text'].split('\n')))
+        elif block['type'] == 'tool_call':
+            calls.append({
+                'id': block['id'],
+                'type': 'function',
+                'function': {
+                    'name': block['name'],
+                    'arguments': json.dumps(block['args']),
+                },
+            })
+        elif block['type'] == 'reasoning':
+            continue
+        elif block['type'] == 'attachment':
+            raise NotImplementedError(
+                "Legacy Conversation cannot store attachment responses"
+            )
+        else:
+            raise NotImplementedError(
+                f"Unknown transport content type: {block['type']!r}"
+            )
+    result = {'role': 'assistant', 'content': '\n'.join(text)}
+    if calls:
+        result['tool_calls'] = calls
+    metadata = message.get('provider_metadata')
+    if metadata and 'stop_reason' in metadata:
+        result['_stop_reason'] = metadata['stop_reason']
+    return result
+
+
+def _openai_compatible_message_to_transport_blocks(message):
+    content = message['content']
+    if isinstance(content, str):
+        blocks = [{'type': 'text', 'text': content}] if content else []
+    elif content is None:
+        blocks = []
+    else:
+        blocks = []
+        for block in content:
+            kind = block['type']
+            if kind in ('text', 'commentary', 'reasoning'):
+                blocks.append({'type': kind, 'text': block['text']})
+            elif kind in ('image_url', 'input_audio'):
+                blocks.append(_legacy_content_block(block))
+            else:
+                raise NotImplementedError(
+                    f"Unknown OpenAI-compatible response content type: {kind!r}"
+                )
+    for call in message.get('tool_calls') or []:
+        function = call['function']
+        blocks.append({
+            'type': 'tool_call',
+            'id': call['id'],
+            'name': function['name'],
+            'args': json.loads(function['arguments']),
+        })
+    for image in message.get('images') or []:
+        kind = image['type']
+        if kind != 'image_url':
+            raise NotImplementedError(
+                f"Unknown OpenAI-compatible image type: {kind!r}"
+            )
+        image_url = image['image_url']
+        blocks.append(_attachment(
+            image.get('media_type'),
+            'url',
+            image_url['url'] if isinstance(image_url, dict) else image_url,
+        ))
+    return blocks
 
 
 class LLMClient:
@@ -174,23 +385,141 @@ class LLMClient:
             raise BadRequestError("Invalid media attachment type")
         api_type = self.model_config["api_type"]
         if media_type not in TRANSPORT_MEDIA_TYPES.get(api_type, set()):
-            raise BadRequestError(
+            raise NotImplementedError(
                 f"{api_type} transport does not support {media_type} attachments"
             )
 
-    def _pop_media_attachments(self, message):
-        media = message.pop(MEDIA_ATTACHMENTS_FIELD, None) or []
-        for item in media:
-            if not isinstance(item, dict):
-                raise BadRequestError("Invalid projected media attachment")
-            self.validate_media_type(item.get("media_type"))
-            if not isinstance(item.get("content"), bytes):
-                raise BadRequestError("Projected media attachment has no binary content")
-        return media
+    def _attachment_data(self, block):
+        data_type = block['data_type']
+        data = block['data']
+        if data_type == 'bytes':
+            if not isinstance(data, bytes):
+                raise BadRequestError("Attachment bytes data must be bytes")
+            return data
+        if data_type == 'filepath':
+            if not isinstance(data, str):
+                raise BadRequestError("Attachment filepath data must be a string")
+            with open(data, 'rb') as file:
+                return file.read()
+        if data_type in ('url', 'provider_id'):
+            if not isinstance(data, str):
+                raise BadRequestError(
+                    f"Attachment {data_type} data must be a string"
+                )
+            return data
+        raise NotImplementedError(
+            f"Unknown attachment data type: {data_type!r}"
+        )
+
+    def _binary_attachment(self, block):
+        if block['data_type'] not in ('bytes', 'filepath'):
+            raise NotImplementedError(
+                f"{self.model_config['api_type']} transport does not support "
+                f"{block['data_type']} attachments"
+            )
+        self.validate_media_type(block.get('media_type'))
+        return self._attachment_data(block)
+
+    def _openai_attachment(self, block):
+        if self.model_config['api_type'] == 'cursor':
+            raise NotImplementedError(
+                "Cursor transport does not support attachments"
+            )
+        data_type = block['data_type']
+        media_type = block.get('media_type')
+        if data_type == 'provider_id':
+            return {
+                'type': 'input_file',
+                'file_id': self._attachment_data(block),
+            }
+        if data_type == 'url':
+            if media_type is not None and not media_type.startswith('image/'):
+                raise NotImplementedError(
+                    "OpenAI-compatible transport only supports image URLs"
+                )
+            return {
+                'type': 'image_url',
+                'image_url': {'url': self._attachment_data(block)},
+            }
+        data = self._binary_attachment(block)
+        encoded = base64.b64encode(data).decode()
+        if media_type.startswith('image/'):
+            return {
+                'type': 'image_url',
+                'image_url': {
+                    'url': f"data:{media_type};base64,{encoded}",
+                },
+            }
+        if media_type in AUDIO_MEDIA_TYPES:
+            return {
+                'type': 'input_audio',
+                'input_audio': {
+                    'data': encoded,
+                    'format': 'wav' if media_type == 'audio/wav' else 'mp3',
+                },
+            }
+        raise NotImplementedError(
+            f"OpenAI-compatible transport does not support {media_type}"
+        )
+
+    def _responses_attachment(self, block):
+        data_type = block['data_type']
+        if data_type == 'provider_id':
+            return {
+                'type': 'input_file',
+                'file_id': self._attachment_data(block),
+            }
+        if data_type == 'url':
+            media_type = block.get('media_type')
+            if media_type is not None and not media_type.startswith('image/'):
+                raise NotImplementedError(
+                    "Responses transport only supports image URLs"
+                )
+            return {
+                'type': 'input_image',
+                'image_url': self._attachment_data(block),
+            }
+        data = self._binary_attachment(block)
+        media_type = block['media_type']
+        if not media_type.startswith('image/'):
+            raise NotImplementedError(
+                f"Responses transport does not support {media_type}"
+            )
+        return {
+            'type': 'input_image',
+            'image_url': (
+                f"data:{media_type};base64,"
+                f"{base64.b64encode(data).decode()}"
+            ),
+        }
+
+    def _anthropic_attachment(self, block):
+        data = self._binary_attachment(block)
+        media_type = block['media_type']
+        if not media_type.startswith('image/'):
+            raise NotImplementedError(
+                f"Anthropic transport does not support {media_type}"
+            )
+        return {
+            'type': 'image',
+            'source': {
+                'type': 'base64',
+                'media_type': media_type,
+                'data': base64.b64encode(data).decode(),
+            },
+        }
+
+    def _gemini_attachment(self, block):
+        data = self._binary_attachment(block)
+        return {
+            'inlineData': {
+                'mimeType': block['media_type'],
+                'data': base64.b64encode(data).decode(),
+            },
+        }
 
     @staticmethod
     def _strip_response_media(message):
-        message.pop("images", None)
         return message
 
     @staticmethod
@@ -244,6 +573,82 @@ class LLMClient:
                 f"{context_window:,} for {self.model_name}"
             )
 
+    def _completions_messages(self, messages):
+        projected = []
+        for original in messages:
+            message = dict(original)
+            role = message['role']
+            blocks = message['content']
+            if role == 'tool':
+                output = []
+                for block in blocks:
+                    kind = block['type']
+                    if kind == 'text':
+                        output.append(block['text'])
+                    else:
+                        raise NotImplementedError(
+                            f"Unknown tool result content type: {kind!r}"
+                        )
+                projected.append({
+                    'role': 'tool',
+                    'tool_call_id': message['tool_call_id'],
+                    'content': '\n'.join(output),
+                })
+                continue
+            content = []
+            calls = []
+            for block in blocks:
+                kind = block['type']
+                if kind in ('text', 'commentary'):
+                    content.append({'type': 'text', 'text': block['text']})
+                elif kind == 'attachment':
+                    content.append(self._openai_attachment(block))
+                elif kind == 'tool_call':
+                    calls.append({
+                        'id': block['id'],
+                        'type': 'function',
+                        'function': {
+                            'name': block['name'],
+                            'arguments': json.dumps(block['args']),
+                        },
+                    })
+                elif kind == 'reasoning':
+                    continue
+                else:
+                    raise NotImplementedError(
+                        f"Unknown transport content type: {kind!r}"
+                    )
+            out = {
+                'role': role,
+                'content': (
+                    content[0]['text']
+                    if len(content) == 1 and content[0]['type'] == 'text'
+                    else content
+                ),
+            }
+            if calls:
+                out['tool_calls'] = calls
+            breakpoint = message.get('_prompt_cache_breakpoint')
+            if (
+                breakpoint
+                and self.model_config.get('explicit_prompt_cache')
+                and out['content']
+            ):
+                if isinstance(out['content'], str):
+                    out['content'] = [{
+                        'type': 'text',
+                        'text': out['content'],
+                        'prompt_cache_breakpoint': {'mode': 'explicit'},
+                    }]
+                else:
+                    out['content'][-1] = {
+                        **out['content'][-1],
+                        'prompt_cache_breakpoint': {'mode': 'explicit'},
+                    }
+            projected.append(out)
+        return projected
+
+
     def _call_completions(self, messages, tools):
         """
         Call OpenAI Completions API.
@@ -252,46 +657,16 @@ class LLMClient:
             messages: List of projected message dicts.
             tools: Optional tool specifications.
         """
-        # OpenAI Completions API-compatible format
-        prepared = []
-        for m in messages:
-            out = dict(m)
-            breakpoint = out.pop('_prompt_cache_breakpoint', None)
-            if media := self._pop_media_attachments(out):
-                blocks = []
-                if out['content']:
-                    blocks.append({"type": "text", "text": out['content']})
-                for item in media:
-                    encoded = base64.b64encode(item['content']).decode()
-                    if item['media_type'].startswith('image/'):
-                        blocks.append({"type": "image_url", "image_url": {
-                            "url": f"data:{item['media_type']};base64,{encoded}"
-                        }})
-                    else:
-                        blocks.append({"type": "input_audio", "input_audio": {
-                            "data": encoded,
-                            "format": "wav" if item['media_type'] == "audio/wav" else "mp3",
-                        }})
-                out['content'] = blocks
-            elif breakpoint and self.model_config.get('explicit_prompt_cache') and isinstance(out.get('content'), str):
-                out['content'] = [{
-                    "type": "text",
-                    "text": out['content'],
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
-                }]
-            prepared.append(out)
-        messages = self._public_messages(prepared)
-
+        transport_messages = list(messages)
         context_window = self.model_config.get('context_window')
         extra_config = dict(self.model_config.get('config', {}))
         current_max_tokens = extra_config.get('max_tokens')
-        messages = list(messages)
         max_tokens_retry = 0
 
         while True:
             req = {
                 "model": self.model_config['model'],
-                "messages": messages,
+                "messages": self._completions_messages(transport_messages),
                 **extra_config,
             }
             if self.tool_mode == "repl_execute":
@@ -346,13 +721,17 @@ class LLMClient:
 
                 response_json = json.loads(response_data)
                 parser = self.model_config.get('response_parser') or _parse_completions_response
-                message, stop_reason, usage = parser(response_json)
+                provider_message, stop_reason, usage = parser(response_json)
+                message = {
+                    'role': 'assistant',
+                    'content': _openai_compatible_message_to_transport_blocks(provider_message),
+                    'provider_metadata': {'stop_reason': stop_reason},
+                }
                 if self.tool_mode == "repl_execute":
-                    message = normalize_openai_repl_response(message)
+                    message = repl_response_to_text(message)
                 if usage:
                     self.usage_tracker.log(self.model_name, usage)
                     self._update_input_tokens_per_byte(self._current_input_bytes, usage)
-                message['_stop_reason'] = stop_reason
 
                 # Truncated response: feed it back and retry with doubled max_tokens.
                 # Keeps doubling until prompt + output would exceed context_window.
@@ -364,8 +743,17 @@ class LLMClient:
                         max_tokens_retry += 1
                         if self.on_retry:
                             self.on_retry("max_tokens", max_tokens_retry)
-                        messages.append(message)
-                        messages.append({'role': 'user', 'content': 'Incomplete response detected. Resubmit your response.'})
+                        transport_messages.append(message)
+                        transport_messages.append({
+                            'role': 'user',
+                            'content': [{
+                                'type': 'text',
+                                'text': (
+                                    'Incomplete response detected. '
+                                    'Resubmit your response.'
+                                ),
+                            }],
+                        })
                         current_max_tokens = next_max_tokens
                         extra_config['max_tokens'] = current_max_tokens
                         logger.warning(f"stop_reason={stop_reason}, doubling max_tokens to {current_max_tokens}")
@@ -384,67 +772,95 @@ class LLMClient:
         input_items = []
         has_cache_breakpoint = False
         for message in messages:
-            message = dict(message)
-            media = self._pop_media_attachments(message)
-            role = message.get('role')
-            cache_breakpoint = bool(message.get('_prompt_cache_breakpoint')) and self.model_config.get('explicit_prompt_cache')
+            role = message['role']
+            blocks = message['content']
             if role == 'tool':
+                output = []
+                for block in blocks:
+                    kind = block['type']
+                    if kind == 'text':
+                        output.append(block['text'])
+                    else:
+                        raise NotImplementedError(
+                            f"Unknown tool result content type: {kind!r}"
+                        )
                 input_items.append({
                     'type': 'function_call_output',
-                    'call_id': message.get('tool_call_id'),
-                    'output': message.get('content', ''),
+                    'call_id': message['tool_call_id'],
+                    'output': '\n'.join(output),
                 })
                 continue
-            content = message.get('content')
-            if isinstance(content, str):
-                content = [{'type': 'text', 'text': content}]
-            elif not isinstance(content, list):
-                content = []
-            blocks = []
-            for block in content:
-                if not isinstance(block, dict) or block.get('type') == 'reasoning':
-                    continue
-                kind = block.get('type')
-                if kind == 'text':
-                    blocks.append({
-                        'type': 'output_text' if role == 'assistant' else 'input_text',
-                        'text': block.get('text', ''),
+
+            message_items = []
+            content = []
+
+            def flush_content(phase=None):
+                nonlocal content
+                if content:
+                    item = {'role': role, 'content': content}
+                    if phase is not None:
+                        item['phase'] = phase
+                    message_items.append(item)
+                    content = []
+
+            for block in blocks:
+                kind = block['type']
+                if kind in ('text', 'commentary'):
+                    phase = 'commentary' if kind == 'commentary' else None
+                    if content and phase is not None:
+                        flush_content()
+                    content.append({
+                        'type': (
+                            'output_text'
+                            if role == 'assistant'
+                            else 'input_text'
+                        ),
+                        'text': block['text'],
                     })
-                elif kind == 'image_url':
-                    image_url = block.get('image_url')
-                    if isinstance(image_url, dict):
-                        image_url = image_url.get('url')
-                    blocks.append({'type': 'input_image', 'image_url': image_url})
-                elif kind == 'output_text' and role != 'assistant':
-                    blocks.append({'type': 'input_text', 'text': block.get('text', '')})
+                    if phase is not None:
+                        flush_content(phase)
+                elif kind == 'attachment':
+                    content.append(self._responses_attachment(block))
+                elif kind == 'reasoning':
+                    flush_content()
+                    metadata = block.get('provider_metadata') or {}
+                    if 'encrypted_content' in metadata:
+                        message_items.append({
+                            'type': 'reasoning',
+                            'encrypted_content': metadata['encrypted_content'],
+                            'summary': [],
+                        })
+                elif kind == 'tool_call':
+                    flush_content()
+                    message_items.append({
+                        'type': 'function_call',
+                        'call_id': block['id'],
+                        'name': block['name'],
+                        'arguments': json.dumps(block['args']),
+                    })
                 else:
-                    blocks.append(dict(block))
-            blocks.extend({
-                'type': 'input_image',
-                'image_url': (
-                    f"data:{item['media_type']};base64,"
-                    f"{base64.b64encode(item['content']).decode()}"
-                ),
-            } for item in media)
-            if cache_breakpoint and blocks:
-                blocks[-1] = {
-                    **blocks[-1],
+                    raise NotImplementedError(
+                        f"Unknown transport content type: {kind!r}"
+                    )
+            flush_content()
+            if (
+                message.get('_prompt_cache_breakpoint')
+                and self.model_config.get('explicit_prompt_cache')
+            ):
+                message_items[-1]['content'][-1] = {
+                    **message_items[-1]['content'][-1],
                     'prompt_cache_breakpoint': {'mode': 'explicit'},
                 }
                 has_cache_breakpoint = True
-            if blocks:
-                input_items.append({'role': role, 'content': blocks})
-            for call in message.get('tool_calls') or []:
-                function = call.get('function') or {}
-                input_items.append({
-                    'type': 'function_call',
-                    'call_id': call.get('id'),
-                    'name': function.get('name'),
-                    'arguments': function.get('arguments', ''),
-                })
-        response_tools = []
-        for tool in ([REPL_EXECUTE_TOOL] if self.tool_mode == 'repl_execute' else tools or []):
-            response_tools.append({'type': 'function', **tool.get('function', tool)})
+            input_items.extend(message_items)
+        response_tools = [
+            {'type': 'function', **tool.get('function', tool)}
+            for tool in (
+                [REPL_EXECUTE_TOOL]
+                if self.tool_mode == 'repl_execute'
+                else tools or []
+            )
+        ]
         req = {'model': self.model_config['model'], 'input': input_items, **config}
         if has_cache_breakpoint:
             req.setdefault('prompt_cache_options', {'mode': 'explicit'})
@@ -453,55 +869,109 @@ class LLMClient:
         return req
 
     def _parse_responses_result(self, response_json):
-        output = response_json.get('output')
-        if not isinstance(output, list):
-            raise Exception(f"output missing from response: {response_json}")
-        text = []
-        calls = []
+        output = response_json['output']
+        blocks = []
         for item in output:
-            if item.get('type') == 'message':
-                msg_text = '\n'.join(
-                    block['text']
-                    for block in item.get('content', [])
-                    if block.get('type') in ('output_text', 'text') and block.get('text')
-                )
+            kind = item['type']
+            if kind == 'message':
                 phase = item.get('phase')
-                if phase not in (None, 'final'):
-                    if phase != 'commentary':
-                        sys.stderr.write(f"Warning: unrecognized Responses API message phase: {phase!r}\n")
-                    if msg_text:
-                        msg_text = '# ' + '\n# '.join(msg_text.split('\n'))
-                if msg_text:
-                    text.append(msg_text)
-            elif item.get('type') == 'output_text' and item.get('text'):
-                text.append(item['text'])
-            elif item.get('type') == 'function_call':
-                calls.append({
-                    'id': item.get('call_id') or item.get('id'),
-                    'type': 'function',
-                    'function': {
-                        'name': item.get('name'),
-                        'arguments': item.get('arguments', ''),
-                    },
+                block_type = 'text' if phase in (None, 'final') else 'commentary'
+                if phase not in (None, 'final', 'commentary'):
+                    sys.stderr.write(
+                        f"Warning: unrecognized Responses API message phase: {phase!r}\n"
+                    )
+                for content in item['content']:
+                    content_kind = content['type']
+                    if content_kind in ('output_text', 'text'):
+                        blocks.append({
+                            'type': block_type,
+                            'text': content['text'],
+                        })
+                    elif content_kind == 'input_file':
+                        blocks.append(_attachment(
+                            content.get('media_type'),
+                            'provider_id',
+                            content['file_id'],
+                        ))
+                    elif content_kind in ('input_image', 'image_url'):
+                        image_url = content.get(
+                            'image_url', content.get('url')
+                        )
+                        blocks.append(_attachment(
+                            content.get('media_type'),
+                            'url',
+                            image_url,
+                        ))
+                    else:
+                        raise NotImplementedError(
+                            "Unknown Responses message content type: "
+                            f"{content_kind!r}"
+                        )
+            elif kind == 'output_text':
+                blocks.append({'type': 'text', 'text': item['text']})
+            elif kind == 'reasoning':
+                summary = []
+                for part in item.get('summary', []):
+                    part_kind = part['type']
+                    if part_kind in ('summary_text', 'text'):
+                        summary.append(part['text'])
+                    else:
+                        raise NotImplementedError(
+                            "Unknown Responses reasoning summary type: "
+                            f"{part_kind!r}"
+                        )
+                block = {
+                    'type': 'reasoning',
+                    'text': '\n'.join(summary),
+                }
+                if 'encrypted_content' in item:
+                    block['provider_metadata'] = {
+                        'encrypted_content': item['encrypted_content'],
+                    }
+                blocks.append(block)
+            elif kind == 'function_call':
+                blocks.append({
+                    'type': 'tool_call',
+                    'id': item.get('call_id') or item['id'],
+                    'name': item['name'],
+                    'args': json.loads(item['arguments']),
                 })
-        if not text and isinstance(response_json.get('output_text'), str):
-            text.append(response_json['output_text'])
-        message = {'role': 'assistant', 'content': '\n'.join(part for part in text if part)}
-        if calls:
-            message['tool_calls'] = calls
-        if self.tool_mode == 'repl_execute':
-            message = normalize_openai_repl_response(message)
+            elif kind == 'input_file':
+                blocks.append(_attachment(
+                    item.get('media_type'),
+                    'provider_id',
+                    item['file_id'],
+                ))
+            elif kind in ('input_image', 'image_url'):
+                blocks.append(_attachment(
+                    item.get('media_type'),
+                    'url',
+                    item.get('image_url', item.get('url')),
+                ))
+            else:
+                raise NotImplementedError(
+                    f"Unknown Responses output type: {kind!r}"
+                )
+        if not blocks and isinstance(response_json.get('output_text'), str):
+            blocks.append({'type': 'text', 'text': response_json['output_text']})
         if usage := response_json.get('usage'):
             self.usage_tracker.log(self.model_name, usage)
             self._update_input_tokens_per_byte(self._current_input_bytes, usage)
         incomplete = response_json.get('incomplete_details') or {}
-        message['_stop_reason'] = incomplete.get('reason')
-        if message['_stop_reason'] is None:
-            message['_stop_reason'] = (
-                'tool_calls' if calls
+        stop_reason = incomplete.get('reason')
+        if stop_reason is None:
+            stop_reason = (
+                'tool_calls' if any(block['type'] == 'tool_call' for block in blocks)
                 else 'stop' if response_json.get('status') == 'completed'
                 else response_json.get('status')
             )
+        message = {
+            'role': 'assistant',
+            'content': blocks,
+            'provider_metadata': {'stop_reason': stop_reason},
+        }
+        if self.tool_mode == 'repl_execute':
+            message = repl_response_to_text(message)
         return message
 
     def _call_responses(self, messages, tools):
@@ -541,12 +1011,7 @@ class LLMClient:
     def _call_cursor(self, messages, tools):
         if self.tool_mode != "repl_execute":
             raise TypeError("Cursor transport requires tool_mode='repl_execute'")
-        prepared = []
-        for message in messages:
-            message = dict(message)
-            self._pop_media_attachments(message)
-            prepared.append(message)
-        messages = self._public_messages(prepared)
+        messages = self._completions_messages(messages)
         req = {
             "model": self.model_config["model"],
             "messages": messages,
@@ -557,12 +1022,16 @@ class LLMClient:
             self.model_config["api_key"],
             req,
         )
-        message, stop_reason, usage = _parse_completions_response(response_json)
-        message = normalize_openai_repl_response(message)
+        provider_message, stop_reason, usage = _parse_completions_response(response_json)
+        message = {
+            'role': 'assistant',
+            'content': _openai_compatible_message_to_transport_blocks(provider_message),
+            'provider_metadata': {'stop_reason': stop_reason},
+        }
+        message = repl_response_to_text(message)
         if usage:
             self.usage_tracker.log(self.model_name, usage)
             self._update_input_tokens_per_byte(self._current_input_bytes, usage)
-        message["_stop_reason"] = stop_reason
         return message
 
     def _call_codex(self, messages, tools):
@@ -579,36 +1048,59 @@ class LLMClient:
             messages: List of projected message dicts.
             tools: Optional tool specifications.
         """
-        # Anthropic Messages API-compatible format
-        prepared = []
-        for message in messages:
-            m = dict(message)
-            if media := self._pop_media_attachments(m):
-                m['content'] = [
-                    *([{"type": "text", "text": m['content']}] if m['content'] else []),
-                    *[{"type": "image", "source": {
-                        "type": "base64",
-                        "media_type": item["media_type"],
-                        "data": base64.b64encode(item["content"]).decode()
-                    }} for item in media]
-                ]
-            prepared.append(m)
-        messages = self._public_messages(prepared)
         system_message = None
-        _messages = []
-        for msg in messages:
-            if msg['role'] == 'system':
+        projected = []
+        for message in messages:
+            role = message['role']
+            blocks = message['content']
+            if role == 'system':
+                text = _text_only_content(blocks, 'Anthropic system')
                 if system_message is None:
-                    system_message = msg['content']
+                    system_message = text
                 else:
-                    _messages.append({**msg, 'role': 'user'})
-            elif msg['role'] == 'tool':
-                _messages.append({'role': 'user', 'content': msg.get('content', '')})
+                    projected.append({'role': 'user', 'content': text})
+                continue
+            content = []
+            if role == 'tool':
+                content.append({
+                    'type': 'tool_result',
+                    'tool_use_id': message['tool_call_id'],
+                    'content': _text_only_content(
+                        blocks, 'Anthropic tool result'
+                    ),
+                })
+                role = 'user'
             else:
-                _messages.append({k: v for k, v in msg.items() if k != 'tool_calls'})
+                for block in blocks:
+                    kind = block['type']
+                    if kind in ('text', 'commentary'):
+                        content.append({'type': 'text', 'text': block['text']})
+                    elif kind == 'reasoning':
+                        item = {
+                            'type': 'thinking',
+                            'thinking': block['text'],
+                        }
+                        metadata = block.get('provider_metadata') or {}
+                        if 'signature' in metadata:
+                            item['signature'] = metadata['signature']
+                        content.append(item)
+                    elif kind == 'tool_call':
+                        content.append({
+                            'type': 'tool_use',
+                            'id': block['id'],
+                            'name': block['name'],
+                            'input': block['args'],
+                        })
+                    elif kind == 'attachment':
+                        content.append(self._anthropic_attachment(block))
+                    else:
+                        raise NotImplementedError(
+                            f"Unknown transport content type: {kind!r}"
+                        )
+            projected.append({'role': role, 'content': content})
         req = {
             "model": self.model_config['model'],
-            "messages": _messages,
+            "messages": projected,
             "max_tokens": self.model_config.get('config', {}).get('max_tokens', 4096),
             **{k: v for k, v in self.model_config.get('config', {}).items() if k != 'max_tokens'}
         }
@@ -647,16 +1139,56 @@ class LLMClient:
             if usage := response_json.get('usage'):
                 self.usage_tracker.log(self.model_name, usage)
                 self._update_input_tokens_per_byte(self._current_input_bytes, usage)
-            text = [
-                block['text'] for block in response_json.get('content', [])
-                if block['type'] == 'text' and block.get('text')
-            ]
-            message = {
+            blocks = []
+            for block in response_json['content']:
+                kind = block['type']
+                if kind == 'text':
+                    blocks.append({'type': 'text', 'text': block['text']})
+                elif kind in ('thinking', 'reasoning'):
+                    reasoning = {'type': 'reasoning', 'text': block['thinking']}
+                    if 'signature' in block:
+                        reasoning['provider_metadata'] = {
+                            'signature': block['signature'],
+                        }
+                    blocks.append(reasoning)
+                elif kind == 'tool_use':
+                    blocks.append({
+                        'type': 'tool_call',
+                        'id': block['id'],
+                        'name': block['name'],
+                        'args': block['input'],
+                    })
+                elif kind == 'image':
+                    source = block['source']
+                    source_type = source['type']
+                    if source_type == 'base64':
+                        blocks.append(_attachment(
+                            source['media_type'],
+                            'bytes',
+                            base64.b64decode(source['data']),
+                        ))
+                    elif source_type == 'url':
+                        blocks.append(_attachment(
+                            source.get('media_type'),
+                            'url',
+                            source['url'],
+                        ))
+                    else:
+                        raise NotImplementedError(
+                            "Unknown Anthropic image source type: "
+                            f"{source_type!r}"
+                        )
+                else:
+                    raise NotImplementedError(
+                        f"Unknown Anthropic response content type: {kind!r}"
+                    )
+            return {
                 'role': 'assistant',
-                'content': '\n'.join(text)
+                'content': blocks,
+                'provider_metadata': {
+                    'stop_reason': response_json['stop_reason'],
+                },
             }
-            message['_stop_reason'] = response_json.get('stop_reason')
-            return message
         finally:
             conn.close()
 
@@ -670,36 +1202,63 @@ class LLMClient:
         """
         contents = []
         system_parts = []
-        for original in messages:
-            m = dict(original)
-            media = self._pop_media_attachments(m)
-            role = m['role']
+        for message in messages:
+            role = message['role']
+            blocks = message['content']
+            parts = []
             if role == 'system':
-                system_parts.append({"text": m['content']})
+                system_parts.extend(
+                    {'text': text}
+                    for text in [_text_only_content(
+                        blocks, 'Gemini system'
+                    )]
+                    if text
+                )
                 continue
             if role == 'tool':
-                contents.append({
-                    "role": "user",
-                    "parts": [{"text": m.get('content', '')}]
+                parts.append({
+                    'functionResponse': {
+                        'id': message['tool_call_id'],
+                        'name': message['name'],
+                        'response': {
+                            'output': _text_only_content(
+                                blocks, 'Gemini tool result'
+                            ),
+                        },
+                    },
                 })
-                continue
-            if role == 'assistant':
-                parts = []
-                if m.get('content'):
-                    parts.append({"text": m['content']})
-                contents.append({"role": "model", "parts": parts})
-                continue
-            # role == 'user'
-            parts = []
-            if m.get('content'):
-                parts.append({"text": m['content']})
-            for item in media:
-                parts.append({"inlineData": {
-                    "mimeType": item["media_type"],
-                    "data": base64.b64encode(item["content"]).decode()
-                }})
-            contents.append({"role": "user", "parts": parts})
-        # Merge consecutive same-role messages (required by Gemini API)
+                role = 'user'
+            else:
+                for block in blocks:
+                    kind = block['type']
+                    if kind in ('text', 'commentary'):
+                        parts.append({'text': block['text']})
+                    elif kind == 'reasoning':
+                        part = {'text': block['text'], 'thought': True}
+                        metadata = block.get('provider_metadata') or {}
+                        if 'thought_signature' in metadata:
+                            part['thoughtSignature'] = metadata[
+                                'thought_signature'
+                            ]
+                        parts.append(part)
+                    elif kind == 'tool_call':
+                        parts.append({
+                            'functionCall': {
+                                'id': block['id'],
+                                'name': block['name'],
+                                'args': block['args'],
+                            },
+                        })
+                    elif kind == 'attachment':
+                        parts.append(self._gemini_attachment(block))
+                    else:
+                        raise NotImplementedError(
+                            f"Unknown transport content type: {kind!r}"
+                        )
+            contents.append({
+                'role': 'model' if role == 'assistant' else 'user',
+                'parts': parts,
+            })
         merged = []
         for entry in contents:
             if merged and merged[-1]['role'] == entry['role']:
@@ -768,37 +1327,61 @@ class LLMClient:
             if not response_json.get('candidates'):
                 raise Exception(f"candidates missing from response: {response_json}")
             candidate = response_json['candidates'][0]
-            text = [
-                part.get('text') or json.dumps(part['functionCall'])
-                for part in candidate.get('content', {}).get('parts', [])
-                if part.get('text') or 'functionCall' in part
-            ]
-            message = {'role': 'assistant', 'content': '\n'.join(text)}
-            message['_stop_reason'] = candidate.get('finishReason')
-            return message
+            blocks = []
+            for part in candidate['content']['parts']:
+                if 'functionCall' in part:
+                    call = part['functionCall']
+                    blocks.append({
+                        'type': 'tool_call',
+                        'id': call['id'],
+                        'name': call['name'],
+                        'args': call['args'],
+                    })
+                elif 'inlineData' in part:
+                    inline = part['inlineData']
+                    blocks.append(_attachment(
+                        inline['mimeType'],
+                        'bytes',
+                        base64.b64decode(inline['data']),
+                    ))
+                elif 'fileData' in part:
+                    file_data = part['fileData']
+                    blocks.append(_attachment(
+                        file_data.get('mimeType'),
+                        'url',
+                        file_data['fileUri'],
+                    ))
+                elif part.get('thought'):
+                    block = {'type': 'reasoning', 'text': part['text']}
+                    if 'thoughtSignature' in part:
+                        block['provider_metadata'] = {
+                            'thought_signature': part['thoughtSignature'],
+                        }
+                    blocks.append(block)
+                elif 'text' in part:
+                    blocks.append({'type': 'text', 'text': part['text']})
+                else:
+                    raise NotImplementedError(
+                        "Unknown Gemini response part type: "
+                        f"{tuple(part)!r}"
+                    )
+            return {
+                'role': 'assistant',
+                'content': blocks,
+                'provider_metadata': {
+                    'stop_reason': candidate['finishReason'],
+                },
+            }
         finally:
             conn.close()
 
-    def prepare_message(self, m):
-        if m['role'] == 'tool':
-            return {
-                'role': 'user',
-                'content': f"{m.get('name', 'tool')}: {m.get('content', '')}",
-                **{k: v for k, v in m.items() if k in EXTRA_KEYS}
-            }
-        return {k: v for k, v in m.items() if k != 'tool_calls'}
-
-    @staticmethod
-    def _strip_tool_metadata(messages):
-        return [{k: v for k, v in msg.items() if k != 'tool_calls'} for msg in messages]
 
     def _call(self, messages, tools=None):
+        messages = legacy_to_transport_messages(messages)
         if self.tool_mode == "repl_execute":
-            messages = project_openai_repl_messages(messages)
+            messages = project_repl_tool_history(messages)
         else:
-            if not self.native:
-                messages = [self.prepare_message(msg) for msg in messages]
-            messages = self._strip_tool_metadata(messages)
+            messages = _apply_native_policy(messages, self.native)
         size_tools = [REPL_EXECUTE_TOOL] if self.tool_mode == "repl_execute" else tools
         self._validate_context_budget(self._input_bytes(messages, size_tools))
         api_type = self.model_config['api_type']
@@ -831,9 +1414,12 @@ class LLMClient:
                 else contextlib.nullcontext()
             )
             with context:
-                response = self._call(messages)
+                response = transport_to_legacy_message(self._call(messages))
                 content = response.get("content")
-                if not isinstance(content, str) or not content.strip():
+                if (
+                    not isinstance(content, str)
+                    or not content.strip() and not response.get("tool_calls")
+                ):
                     raise EmptyResponseError("LLM returned an empty response")
                 return response
         except (ContextOverflowError, ReplExecuteResponseError):

@@ -197,8 +197,11 @@ def test_cursor_client_adapter(monkeypatch):
     assert captured["body"]["model"] == "composer-2.5"
     assert captured["body"]["tools"] == [REPL_EXECUTE_TOOL]
     assert "timeout" not in captured["body"]
-    assert result["content"] == "emit('ok', release=True)"
-    assert result["_stop_reason"] == "tool_calls"
+    assert result["content"] == [{
+        "type": "text",
+        "text": "emit('ok', release=True)",
+    }]
+    assert result["provider_metadata"]["stop_reason"] == "tool_calls"
     assert client.usage_tracker.history[history_length:] == [(
         "cursor/composer-2.5",
         {

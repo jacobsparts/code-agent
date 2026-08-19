@@ -14,6 +14,7 @@ import pytest
 from code_agent import codex
 from code_agent.client import LLMClient
 from code_agent.repl_tool_adapter import REPL_EXECUTE_TOOL
+from code_agent.client import legacy_to_transport_messages, transport_to_legacy_message
 
 
 def _jwt(payload):
@@ -373,6 +374,45 @@ def test_headers_reuse_process_session_id(tmp_path):
     assert uuid.UUID(codex.SESSION_ID).version == 7
 
 
+def test_legacy_input_file_survives_responses_projection(monkeypatch):
+    config = {
+        "provider": "openai",
+        "model": "gpt-test",
+        "api_key": "key",
+        "api_type": "responses",
+        "tool_mode": None,
+        "tools": True,
+        "concurrency": 1,
+        "timeout": 20,
+        "config": {},
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("openai/gpt-test")
+
+    transport = legacy_to_transport_messages([{
+        "role": "user",
+        "content": [
+            {"type": "input_file", "file_id": "file_123"},
+            {"type": "text", "text": "Use this file."},
+        ],
+    }])
+    request = client._responses_request(transport, None)
+
+    assert transport[0]["content"] == [
+        {
+            "type": "attachment",
+            "media_type": None,
+            "data_type": "provider_id",
+            "data": "file_123",
+        },
+        {"type": "text", "text": "Use this file."},
+    ]
+    assert [block["type"] for block in request["input"][0]["content"]] == [
+        "input_file", "input_text",
+    ]
+    assert request["input"][0]["content"][0]["file_id"] == "file_123"
+
+
 def test_responses_request_adds_explicit_cache_breakpoints(monkeypatch):
     config = {
         "provider": "openai",
@@ -394,18 +434,26 @@ def test_responses_request_adds_explicit_cache_breakpoints(monkeypatch):
     request = client._responses_request([
         {
             "role": "system",
-            "content": "stable instructions",
+            "content": [{"type": "text", "text": "stable instructions"}],
             "_prompt_cache_breakpoint": True,
         },
         {
             "role": "user",
             "content": [
-                {"type": "input_file", "file_id": "file_123"},
+                {
+                    "type": "attachment",
+                    "media_type": None,
+                    "data_type": "provider_id",
+                    "data": "file_123",
+                },
                 {"type": "text", "text": "Answer the current question."},
             ],
             "_prompt_cache_breakpoint": True,
         },
-        {"role": "user", "content": "uncached"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "uncached"}],
+        },
     ], None)
 
     assert request["prompt_cache_key"] == "tenant:acme:knowledge-base-v1"
@@ -416,6 +464,7 @@ def test_responses_request_adds_explicit_cache_breakpoints(monkeypatch):
     assert request["input"][1]["content"][-1]["prompt_cache_breakpoint"] == {
         "mode": "explicit"
     }
+    assert request["input"][1]["content"][0]["type"] == "input_file"
     assert "prompt_cache_breakpoint" not in request["input"][1]["content"][0]
     assert "prompt_cache_breakpoint" not in request["input"][2]["content"][0]
 
@@ -449,6 +498,106 @@ def test_codex_strips_unsupported_prompt_cache_fields(monkeypatch, tmp_path):
     assert "prompt_cache_options" not in captured["body"]
     assert "prompt_cache_breakpoint" not in captured["body"]["input"][0]["content"][0]
     assert request_body["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+
+
+def test_responses_order_survives_to_lossy_legacy_boundary(monkeypatch):
+    config = {
+        "provider": "openai",
+        "model": "gpt-test",
+        "api_key": "key",
+        "api_type": "responses",
+        "tool_mode": None,
+        "tools": True,
+        "concurrency": 1,
+        "timeout": 20,
+        "config": {},
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("openai/gpt-test")
+
+    response = client._parse_responses_result({
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "first"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call",
+                "name": "read",
+                "arguments": '{"file_path": "app.py"}',
+            },
+            {
+                "type": "message",
+                "phase": "final",
+                "content": [{"type": "output_text", "text": "last"}],
+            },
+        ],
+    })
+
+    assert [block["type"] for block in response["content"]] == [
+        "commentary", "tool_call", "text",
+    ]
+    assert response["content"][1]["args"] == {"file_path": "app.py"}
+
+    legacy = transport_to_legacy_message(response)
+    assert legacy["content"].startswith("# first")
+    assert legacy["content"].endswith("last")
+    assert legacy["tool_calls"][0]["function"]["name"] == "read"
+
+
+
+def test_non_native_history_preserves_legacy_tool_policy(monkeypatch):
+    config = {
+        "provider": "codex",
+        "model": "gpt-test",
+        "api_key": None,
+        "api_type": "codex",
+        "tool_mode": None,
+        "tools": True,
+        "concurrency": 1,
+        "timeout": 20,
+        "config": {},
+    }
+    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
+    client = LLMClient("codex/gpt-test", native=False)
+    captured = {}
+
+    def call(messages, tools):
+        captured["messages"] = messages
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+        }
+
+    client._call_codex = call
+    client._call([
+        {
+            "role": "assistant",
+            "content": "working",
+            "tool_calls": [{
+                "id": "call",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "name": "read",
+            "tool_call_id": "call",
+            "content": "file contents",
+            "_private": "discard",
+        },
+    ])
+
+    assistant, result = captured["messages"]
+    assert assistant["content"] == [{"type": "text", "text": "working"}]
+    assert result == {
+        "role": "user",
+        "content": [{"type": "text", "text": "read: file contents"}],
+    }
 
 
 def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
@@ -488,7 +637,11 @@ def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
     }]
     assert "tools" not in captured["body"]
     assert "timeout" not in captured["kwargs"]
-    assert result == {"role": "assistant", "content": "hello", "_stop_reason": "stop"}
+    assert result == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "hello"}],
+        "provider_metadata": {"stop_reason": "stop"},
+    }
 
 
 def test_codex_client_adapter(monkeypatch, tmp_path):
@@ -535,8 +688,62 @@ def test_codex_client_adapter(monkeypatch, tmp_path):
         **REPL_EXECUTE_TOOL["function"],
     }]
     assert "timeout" not in captured["kwargs"]
-    assert result["content"] == "emit('ok', release=True)"
-    assert result["_stop_reason"] == "tool_calls"
+    assert result["content"] == [{
+        "type": "text",
+        "text": "emit('ok', release=True)",
+    }]
+    assert result["provider_metadata"]["stop_reason"] == "tool_calls"
+
+
+def test_chat_completions_stream_reassembles_tool_call_arguments():
+    from code_agent.streaming import reassemble_chat_completions_stream
+
+    events = [
+        {
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "repl_",
+                            "arguments": '{"code":"print',
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "name": "execute",
+                            "arguments": '(1)"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        },
+    ]
+    body = "".join(
+        f"data: {json.dumps(event)}\n\n" for event in events
+    ) + "data: [DONE]\n\n"
+
+    response = reassemble_chat_completions_stream(body)
+
+    assert response["choices"][0]["message"]["tool_calls"] == [{
+        "id": "call-1",
+        "type": "function",
+        "function": {
+            "name": "repl_execute",
+            "arguments": '{"code":"print(1)"}',
+        },
+    }]
 
 
 class _FakeHeaders(dict):

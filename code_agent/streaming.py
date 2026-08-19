@@ -37,6 +37,7 @@ def reassemble_chat_completions_stream(body):
         "role": "assistant",
         "content": "",
     }
+    tool_calls = {}
     saw_done = False
 
     saw_choice = False
@@ -61,6 +62,20 @@ def reassemble_chat_completions_stream(body):
                 message["role"] = delta["role"]
             if delta.get("content"):
                 message["content"] += delta["content"]
+            for call_delta in delta.get("tool_calls") or []:
+                index = call_delta["index"]
+                call = tool_calls.setdefault(index, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if call_delta.get("id") is not None:
+                    call["id"] = call_delta["id"]
+                function_delta = call_delta.get("function") or {}
+                if function_delta.get("name"):
+                    call["function"]["name"] += function_delta["name"]
+                if function_delta.get("arguments"):
+                    call["function"]["arguments"] += function_delta["arguments"]
             if choice.get("finish_reason") is not None:
                 finish_reason = choice["finish_reason"]
 
@@ -68,7 +83,10 @@ def reassemble_chat_completions_stream(body):
         raise StreamingProtocolError("No chat completion chunks found in streaming response.")
     if not saw_done:
         raise StreamingProtocolError("Streaming response ended before [DONE].")
-
+    if tool_calls:
+        message["tool_calls"] = [
+            tool_calls[index] for index in sorted(tool_calls)
+        ]
 
     return {
         "id": response_id,

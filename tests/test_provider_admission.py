@@ -137,10 +137,16 @@ def test_client_wraps_each_retry_with_admission(monkeypatch):
         events.append(f"call-{calls}")
         if calls == 1:
             raise RuntimeError("temporary")
-        return {"content": "ok"}
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+        }
 
     monkeypatch.setattr(client, "_call", call)
-    assert client.text_call([], retry=1) == {"content": "ok"}
+    assert client.text_call([], retry=1) == {
+        "role": "assistant",
+        "content": "ok",
+    }
     assert events == [
         "enter", "call-1", "exit", "backoff",
         "enter", "call-2", "exit",
