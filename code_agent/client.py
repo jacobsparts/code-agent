@@ -460,10 +460,19 @@ class LLMClient:
         calls = []
         for item in output:
             if item.get('type') == 'message':
-                text.extend(
-                    block['text'] for block in item.get('content', [])
+                msg_text = '\n'.join(
+                    block['text']
+                    for block in item.get('content', [])
                     if block.get('type') in ('output_text', 'text') and block.get('text')
                 )
+                phase = item.get('phase')
+                if phase not in (None, 'final'):
+                    if phase != 'commentary':
+                        sys.stderr.write(f"Warning: unrecognized Responses API message phase: {phase!r}\n")
+                    if msg_text:
+                        msg_text = '# ' + '\n# '.join(msg_text.split('\n'))
+                if msg_text:
+                    text.append(msg_text)
             elif item.get('type') == 'output_text' and item.get('text'):
                 text.append(item['text'])
             elif item.get('type') == 'function_call':
@@ -477,7 +486,7 @@ class LLMClient:
                 })
         if not text and isinstance(response_json.get('output_text'), str):
             text.append(response_json['output_text'])
-        message = {'role': 'assistant', 'content': ''.join(text)}
+        message = {'role': 'assistant', 'content': '\n'.join(part for part in text if part)}
         if calls:
             message['tool_calls'] = calls
         if self.tool_mode == 'repl_execute':
@@ -638,13 +647,13 @@ class LLMClient:
             if usage := response_json.get('usage'):
                 self.usage_tracker.log(self.model_name, usage)
                 self._update_input_tokens_per_byte(self._current_input_bytes, usage)
-            content = ""
-            for content_block in response_json.get('content', []):
-                if content_block['type'] == 'text':
-                    content += content_block['text']
+            text = [
+                block['text'] for block in response_json.get('content', [])
+                if block['type'] == 'text' and block.get('text')
+            ]
             message = {
                 'role': 'assistant',
-                'content': content
+                'content': '\n'.join(text)
             }
             message['_stop_reason'] = response_json.get('stop_reason')
             return message
@@ -759,13 +768,12 @@ class LLMClient:
             if not response_json.get('candidates'):
                 raise Exception(f"candidates missing from response: {response_json}")
             candidate = response_json['candidates'][0]
-            content = ""
-            for part in candidate.get('content', {}).get('parts', []):
-                if 'text' in part:
-                    content += part['text']
-                elif 'functionCall' in part:
-                    content += json.dumps(part['functionCall'])
-            message = {'role': 'assistant', 'content': content}
+            text = [
+                part.get('text') or json.dumps(part['functionCall'])
+                for part in candidate.get('content', {}).get('parts', [])
+                if part.get('text') or 'functionCall' in part
+            ]
+            message = {'role': 'assistant', 'content': '\n'.join(text)}
             message['_stop_reason'] = candidate.get('finishReason')
             return message
         finally:
