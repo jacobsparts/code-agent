@@ -25,8 +25,10 @@ class DummyClient:
     on_retry = None
 
     def call(self, messages, tools=None):
-        return {"role": "assistant", "content": "ok"}
-
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+        }
 
     def conversation(self, system):
         return Conversation(self, system)
@@ -208,7 +210,7 @@ def test_observe_rejects_empty_content():
 def test_observe_does_not_pin_or_release():
     agent = make_agent()
     assistant = {"role": "assistant", "content": "print('previous')"}
-    agent.conversation.messages.append(assistant)
+    agent.conversation.append_message(assistant)
     agent.complete = False
     agent._start_assistant_execution_attempt()
 
@@ -313,7 +315,7 @@ def test_live_ordinary_repl_output_gets_transition_association_without_stdout():
 
     agent.usermsg("ordinary output", _repl_output=True)
 
-    output = agent.conversation.messages[-1]
+    output = agent.conversation.stored_messages()[-1]
     assert "_stdout" not in output
     assert output["_render_segments"] == [
         {"type": "stdout", "content": "ordinary output"}
@@ -431,9 +433,13 @@ def test_run_loop_ordinary_output_without_stdout_has_first_checkpoint_marker():
         },
     ])
 
-    def text_call(messages):
+    def call(messages, **kwargs):
         calls.append(messages)
-        return next(responses)
+        response = next(responses)
+        return {
+            "role": response["role"],
+            "content": [{"type": "text", "text": response["content"]}],
+        }
 
     def execute(repl, content):
         if content.startswith("observe"):
@@ -445,10 +451,10 @@ def test_run_loop_ordinary_output_without_stdout_has_first_checkpoint_marker():
         text = ">>> emit('done', release=True)\ndone\n"
         return text, False, [ReplEvent(kind="output", text=text)], content
 
-    agent.llm_client.text_call = text_call
+    agent.conversation.llm_client.call = call
     event_seq = iter(range(1, 20))
-    agent._persist_message = lambda message: message.setdefault(
-        "_event_seq", next(event_seq)
+    agent._persist_message = lambda message: agent.conversation.update_message(
+        message, _event_seq=next(event_seq)
     )
     agent._ensure_setup = lambda: None
     agent._get_tool_repl = lambda: object()
@@ -459,16 +465,19 @@ def test_run_loop_ordinary_output_without_stdout_has_first_checkpoint_marker():
 
     assert agent.run_loop(max_turns=2) == "done"
 
-    ordinary_output = agent.conversation.messages[2]
+    ordinary_output = agent.conversation.stored_messages()[2]
     assert "_stdout" not in ordinary_output
     transition_seq = next(
         message["_event_seq"]
-        for message in agent.conversation.messages
+        for message in agent.conversation.stored_messages()
         if message.get("_observation_transition") is True
     )
     assert ordinary_output["_repl_output_for"] == transition_seq
     assert any(
-        message.get("content") == f"# Checkpoint {transition_seq}"
+        message.get("content") == [{
+            "type": "text",
+            "text": f"# Checkpoint {transition_seq}",
+        }]
         for message in calls[1]
     )
 
@@ -488,13 +497,15 @@ def test_new_execution_attempt_discards_uncommitted_observations():
 def test_pin_marks_previous_assistant_turn():
     agent = make_agent()
     assistant = {"role": "assistant", "content": "print('important')"}
-    agent.conversation.messages.append({"role": "user", "content": "Task", "_user_content": "Task"})
-    agent.conversation.messages.append(assistant)
+    agent.conversation.append_message({"role": "user", "content": "Task", "_user_content": "Task"})
+    agent.conversation.append_message(assistant)
 
     result = agent.pin()
 
     assert result == "Pinned previous turn for coalescing."
-    assert assistant["_pinned_coalesce"] == {"label": "Pinned previous turn"}
+    assert agent.conversation.stored_messages()[-1]["_pinned_coalesce"] == {
+        "label": "Pinned previous turn",
+    }
 
 
 def test_pin_no_previous_turn_is_noop():
@@ -509,7 +520,7 @@ def test_pin_can_target_previous_interaction_release_turn():
     agent = make_agent()
     old_assistant = {"role": "assistant", "content": "print('old')"}
     release_assistant = {"role": "assistant", "content": "emit('old done', release=True)"}
-    agent.conversation.messages.extend([
+    agent.conversation.extend_messages([
         {"role": "user", "content": "Old task", "_user_content": "Old task"},
         old_assistant,
         {"role": "user", "content": ">>> print('old')\nold\n"},
@@ -520,20 +531,21 @@ def test_pin_can_target_previous_interaction_release_turn():
     result = agent.pin()
 
     assert result == "Pinned previous turn for coalescing."
-    assert "_pinned_coalesce" not in old_assistant
-    assert release_assistant["_pinned_coalesce"] == {"label": "Pinned previous turn"}
+    messages = agent.conversation.stored_messages()
+    assert "_pinned_coalesce" not in messages[2]
+    assert messages[4]["_pinned_coalesce"] == {"label": "Pinned previous turn"}
 
 
 def test_pin_persists_metadata_event_for_existing_persisted_message(tmp_path):
     from code_agent.session_replay import replay_session_into_agent
 
     agent = make_persistent_agent(tmp_path)
-    agent.conversation.messages.extend([
+    agent.conversation.extend_messages([
         {"role": "user", "content": "Task", "_user_content": "Task"},
         {"role": "assistant", "content": "print('important')"},
     ])
-    assistant = agent.conversation.messages[-1]
-    agent._persist_message(agent.conversation.messages[-2])
+    agent._persist_message(agent.conversation.stored_messages()[-2])
+    assistant = agent.conversation.stored_messages()[-1]
     agent._persist_message(assistant)
 
     result = agent.pin()
@@ -554,7 +566,7 @@ def test_pin_persists_metadata_event_for_existing_persisted_message(tmp_path):
     replayed = ReplayAgent()
     replay_session_into_agent(replayed, agent._session_id, agent._session_store)
     replayed_assistant = next(
-        msg for msg in replayed.conversation.messages
+        msg for msg in replayed.conversation.stored_messages()
         if msg.get("role") == "assistant" and msg.get("content") == "print('important')"
     )
     assert replayed_assistant["_pinned_coalesce"] == {"label": "Pinned previous turn"}
@@ -582,7 +594,7 @@ def test_observations_survive_message_persistence_and_replay(tmp_path):
     replayed = ReplayAgent()
     replay_session_into_agent(replayed, agent._session_id, agent._session_store)
 
-    assert replayed.conversation.messages[-1]["_observations"] == ["  persisted\nreflection  "]
+    assert replayed.conversation.stored_messages()[-1]["_observations"] == ["  persisted\nreflection  "]
     events = agent._session_store.get_events(agent._session_id)
     assert [event["event_type"] for event in events] == ["message_added"]
 
@@ -878,15 +890,15 @@ def test_context_notices_are_ephemeral_and_do_not_mutate_messages():
     agent = make_agent()
     agent._configure_conversation(agent.conversation)
     agent.conversation.usermsg("request")
-    original = json.loads(json.dumps(agent.conversation.messages))
+    original = json.loads(json.dumps(agent.conversation.stored_messages()))
     agent._assistant_turns_since_observation = 5
 
-    first = agent.conversation._messages()
-    second = agent.conversation._messages()
+    first = agent.conversation.projected_messages()
+    second = agent.conversation.projected_messages()
 
     assert "No observation has been recorded" in first[-1]["content"]
     assert first == second
-    assert agent.conversation.messages == original
+    assert agent.conversation.stored_messages() == original
 
 
 def test_system_prompt_mentions_pin_and_context_pressure():
@@ -1005,8 +1017,8 @@ def test_replay_attachment_invalidated_removes_attachment_refs(tmp_path):
     agent = ReplayAgent()
     replay_session_into_agent(agent, session_id, store)
 
-    assert "_attachment_refs" not in agent.conversation.messages[1]
-    assert "_attachments" not in agent.conversation.messages[1]
+    assert "_attachment_refs" not in agent.conversation.stored_messages()[1]
+    assert "_attachments" not in agent.conversation.stored_messages()[1]
 
 
 
@@ -1182,7 +1194,7 @@ def test_view_detects_images_by_magic_bytes(
 
     agent._suspend_persistence = True
     agent.usermsg(llm_output, _user_content=llm_output)
-    projected = agent.conversation._messages()[-1]
+    projected = agent.conversation.projected_messages()[-1]
     assert expected in projected["content"]
     assert projected[MEDIA_ATTACHMENTS_FIELD] == [{
         "name": str(path),
@@ -1218,7 +1230,7 @@ def test_view_detects_audio_and_projects_attachment(tmp_path, data, media_type):
 
     agent._suspend_persistence = True
     agent.usermsg(llm_output, _user_content=llm_output)
-    assert agent.conversation._messages()[-1][MEDIA_ATTACHMENTS_FIELD] == [{
+    assert agent.conversation.projected_messages()[-1][MEDIA_ATTACHMENTS_FIELD] == [{
         "name": str(path),
         "media_type": media_type,
         "content": data,
@@ -1242,7 +1254,7 @@ class _RejectAudioClient:
 def test_attach_rejects_audio_before_mutating_existing_attachment(tmp_path):
     agent = make_persistent_agent(tmp_path)
     existing = TextAttachment("old")
-    agent.conversation.messages.append({
+    agent.conversation.append_message({
         "role": "user",
         "content": "[Attachment: clip.wav]",
         "_attachments": {"clip.wav": existing},
@@ -1252,7 +1264,7 @@ def test_attach_rejects_audio_before_mutating_existing_attachment(tmp_path):
     with pytest.raises(BadRequestError, match="does not support audio/wav"):
         agent.attach("clip.wav", _wav_bytes())
 
-    assert agent.conversation.messages[-1]["_attachments"]["clip.wav"] is existing
+    assert agent.conversation.stored_messages()[-1]["_attachments"]["clip.wav"] == existing
     assert "clip.wav" not in agent._pending_attachments
 
 
@@ -1272,7 +1284,7 @@ def test_view_rejects_audio_before_conversation_mutation(tmp_path):
     assert not getattr(agent, "_read_attachments", {})
     assert all(
         str(path) not in message.get("_attachments", {})
-        for message in agent.conversation.messages
+        for message in agent.conversation.stored_messages()
     )
 
 
@@ -1311,7 +1323,7 @@ def test_image_placeholder_parser_supports_commas_and_stable_media_order():
             "notes.txt": TextAttachment("rendered notes"),
         },
     )
-    projected = conversation._messages()[-1]
+    projected = conversation.projected_messages()[-1]
     assert projected["content"] == content
     assert [item["name"] for item in projected[MEDIA_ATTACHMENTS_FIELD]] == [
         second_name,
@@ -1331,7 +1343,7 @@ def test_text_and_image_attachments_materialize_differently():
         },
     )
 
-    projected = conversation._messages()[-1]
+    projected = conversation.projected_messages()[-1]
     assert projected["content"] == f"    1→hello\n{image_placeholder}"
     assert projected[MEDIA_ATTACHMENTS_FIELD][0]["content"] == image.content
 
@@ -1361,12 +1373,12 @@ def test_typed_image_attachment_persists_and_replays(tmp_path):
 
     replayed = ReplayAgent()
     replay_session_into_agent(replayed, agent._session_id, agent._session_store)
-    replayed_message = replayed.conversation.messages[-1]
+    replayed_message = replayed.conversation.stored_messages()[-1]
 
     assert replayed_message["content"] == placeholder
     assert replayed_message["_attachments"]["persisted.png"] == image
     assert replayed_message["_attachment_refs"]["persisted.png"] == image
-    projected = replayed.conversation._messages()[-1]
+    projected = replayed.conversation.projected_messages()[-1]
     assert projected[MEDIA_ATTACHMENTS_FIELD][0]["content"] == image.content
 
 
@@ -1455,13 +1467,13 @@ def test_view_reposition_attached_moves_to_newest_context(tmp_path):
     # Invalidation clears the old placement and commit adds one newest placement.
     placements = [
         (index, msg)
-        for index, msg in enumerate(agent.conversation.messages)
+        for index, msg in enumerate(agent.conversation.stored_messages())
         if file_path in (msg.get("_attachments") or {})
         or file_path in (msg.get("_attachment_refs") or {})
     ]
     assert len(placements) == 1
     index, message = placements[0]
-    assert index == len(agent.conversation.messages) - 1
+    assert index == len(agent.conversation.stored_messages()) - 1
     assert "print('move')" in message["_attachments"][file_path].content
 
 

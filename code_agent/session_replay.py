@@ -94,7 +94,7 @@ def _replay_session_into_target(agent, session_id: str, store):
         and type(event["payload"].get("target_seq")) is int
     }
     snapshot_seqs.add(0)
-    messages = [copy.deepcopy(agent.conversation.messages[0])]
+    messages = [agent.conversation.stored_messages()[0]]
     agent._expanded_preview_refs = {}
     if hasattr(agent, "_configure_conversation"):
         agent._configure_conversation(agent.conversation)
@@ -244,9 +244,9 @@ def _replay_session_into_target(agent, session_id: str, store):
                     final_missing.append((name, ref))
         if "_attachments" in msg and not msg["_attachments"]:
             del msg["_attachments"]
-    agent.conversation.messages = [
+    agent.conversation.replace_messages([
         normalize_message_attachments(message) for message in messages
-    ]
+    ])
     agent._persisted_preview_state = persisted_preview_state
     if hasattr(agent, "_reconstruct_observation_counters"):
         agent._reconstruct_observation_counters(messages)

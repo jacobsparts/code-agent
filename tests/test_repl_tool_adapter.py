@@ -1,11 +1,25 @@
 import pytest
 
-from code_agent.client import legacy_to_transport_messages
+from code_agent.client import LLMClient
+from code_agent.conversation import Conversation
 from code_agent.repl_tool_adapter import (
     ReplExecuteResponseError,
     project_repl_tool_history,
     repl_response_to_text,
 )
+
+
+def legacy_to_transport(messages):
+    client = object.__new__(LLMClient)
+    captured = {}
+
+    def call(projected, **kwargs):
+        captured["messages"] = projected
+        return {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+
+    client.call = call
+    Conversation(client, "").call(messages)
+    return captured["messages"]
 
 
 def text(value):
@@ -22,7 +36,7 @@ def repl_call(code):
 
 
 def test_legacy_assistant_projects_text_before_flat_tool_calls():
-    projected = legacy_to_transport_messages([{
+    projected = legacy_to_transport([{
         "role": "assistant",
         "content": "before tool",
         "tool_calls": [{
@@ -76,7 +90,7 @@ def test_transport_repl_response_requires_python_without_a_call():
 
 
 def project_legacy(messages):
-    return project_repl_tool_history(legacy_to_transport_messages(messages))
+    return project_repl_tool_history(legacy_to_transport(messages))
 
 
 def test_repl_history_uses_stable_synthetic_calls_and_results():

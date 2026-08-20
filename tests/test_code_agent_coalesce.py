@@ -1,3 +1,4 @@
+import copy
 import re
 
 import pytest
@@ -586,7 +587,16 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
 
     class Conversation:
         def __init__(self):
-            self.messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": "system"}]
+
+        def message(self, index):
+            return copy.deepcopy(self._messages[index])
+
+        def stored_messages(self):
+            return copy.deepcopy(self._messages)
+
+        def replace_messages(self, messages):
+            self._messages = copy.deepcopy(messages)
 
     class Agent:
         def __init__(self):
@@ -605,10 +615,10 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
     agent = Agent()
     replay_session_into_agent(agent, session_id, store)
     before_projection_events = store.get_events(session_id)
-    assert not any(m.get("_coalesced") for m in agent.conversation.messages)
+    assert not any(m.get("_coalesced") for m in agent.conversation.stored_messages())
 
     projected = coalesce_repl_messages(
-        agent.conversation.messages,
+        agent.conversation.stored_messages(),
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
         min_savings_chars=1,
@@ -621,7 +631,7 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
     replayed_agent = Agent()
     replay_session_into_agent(replayed_agent, session_id, store)
     projected_again = coalesce_repl_messages(
-        replayed_agent.conversation.messages,
+        replayed_agent.conversation.stored_messages(),
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
         min_savings_chars=1,
@@ -637,7 +647,16 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
 
     class Conversation:
         def __init__(self):
-            self.messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": "system"}]
+
+        def message(self, index):
+            return copy.deepcopy(self._messages[index])
+
+        def stored_messages(self):
+            return copy.deepcopy(self._messages)
+
+        def replace_messages(self, messages):
+            self._messages = copy.deepcopy(messages)
 
     class Agent:
         def __init__(self):
@@ -658,7 +677,7 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
     agent = Agent()
     replay_session_into_agent(agent, session_id, store)
     projected = coalesce_repl_messages(
-        agent.conversation.messages,
+        agent.conversation.stored_messages(),
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
         min_savings_chars=1,
@@ -676,7 +695,7 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
     assert resumed._expanded_preview_refs == {uri: {"numbered": True}}
 
     projected_after_resume = coalesce_repl_messages(
-        resumed.conversation.messages,
+        resumed.conversation.stored_messages(),
         keep_last_interactions=0,
         keep_last_execution_interactions=0,
         min_savings_chars=1,
@@ -732,7 +751,7 @@ def test_actual_expanded_preview_refs_include_replayed_expanded_state(tmp_path):
     agent._session_id = session_id
     agent._expanded_preview_refs = {uri: {"numbered": False}}
     agent._configure_conversation(agent.conversation)
-    agent.conversation.messages.append({
+    agent.conversation.append_message({
         "role": "user",
         "content": "[Assistant work and REPL output coalesced into preview]",
         "_synthetic": True,
@@ -754,7 +773,16 @@ def test_resume_replay_leaves_path_attachment_refs_for_code_agent_worker_materia
 
     class Conversation:
         def __init__(self):
-            self.messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": "system"}]
+
+        def message(self, index):
+            return copy.deepcopy(self._messages[index])
+
+        def stored_messages(self):
+            return copy.deepcopy(self._messages)
+
+        def replace_messages(self, messages):
+            self._messages = copy.deepcopy(messages)
 
     class Agent:
         def __init__(self):
@@ -781,8 +809,8 @@ def test_resume_replay_leaves_path_attachment_refs_for_code_agent_worker_materia
     missing = replay_session_into_agent(agent, session_id, store)
 
     assert missing == []
-    assert "_attachments" not in agent.conversation.messages[1]
-    assert agent.conversation.messages[1]["_attachment_refs"] == {"rel.py": "rel.py"}
+    assert "_attachments" not in agent.conversation.stored_messages()[1]
+    assert agent.conversation.stored_messages()[1]["_attachment_refs"] == {"rel.py": "rel.py"}
 
 
 
@@ -970,7 +998,16 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
 
     class Conversation:
         def __init__(self):
-            self.messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": "system"}]
+
+        def message(self, index):
+            return copy.deepcopy(self._messages[index])
+
+        def stored_messages(self):
+            return copy.deepcopy(self._messages)
+
+        def replace_messages(self, messages):
+            self._messages = copy.deepcopy(messages)
 
     class Agent:
         def __init__(self):
@@ -1005,10 +1042,10 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
     agent = Agent()
     replay_session_into_agent(agent, session_id, store)
 
-    assert any(m.get("_virtual_interaction_boundary") for m in agent.conversation.messages)
+    assert any(m.get("_virtual_interaction_boundary") for m in agent.conversation.stored_messages())
 
     projected = coalesce_repl_messages(
-        agent.conversation.messages,
+        agent.conversation.stored_messages(),
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
         min_savings_chars=1,
@@ -1657,7 +1694,7 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
     agent._pending_session_events = []
     agent._suspend_persistence = False
     agent._conversation = Conversation(Client(), "system")
-    agent.conversation.messages.extend([
+    agent.conversation.extend_messages([
         {"role": "assistant", "content": "one", "_event_seq": 1},
         {"role": "assistant", "content": "two", "_event_seq": 2},
     ])
@@ -1671,10 +1708,10 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
     assert created_seq == 3
     assert agent._next_event_seq == 5
     assert agent._persisted_preview_state.active_placements == {(1, 1): 3}
-    assert agent.conversation.messages[1]["_preview_event_seq"] == 3
-    assert f"session://preview/{key}" in agent.conversation.messages[1]["content"]
+    assert agent.conversation.stored_messages()[1]["_preview_event_seq"] == 3
+    assert f"session://preview/{key}" in agent.conversation.stored_messages()[1]["content"]
 
-    before_messages = list(agent.conversation.messages)
+    before_messages = list(agent.conversation.stored_messages())
     before_state = dict(agent._persisted_preview_state.active_placements)
     before_events = store.get_events(session_id)
     agent._next_event_seq = 3
@@ -1682,7 +1719,7 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
         agent.create_persisted_preview(
             Preview("second"), source_start_seq=2, source_end_seq=2,
         )
-    assert agent.conversation.messages == before_messages
+    assert agent.conversation.stored_messages() == before_messages
     assert agent._persisted_preview_state.active_placements == before_state
     assert store.get_events(session_id) == before_events
 
@@ -1728,7 +1765,7 @@ def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_
     before_events = store.get_events(session_id)
     agent._coalesce_context(protect_last_interactions=False)
 
-    persisted = [message for message in agent.conversation.messages if message.get("_persisted_preview")]
+    persisted = [message for message in agent.conversation.stored_messages() if message.get("_persisted_preview")]
     assert len(persisted) == 1
     assert persisted[0]["_source_start_seq"] == 2
     assert persisted[0]["_source_end_seq"] == 3
@@ -1858,7 +1895,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
 
     replay_session_into_agent(agent, session_id, store)
     assert agent._persisted_preview_state.exec_start_seq == 0
-    assert agent.conversation.messages == [
+    assert agent.conversation.stored_messages() == [
         {"role": "system", "content": "system"},
         {"role": "assistant", "content": "pre-exec", "_event_seq": 1},
     ]
@@ -1869,7 +1906,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
         source_end_seq=1,
     )
     assert created_seq == 5
-    live_messages = agent.conversation.messages
+    live_messages = agent.conversation.stored_messages()
     live_state = agent._persisted_preview_state
 
     resumed = CodeAgentBase.__new__(CodeAgentBase)
@@ -1877,12 +1914,12 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     resumed._expanded_preview_refs = {}
     replay_session_into_agent(resumed, session_id, store)
 
-    assert resumed.conversation.messages == live_messages
+    assert resumed.conversation.stored_messages() == live_messages
     assert resumed._persisted_preview_state == live_state
     assert resumed._persisted_preview_state.exec_start_seq == 0
     assert resumed._persisted_preview_state.active_placements == {(1, 1): 5}
-    assert resumed.conversation.messages[1]["_preview_event_seq"] == 5
-    assert f"session://preview/{key}" in resumed.conversation.messages[1]["content"]
+    assert resumed.conversation.stored_messages()[1]["_preview_event_seq"] == 5
+    assert f"session://preview/{key}" in resumed.conversation.stored_messages()[1]["content"]
 
     before = store.get_events(session_id)
     with pytest.raises(Exception):

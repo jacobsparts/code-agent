@@ -96,7 +96,7 @@ from .provider_admission import ProviderAdmission
 
 from .utils import UsageTracker
 from .llm_registry import get_model_config
-from .conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
+from .conversation import Conversation
 from . import codex, cursor
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, repl_response_to_text, project_repl_tool_history
@@ -142,7 +142,6 @@ def _parse_completions_response(response_json):
     return choice['message'], choice.get('finish_reason'), response_json.get('usage')
 
 
-# Transitional compatibility projections. Remove with the legacy Conversation shape.
 def _attachment(media_type, data_type, data):
     return {
         'type': 'attachment',
@@ -150,85 +149,6 @@ def _attachment(media_type, data_type, data):
         'data_type': data_type,
         'data': data,
     }
-
-
-def _legacy_content_block(block):
-    kind = block['type']
-    if kind in ('text', 'input_text', 'output_text'):
-        return {'type': 'text', 'text': block['text']}
-    if kind == 'input_file':
-        return _attachment(
-            block.get('media_type'),
-            'provider_id',
-            block['file_id'],
-        )
-    if kind == 'image_url':
-        image_url = block['image_url']
-        return _attachment(
-            block.get('media_type'),
-            'url',
-            image_url['url'] if isinstance(image_url, dict) else image_url,
-        )
-    if kind == 'input_audio':
-        audio = block['input_audio']
-        media_type = {
-            'wav': 'audio/wav',
-            'mp3': 'audio/mpeg',
-        }.get(audio['format'])
-        if media_type is None:
-            raise NotImplementedError(
-                f"Unknown input_audio format: {audio['format']!r}"
-            )
-        return _attachment(
-            media_type,
-            'bytes',
-            base64.b64decode(audio['data']),
-        )
-    raise NotImplementedError(f"Unknown legacy content type: {kind!r}")
-
-
-def legacy_to_transport_messages(messages):
-    projected = []
-    for message in messages:
-        blocks = []
-        content = message['content']
-        if isinstance(content, str):
-            if content:
-                blocks.append({'type': 'text', 'text': content})
-        elif content is not None:
-            blocks.extend(_legacy_content_block(block) for block in content)
-        for item in message.get(MEDIA_ATTACHMENTS_FIELD) or []:
-            if not isinstance(item, dict):
-                raise BadRequestError("Invalid projected media attachment")
-            data = item.get('content')
-            if not isinstance(data, bytes):
-                raise BadRequestError(
-                    "Projected media attachment has no binary content"
-                )
-            blocks.append(_attachment(item.get('media_type'), 'bytes', data))
-        if message['role'] == 'assistant':
-            for call in message.get('tool_calls') or []:
-                function = call['function']
-                blocks.append({
-                    'type': 'tool_call',
-                    'id': call['id'],
-                    'name': function['name'],
-                    'args': json.loads(function['arguments']),
-                })
-        projected_message = {
-            'role': message['role'],
-            'content': blocks,
-        }
-        for key in ('tool_call_id', 'name'):
-            if key in message:
-                projected_message[key] = message[key]
-        projected_message.update({
-            key: value
-            for key, value in message.items()
-            if key.startswith('_') and key != MEDIA_ATTACHMENTS_FIELD
-        })
-        projected.append(projected_message)
-    return projected
 
 
 def _text_only_content(blocks, context):
@@ -276,42 +196,6 @@ def _apply_native_policy(messages, native):
     return projected
 
 
-def transport_to_legacy_message(message):
-    text = []
-    calls = []
-    for block in message['content']:
-        if block['type'] == 'text':
-            text.append(block['text'])
-        elif block['type'] == 'commentary':
-            text.append('# ' + '\n# '.join(block['text'].split('\n')))
-        elif block['type'] == 'tool_call':
-            calls.append({
-                'id': block['id'],
-                'type': 'function',
-                'function': {
-                    'name': block['name'],
-                    'arguments': json.dumps(block['args']),
-                },
-            })
-        elif block['type'] == 'reasoning':
-            continue
-        elif block['type'] == 'attachment':
-            raise NotImplementedError(
-                "Legacy Conversation cannot store attachment responses"
-            )
-        else:
-            raise NotImplementedError(
-                f"Unknown transport content type: {block['type']!r}"
-            )
-    result = {'role': 'assistant', 'content': '\n'.join(text)}
-    if calls:
-        result['tool_calls'] = calls
-    metadata = message.get('provider_metadata')
-    if metadata and 'stop_reason' in metadata:
-        result['_stop_reason'] = metadata['stop_reason']
-    return result
-
-
 def _openai_compatible_message_to_transport_blocks(message):
     content = message['content']
     if isinstance(content, str):
@@ -324,8 +208,28 @@ def _openai_compatible_message_to_transport_blocks(message):
             kind = block['type']
             if kind in ('text', 'commentary', 'reasoning'):
                 blocks.append({'type': kind, 'text': block['text']})
-            elif kind in ('image_url', 'input_audio'):
-                blocks.append(_legacy_content_block(block))
+            elif kind == 'image_url':
+                image_url = block['image_url']
+                blocks.append(_attachment(
+                    block.get('media_type'),
+                    'url',
+                    image_url['url'] if isinstance(image_url, dict) else image_url,
+                ))
+            elif kind == 'input_audio':
+                audio = block['input_audio']
+                media_type = {
+                    'wav': 'audio/wav',
+                    'mp3': 'audio/mpeg',
+                }.get(audio['format'])
+                if media_type is None:
+                    raise NotImplementedError(
+                        f"Unknown input_audio format: {audio['format']!r}"
+                    )
+                blocks.append(_attachment(
+                    media_type,
+                    'bytes',
+                    base64.b64decode(audio['data']),
+                ))
             else:
                 raise NotImplementedError(
                     f"Unknown OpenAI-compatible response content type: {kind!r}"
@@ -1377,7 +1281,6 @@ class LLMClient:
 
 
     def _call(self, messages, tools=None):
-        messages = legacy_to_transport_messages(messages)
         if self.tool_mode == "repl_execute":
             messages = project_repl_tool_history(messages)
         else:
@@ -1406,7 +1309,7 @@ class LLMClient:
         """
         time.sleep(base * (2 ** attempt))
 
-    def text_call(self, messages, retry=3, attempt=0):
+    def call(self, messages, retry=3, attempt=0):
         try:
             context = (
                 self.provider_admission.admitted()
@@ -1414,22 +1317,15 @@ class LLMClient:
                 else contextlib.nullcontext()
             )
             with context:
-                response = transport_to_legacy_message(self._call(messages))
-                content = response.get("content")
-                if (
-                    not isinstance(content, str)
-                    or not content.strip() and not response.get("tool_calls")
-                ):
-                    raise EmptyResponseError("LLM returned an empty response")
-                return response
+                return self._call(messages)
         except (ContextOverflowError, ReplExecuteResponseError):
             raise
         except Exception as e:
             err = (str(e) if len(str(e)) < 1000 else str(e)[:1000]+'...').replace("\n"," ")
-            logger.error(f"text_call {type(e).__name__}: {err}", exc_info=True)
+            logger.error(f"call {type(e).__name__}: {err}", exc_info=True)
             if retry:
                 self._sleep_backoff(attempt)
-                return self.text_call(messages, retry-1, attempt+1)
+                return self.call(messages, retry-1, attempt+1)
             raise
 
 

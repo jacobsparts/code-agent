@@ -13,8 +13,27 @@ import pytest
 
 from code_agent import codex
 from code_agent.client import LLMClient
+from code_agent.conversation import Conversation
 from code_agent.repl_tool_adapter import REPL_EXECUTE_TOOL
-from code_agent.client import legacy_to_transport_messages, transport_to_legacy_message
+
+
+def _legacy_to_transport(messages):
+    client = object.__new__(LLMClient)
+    captured = {}
+
+    def call(projected, **kwargs):
+        captured["messages"] = projected
+        return {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+
+    client.call = call
+    Conversation(client, "").call(messages)
+    return captured["messages"]
+
+
+def _transport_to_legacy(message):
+    client = object.__new__(LLMClient)
+    client.call = lambda messages, **kwargs: message
+    return Conversation(client, "").call([])
 
 
 def _jwt(payload):
@@ -389,7 +408,7 @@ def test_legacy_input_file_survives_responses_projection(monkeypatch):
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     client = LLMClient("openai/gpt-test")
 
-    transport = legacy_to_transport_messages([{
+    transport = _legacy_to_transport([{
         "role": "user",
         "content": [
             {"type": "input_file", "file_id": "file_123"},
@@ -542,7 +561,7 @@ def test_responses_order_survives_to_lossy_legacy_boundary(monkeypatch):
     ]
     assert response["content"][1]["args"] == {"file_path": "app.py"}
 
-    legacy = transport_to_legacy_message(response)
+    legacy = _transport_to_legacy(response)
     assert legacy["content"].startswith("# first")
     assert legacy["content"].endswith("last")
     assert legacy["tool_calls"][0]["function"]["name"] == "read"
@@ -573,7 +592,7 @@ def test_non_native_history_preserves_legacy_tool_policy(monkeypatch):
         }
 
     client._call_codex = call
-    client._call([
+    Conversation(client, "").call([
         {
             "role": "assistant",
             "content": "working",
@@ -630,7 +649,7 @@ def test_codex_client_adapter_without_repl_tool_mode(monkeypatch):
 
     monkeypatch.setattr(codex, "responses", complete)
     client = LLMClient("codex/gpt-5.6-luna")
-    result = client._call([{"role": "user", "content": "hello"}])
+    result = client._call([{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
     assert captured["body"]["input"] == [{
         "role": "user",
         "content": [{"type": "input_text", "text": "hello"}],
@@ -681,7 +700,7 @@ def test_codex_client_adapter(monkeypatch, tmp_path):
 
     monkeypatch.setattr(codex, "responses", complete)
     client = LLMClient("codex/gpt-5.6-luna-xhigh")
-    result = client._call([{"role": "user", "content": "hello"}])
+    result = client._call([{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
     assert captured["body"]["model"] == "gpt-5.6-luna"
     assert captured["body"]["tools"] == [{
         "type": "function",

@@ -121,7 +121,7 @@ def test_replay_session_into_agent_exec_resets_messages_and_preview_refs():
     agent = Agent()
     replay_session_into_agent(agent, "sid", store)
 
-    assert agent.conversation.messages == [
+    assert agent.conversation.stored_messages() == [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "continuation", "_event_seq": 5},
     ]
@@ -841,9 +841,9 @@ def test_persisted_preview_replay_does_not_load_blob_content(tmp_path, monkeypat
     agent = _replay_agent()
     replay_session_into_agent(agent, session_id, store)
 
-    assert len(agent.conversation.messages) == 2
-    assert "[PreviewRef: session://preview/abc]\nsummary\n[/PreviewRef]" in agent.conversation.messages[1]["content"]
-    assert agent.conversation.messages[1]["_persisted_preview"] is True
+    assert len(agent.conversation.stored_messages()) == 2
+    assert "[PreviewRef: session://preview/abc]\nsummary\n[/PreviewRef]" in agent.conversation.stored_messages()[1]["content"]
+    assert agent.conversation.stored_messages()[1]["_persisted_preview"] is True
 
 
 def test_persisted_preview_replay_recursive_rewind_and_inactive_definition(tmp_path):
@@ -869,7 +869,7 @@ def test_persisted_preview_replay_recursive_rewind_and_inactive_definition(tmp_p
     agent = _replay_agent()
     replay_session_into_agent(agent, session_id, store)
 
-    visible = "\n".join(message.get("content", "") for message in agent.conversation.messages)
+    visible = "\n".join(message.get("content", "") for message in agent.conversation.stored_messages())
     assert "session://preview/child" in visible
     assert "session://preview/parent" not in visible
 
@@ -898,7 +898,7 @@ def test_persisted_preview_replay_rejects_malformed_missing_partial_and_cross_ex
     agent = _replay_agent()
     replay_session_into_agent(agent, session_id, store)
 
-    assert agent.conversation.messages == [
+    assert agent.conversation.stored_messages() == [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "new", "_event_seq": 3},
     ]
@@ -925,7 +925,7 @@ def test_rewind_restores_preview_expansion_and_rendered_conversation(tmp_path):
 
     assert agent._expanded_preview_refs == {uri: {"numbered": False}}
     agent.conversation.preview_loader = lambda value: store.get_preview_blob(session_id, value.rsplit("/", 1)[1])
-    assert "expanded body" in agent.conversation._messages()[1]["content"]
+    assert "expanded body" in agent.conversation.projected_messages()[1]["content"]
 
 
 def test_rewind_restores_collapsed_state_after_later_expand(tmp_path):
@@ -948,7 +948,7 @@ def test_rewind_restores_collapsed_state_after_later_expand(tmp_path):
     replay_session_into_agent(agent, session_id, store)
 
     assert agent._expanded_preview_refs == {}
-    assert "expanded body" not in agent.conversation._messages()[1]["content"]
+    assert "expanded body" not in agent.conversation.projected_messages()[1]["content"]
 
 
 def test_replay_duplicate_is_idempotent_and_same_range_conflict_is_skipped(tmp_path):
@@ -972,7 +972,7 @@ def test_replay_duplicate_is_idempotent_and_same_range_conflict_is_skipped(tmp_p
     agent = _replay_agent()
     replay_session_into_agent(agent, session_id, store)
 
-    visible = agent.conversation.messages[1]["content"]
+    visible = agent.conversation.stored_messages()[1]["content"]
     assert "session://preview/a" in visible
     assert "session://preview/b" not in visible
     assert agent._persisted_preview_state.active_placements == {(1, 1): 2}
@@ -1001,21 +1001,21 @@ def test_create_resume_expand_fork_resume_end_to_end(tmp_path):
     resumed = _replay_agent()
     replay_session_into_agent(resumed, session_id, store)
     uri = f"session://preview/{key}"
-    assert uri in resumed.conversation.messages[1]["content"]
+    assert uri in resumed.conversation.stored_messages()[1]["content"]
     assert store.get_preview_blob(session_id, key) == "body"
 
     store.append_event(session_id, 4, "preview_expanded", {"uri": uri, "numbered": False})
     expanded = _replay_agent()
     replay_session_into_agent(expanded, session_id, store)
     expanded.conversation.preview_loader = lambda value: store.get_preview_blob(session_id, value.rsplit("/", 1)[1])
-    assert "body" in expanded.conversation._messages()[1]["content"]
+    assert "body" in expanded.conversation.projected_messages()[1]["content"]
 
     forked_id = store.fork_session(session_id)
     forked = _replay_agent()
     replay_session_into_agent(forked, forked_id, store)
     forked.conversation.preview_loader = lambda value: store.get_preview_blob(forked_id, value.rsplit("/", 1)[1])
-    assert uri in forked.conversation.messages[1]["content"]
-    assert "body" in forked.conversation._messages()[1]["content"]
+    assert uri in forked.conversation.stored_messages()[1]["content"]
+    assert "body" in forked.conversation.projected_messages()[1]["content"]
 
 
 def test_adversarial_history_shared_authoritative_state_matches_replay_and_allows_creation(tmp_path):
@@ -1110,5 +1110,5 @@ def test_adversarial_history_shared_authoritative_state_matches_replay_and_allow
     resumed._expanded_preview_refs = {}
     replay_session_into_agent(resumed, session_id, store)
     assert resumed._persisted_preview_state == agent._persisted_preview_state
-    assert resumed.conversation.messages == agent.conversation.messages
-    assert f"session://preview/{key}" in resumed.conversation.messages[-1]["content"]
+    assert resumed.conversation.stored_messages() == agent.conversation.stored_messages()
+    assert f"session://preview/{key}" in resumed.conversation.stored_messages()[-1]["content"]

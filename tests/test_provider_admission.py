@@ -143,9 +143,9 @@ def test_client_wraps_each_retry_with_admission(monkeypatch):
         }
 
     monkeypatch.setattr(client, "_call", call)
-    assert client.text_call([], retry=1) == {
+    assert client.call([], retry=1) == {
         "role": "assistant",
-        "content": "ok",
+        "content": [{"type": "text", "text": "ok"}],
     }
     assert events == [
         "enter", "call-1", "exit", "backoff",

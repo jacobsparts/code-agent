@@ -165,12 +165,12 @@ def test_conversation_labels_active_turn_on_first_call_without_mutation():
     message = input_message("active")
     message["_event_seq"] = 23
     message["_render_segments"][0]["_event_seq"] = 23
-    conversation.messages.append(message)
+    conversation.append_message(message)
     conversation.message_projector = render_turn_labels
 
-    assert conversation._messages()[-1]["content"] == "# Turn 23\n\nactive"
-    assert conversation.messages[-1]["content"] == "active"
-    assert conversation._messages()[-1]["content"] == "# Turn 23\n\nactive"
+    assert conversation.projected_messages()[-1]["content"] == "# Turn 23\n\nactive"
+    assert conversation.stored_messages()[-1]["content"] == "active"
+    assert conversation.projected_messages()[-1]["content"] == "# Turn 23\n\nactive"
 
 def test_transition_marker_is_provider_only_exactly_once_on_first_following_call():
     conversation = Conversation(None, "system")
@@ -184,17 +184,17 @@ def test_transition_marker_is_provider_only_exactly_once_on_first_following_call
     output["_event_seq"] = 8
     output["_repl_output_for"] = 7
     task = {"role": "user", "content": "task", "_event_seq": 1}
-    conversation.messages.extend([task, transition, output])
+    conversation.extend_messages([task, transition, output])
     conversation.messages_projector = render_semantic_labels
-    original = copy.deepcopy(conversation.messages)
+    original = copy.deepcopy(conversation.stored_messages())
 
-    first = conversation._messages()
-    second = conversation._messages()
+    first = conversation.projected_messages()
+    second = conversation.projected_messages()
 
     assert [message["content"] for message in first].count("# Checkpoint 7") == 1
     assert first[-1]["content"] == "# Checkpoint 7"
     assert second == first
-    assert conversation.messages == original
+    assert conversation.stored_messages() == original
 
 
 def test_malformed_transition_metadata_does_not_create_marker_or_segment():
@@ -379,7 +379,7 @@ def test_duplicate_and_colliding_transition_identity_is_non_authoritative():
 
 def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
     conversation = Conversation(None, "system")
-    conversation.messages.extend([
+    conversation.extend_messages([
         {"role": "user", "content": "task", "_event_seq": 1},
         {
             "role": "assistant",
@@ -401,15 +401,15 @@ def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
     ])
     conversation.messages_projector = render_semantic_labels
     conversation.ephemeral = "EPHEMERAL CONTEXT"
-    original = copy.deepcopy(conversation.messages)
+    original = copy.deepcopy(conversation.stored_messages())
 
-    rendered = conversation._messages()
+    rendered = conversation.projected_messages()
 
     assert rendered[-1]["content"] == "# Checkpoint 2"
     assert rendered[-2]["content"].startswith("EPHEMERAL CONTEXT\n\n")
     assert "body" in rendered[-2]["content"]
     assert "[PreviewRef: session://preview/child]" in rendered[-2]["content"]
-    assert conversation.messages == original
+    assert conversation.stored_messages() == original
 
 
 def test_completed_turn_ranges_use_release_output_or_release_assistant():
@@ -1054,22 +1054,22 @@ def test_replay_materializes_attachments_then_coalesces_with_valid_identity(tmp_
 
     agent = ReplayAgent()
     replay_session_into_agent(agent, session_id, store)
-    agent.conversation.messages = coalesce_repl_messages(
-        agent.conversation.messages,
+    agent.conversation.replace_messages(coalesce_repl_messages(
+        agent.conversation.stored_messages(),
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
         min_savings_chars=0,
-    )
+    ))
     eligible = eligible_rollup_units(
         store.get_events(session_id),
-        agent.conversation.messages,
+        agent.conversation.stored_messages(),
         PersistedPreviewState.empty(),
     )
 
     assert eligible and eligible[0].turn_ids == (ids[0],)
     node = next(
         message
-        for message in agent.conversation.messages
+        for message in agent.conversation.stored_messages()
         if message.get("_coalesced")
     )
     assert "notes.txt" in node["_attachments"]
@@ -1152,18 +1152,18 @@ def test_replay_message_pinned_sections_remain_eligible(tmp_path):
         )
     agent = ReplayAgent()
     replay_session_into_agent(agent, session_id, store)
-    agent.conversation.messages = coalesce_repl_messages(
-        agent.conversation.messages,
+    agent.conversation.replace_messages(coalesce_repl_messages(
+        agent.conversation.stored_messages(),
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
         min_savings_chars=0,
-    )
+    ))
 
     assert any(
         unit.turn_ids == (ids[0],)
         for unit in eligible_rollup_units(
             store.get_events(session_id),
-            agent.conversation.messages,
+            agent.conversation.stored_messages(),
             PersistedPreviewState.empty(),
         )
     )
@@ -1222,7 +1222,7 @@ def test_attachment_invalidation_reducer_and_replay_equivalence(tmp_path):
 
     agent = ReplayAgent()
     replay_session_into_agent(agent, session_id, store)
-    replayed = agent.conversation.messages[1]
+    replayed = agent.conversation.stored_messages()[1]
     assert replayed["_attachment_refs"] == reduced[0]["_attachment_refs"]
     assert set(replayed["_attachments"]) == set(reduced[0]["_attachments"])
     assert "stale.txt" not in replayed.get("_attachments", {})
@@ -1286,7 +1286,7 @@ def test_attachment_invalidation_rewind_snapshots(tmp_path):
             )
         agent = ReplayAgent()
         replay_session_into_agent(agent, session_id, store)
-        replayed = agent.conversation.messages[1]
+        replayed = agent.conversation.stored_messages()[1]
         assert ("a.txt" in replayed.get("_attachment_refs", {})) is expected_present
         assert ("a.txt" in replayed.get("_attachments", {})) is expected_present
 
@@ -1325,7 +1325,7 @@ def test_attachment_invalidation_resume_and_fork_reconstruction(tmp_path):
     for replay_id in [session_id, store.fork_session(session_id)]:
         agent = ReplayAgent()
         replay_session_into_agent(agent, replay_id, store)
-        message = agent.conversation.messages[1]
+        message = agent.conversation.stored_messages()[1]
         assert "_attachment_refs" not in message
         assert "_attachments" not in message
 
@@ -1388,7 +1388,7 @@ def test_malformed_attachment_invalidation_is_conservative_and_equivalent(tmp_pa
         )
     agent = ReplayAgent()
     replay_session_into_agent(agent, session_id, store)
-    replayed = agent.conversation.messages[1]
+    replayed = agent.conversation.stored_messages()[1]
     assert replayed["_attachment_refs"] == message["_attachment_refs"]
     assert "a.txt" in replayed["_attachments"]
 
@@ -1473,7 +1473,7 @@ def test_malformed_event_snapshots_match_reducer_replay_resume_and_fork(tmp_path
     for replay_id in [session_id, store.fork_session(session_id)]:
         agent = ReplayAgent()
         replay_session_into_agent(agent, replay_id, store)
-        replayed = agent.conversation.messages[1]
+        replayed = agent.conversation.stored_messages()[1]
         assert replayed["_attachment_refs"] == {
             "a.txt": "session://preview/a"
         }
@@ -1530,7 +1530,7 @@ def test_malformed_events_preserve_exec_boundary_and_targetable_snapshots(tmp_pa
     replay_session_into_agent(agent, session_id, store)
     assert [
         message["_event_seq"]
-        for message in agent.conversation.messages
+        for message in agent.conversation.stored_messages()
         if message.get("_event_seq") is not None
     ] == [3]
 
@@ -1641,7 +1641,7 @@ def test_persisted_child_identity_validation_and_nested_outer_atomicity():
 
 def test_ephemeral_provider_adds_exactly_one_line_and_preserves_existing_context():
     conversation = Conversation(None, "system")
-    conversation.messages.append({"role": "user", "content": "request"})
+    conversation.append_message({"role": "user", "content": "request"})
     conversation.ephemeral = (
         "Current attached context:\n"
         "- file: file.py\n"
@@ -1654,7 +1654,7 @@ def test_ephemeral_provider_adds_exactly_one_line_and_preserves_existing_context
         "Detach attachments or expanded previews that are no longer needed with unview(...)."
     )
 
-    content = conversation._messages()[-1]["content"]
+    content = conversation.projected_messages()[-1]["content"]
     assert content.count("Eligible rollup turns:") == 1
     assert "Current attached context:" in content
     assert "Context usage is 82%." in content
@@ -1697,7 +1697,7 @@ def test_code_agent_usermsg_persists_before_context_projection():
 
     assert seen == []
     assert agent.ephemeral == ""
-    assert agent.conversation.messages[-1]["content"] == "active"
+    assert agent.conversation.stored_messages()[-1]["content"] == "active"
 
 
 def test_registry_normalizes_context_accounting_limits(monkeypatch):
@@ -1772,12 +1772,12 @@ def test_replay_resume_rewind_and_fork_keep_canonical_turn_labels(tmp_path):
 
     resumed = ReplayAgent()
     replay_session_into_agent(resumed, session_id, store)
-    assert resumed.conversation._messages()[-1]["content"] == "# Turn 4\n\nreplacement"
+    assert resumed.conversation.projected_messages()[-1]["content"] == "# Turn 4\n\nreplacement"
 
     fork_id = store.fork_session(session_id)
     forked = ReplayAgent()
     replay_session_into_agent(forked, fork_id, store)
-    assert forked.conversation._messages()[-1]["content"] == "# Turn 4\n\nreplacement"
+    assert forked.conversation.projected_messages()[-1]["content"] == "# Turn 4\n\nreplacement"
     assert store.get_events(session_id)[-1]["payload"]["message"]["content"] == "replacement"
     assert store.get_events(fork_id)[-1]["payload"]["message"]["content"] == "replacement"
 
@@ -1822,10 +1822,10 @@ def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_
         CompletedTurn(1, 1, 3, True, "turn"),
         CompletedTurn(2, 4, 4, False, "checkpoint"),
     ]
-    assert resumed.conversation._messages() == forked.conversation._messages()
+    assert resumed.conversation.projected_messages() == forked.conversation.projected_messages()
     assert sum(
         message.get("content") == "# Checkpoint 2"
-        for message in resumed.conversation._messages()
+        for message in resumed.conversation.projected_messages()
     ) == 1
 
     store.append_event(session_id, 5, "rewind", {"target_seq": 1})
@@ -1834,7 +1834,7 @@ def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_
     assert completed_turns(store.get_events(session_id)) == []
     assert not any(
         message.get("_provider_checkpoint")
-        for message in rewound.conversation._messages()
+        for message in rewound.conversation.projected_messages()
     )
 
 
@@ -1875,7 +1875,7 @@ def _rollup_test_agent(events, tmp_path):
     from code_agent.agent import CodeAgentBase
 
     class Client:
-        def text_call(self, *args, **kwargs):
+        def call(self, *args, **kwargs):
             raise AssertionError("rollup must not call an LLM")
 
     store = SessionStore(str(tmp_path / "rollup-sessions.db"))
@@ -1892,7 +1892,7 @@ def _rollup_test_agent(events, tmp_path):
     agent._pending_session_events = []
     agent._suspend_persistence = False
     agent._conversation = Conversation(Client(), "system")
-    agent.conversation.messages[:] = copy.deepcopy(projected_messages(events))
+    agent.conversation.replace_messages(copy.deepcopy(projected_messages(events)))
     agent._ensure_live_session = lambda: None
     agent._flush_pending_session_events = lambda: None
     return agent, store, session_id
@@ -1900,7 +1900,7 @@ def _rollup_test_agent(events, tmp_path):
 
 def _rollup_snapshot(agent, store, session_id):
     return (
-        copy.deepcopy(agent.conversation.messages),
+        copy.deepcopy(agent.conversation.stored_messages()),
         copy.deepcopy(agent._persisted_preview_state),
         agent._next_event_seq,
         copy.deepcopy(store.get_events(session_id)),
@@ -1922,7 +1922,7 @@ def _mock_rollup_agent(units, content_size=100):
         _session_store=SimpleNamespace(get_events=lambda session_id: [{"seq": 1}]),
         _session_id="session",
         _persisted_preview_state=state,
-        _conversation=SimpleNamespace(messages=messages),
+        _conversation=SimpleNamespace(stored_messages=lambda: copy.deepcopy(messages)),
         _authoritative_persisted_projection=lambda **kwargs: (messages, state),
     )
 
@@ -2015,7 +2015,7 @@ def _mock_boundary_context(monkeypatch, turn_rollups, agent, turns, groups):
         "derive_agent_rollup_context",
         lambda target: (
             events,
-            target._conversation.messages,
+            target._conversation.stored_messages(),
             target._persisted_preview_state,
             eligibility,
         ),
@@ -2259,7 +2259,7 @@ def test_rollup_rebuilds_shared_context_on_every_call(monkeypatch):
         )
         return (
             [],
-            target._conversation.messages,
+            target._conversation.stored_messages(),
             target._persisted_preview_state,
             eligibility,
         )
@@ -2333,7 +2333,7 @@ def test_recursive_and_adjacent_rollups_preserve_outer_boundaries(tmp_path):
 def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_path):
     events, ids = completed_events(6)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
-    agent.conversation.messages.insert(
+    agent.conversation.insert_message(
         3, {"role": "assistant", "content": "stale live gap", "_event_seq": 999}
     )
     agent._persisted_preview_state = PersistedPreviewState(
@@ -2360,7 +2360,7 @@ def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_p
     }
     assert all(
         message.get("_event_seq") != 999
-        for message in agent.conversation.messages
+        for message in agent.conversation.stored_messages()
     )
 
 

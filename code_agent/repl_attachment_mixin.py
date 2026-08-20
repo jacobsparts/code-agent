@@ -338,7 +338,7 @@ class REPLAttachmentMixin:
     def list_attachments(self) -> dict[str, TextAttachment | ImageAttachment | AudioAttachment]:
         """Get currently active attachments as typed values."""
         active = {}
-        for msg in self.conversation.messages:
+        for msg in self.conversation.stored_messages():
             for name, content in msg.get('_attachments', {}).items():
                 active[name] = content
         active.update(self._pending_attachments)
@@ -346,12 +346,16 @@ class REPLAttachmentMixin:
 
     def _invalidate_attachment(self, name: str):
         """Remove an attachment from all messages."""
-        for msg in self.conversation.messages:
+        for msg in self.conversation.stored_messages():
             attachments = msg.get('_attachments')
             if attachments and name in attachments:
-                del attachments[name]
-                if not attachments:
-                    del msg['_attachments']
+                attachments = {
+                    key: value for key, value in attachments.items() if key != name
+                }
+                if attachments:
+                    self.conversation.update_message(msg, _attachments=attachments)
+                else:
+                    self.conversation.remove_message_fields(msg, '_attachments')
 
     def _render_attachment(self, name: str, content):
         """Build a typed attachment value, numbering lines for text content."""

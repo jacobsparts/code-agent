@@ -9,12 +9,15 @@ class OverflowThenSuccessClient:
         self.tool_mode = "repl_execute"
         self.requests = []
 
-    def text_call(self, messages):
+    def call(self, messages, **kwargs):
         self.calls += 1
         self.requests.append(messages)
         if self.calls == 1:
             raise ContextOverflowError("too large")
-        return {"role": "assistant", "content": "emit('ok', release=True)"}
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "emit('ok', release=True)"}],
+        }
 
 
 class RecoveringAgent(REPLAgent):
@@ -41,23 +44,23 @@ class RecoveringAgent(REPLAgent):
 
 
 
-def test_text_call_coalesces_open_interaction_and_retries_after_context_overflow():
+def test_conversation_call_coalesces_open_interaction_and_retries_after_context_overflow():
     agent = RecoveringAgent()
     agent.conversation.usermsg("start")
-    result = agent._llm_text_call_with_context_recovery(agent.conversation._messages())
+    result = agent._conversation_call_with_context_recovery(agent.conversation.projected_messages())
 
 
     assert result["content"] == "emit('ok', release=True)"
     assert agent.llm_client.calls == 2
     assert agent.coalesced == [{}]
-    assert agent.conversation.messages[-1].get("_virtual_interaction_boundary") is True
-    assert agent.committed == [agent.conversation.messages[-1]]
+    assert agent.conversation.stored_messages()[-1].get("_virtual_interaction_boundary") is True
+    assert agent.committed == [agent.conversation.stored_messages()[-1]]
     assert [
-        request[0]["content"].count(
+        request[0]["content"][0]["text"].count(
             "Every response must include a repl_execute tool call."
         )
         for request in agent.llm_client.requests
     ] == [1, 1]
     assert "Every response must include a repl_execute tool call." not in (
-        agent.conversation.messages[0]["content"]
+        agent.conversation.stored_messages()[0]["content"]
     )

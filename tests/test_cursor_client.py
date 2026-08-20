@@ -192,7 +192,7 @@ def test_cursor_client_adapter(monkeypatch):
     monkeypatch.setattr(cursor, "chat_completions", chat)
     client = LLMClient("cursor/composer-2.5")
     history_length = len(client.usage_tracker.history)
-    result = client._call([{"role": "user", "content": "hello"}])
+    result = client._call([{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
     assert captured["api_key"] == "key"
     assert captured["body"]["model"] == "composer-2.5"
     assert captured["body"]["tools"] == [REPL_EXECUTE_TOOL]

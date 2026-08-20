@@ -243,15 +243,15 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             content = self._preview_blob_content(uri)
             if content is not None:
                 preserve_preview_refs[uri] = self._render_preview_ref(content)[1]
-        self.conversation.messages = coalesce_repl_messages(
-            self.conversation.messages,
+        self.conversation.replace_messages(coalesce_repl_messages(
+            self.conversation.stored_messages(),
             keep_last_execution_interactions=self.code_agent_coalesce_keep_last_execution_interactions,
             min_savings_chars=self.code_agent_coalesce_min_savings_chars,
             save_preview_blob=lambda key, content: self._session_store.save_preview_blob(self._session_id, key, content),
             auto_expand_preview_refs=auto_expand_preview_refs,
             preserve_preview_refs=preserve_preview_refs,
             protect_last_interactions=protect_last_interactions,
-        )
+        ))
         for uri in auto_expand_preview_refs:
             self._expanded_preview_refs[uri] = {"numbered": False}
             self._append_session_event("preview_expanded", {"uri": uri, "numbered": False}, create_session=False)
@@ -297,7 +297,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         if self._session_id is None:
             self._ensure_live_session()
             self._flush_pending_session_events()
-        for msg in self.conversation.messages[1:]:
+        for msg in self.conversation.stored_messages()[1:]:
             if msg.get('_synthetic') and not msg.get("_virtual_interaction_boundary"):
                 continue
 
@@ -324,15 +324,15 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         if not self._session_id:
             raise RuntimeError("persisted projection requires a live session")
 
-        system_message = copy.deepcopy(self.conversation.messages[0])
+        system_message = self.conversation.stored_messages()[0]
         target = SimpleNamespace(
             conversation=Conversation(None, system_message.get("content", "")),
             _expanded_preview_refs={},
         )
-        target.conversation.messages[0] = system_message
+        target.conversation.replace_messages([system_message])
         replay_session_into_agent(target, self._session_id, self._session_store)
 
-        projected = target.conversation.messages
+        projected = target.conversation.stored_messages()
         if coalesce:
             projected = coalesce_repl_messages(
                 projected,
@@ -341,7 +341,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             )
 
         live_by_provenance = {}
-        for message in self.conversation.messages:
+        for message in self.conversation.stored_messages():
             source_range = message_source_range(message)
             refs = message.get("_attachment_refs")
             if source_range is not None and isinstance(refs, dict):
@@ -389,7 +389,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             expected_next_seq=expected_next_seq,
             state=state,
         )
-        self.conversation.messages = projected
+        self.conversation.replace_messages(projected)
         self._persisted_preview_state = state
         self._next_event_seq = placed_event_seq + 1
         return key, preview_event_seq
@@ -408,7 +408,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             from code_agent.persisted_preview_state import PersistedPreviewState
             state = PersistedPreviewState.empty()
         return self._create_persisted_preview_from_projection(
-            self.conversation.messages,
+            self.conversation.stored_messages(),
             state,
             preview,
             source_start_seq=source_start_seq,
@@ -671,9 +671,11 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         return msg
 
     def _tag_latest_segment_seq(self, message: dict, seq: int):
-        for seg in reversed(message.get("_render_segments") or []):
+        segments = copy.deepcopy(message.get("_render_segments") or [])
+        for seg in reversed(segments):
             if "_event_seq" not in seg:
                 seg["_event_seq"] = seq
+                self.conversation.update_message(message, _render_segments=segments)
                 break
 
     def _persist_message(self, message: dict):
@@ -685,7 +687,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
                 return
         seq = self._append_session_event("message_added", {"message": self._sanitize_message_for_persistence(message)})
         if seq is not None:
-            message["_event_seq"] = seq
+            self.conversation.update_message(message, _event_seq=seq)
             self._tag_latest_segment_seq(message, seq)
 
     def _persist_append_to_last_user_message(self, target_message: dict, content: str, kwargs: dict):
@@ -884,9 +886,9 @@ def _code_agent_send_rg_available():
     def _materialize_replayed_attachment_refs(self) -> list[tuple[str, object]]:
         missing = []
         loaded = {}
-        for msg in self.conversation.messages:
+        def materialize(msg):
             refs = msg.get('_attachment_refs') or {}
-            attachments = msg.setdefault('_attachments', {}) if refs else {}
+            attachments = dict(msg.get('_attachments') or {})
             for name, ref in refs.items():
                 if (
                     isinstance(
@@ -906,8 +908,13 @@ def _code_agent_send_rg_available():
                 content = loaded[key]
                 if content is not None:
                     attachments[name] = self._render_attachment(name, content)
-            if "_attachments" in msg and not msg["_attachments"]:
-                del msg["_attachments"]
+            if attachments:
+                self.conversation.update_message(msg, _attachments=attachments)
+            else:
+                self.conversation.remove_message_fields(msg, "_attachments")
+
+        for msg in self.conversation.stored_messages():
+            materialize(msg)
         return missing
 
     def attach_memory_ref(self, name: str, content: str):
@@ -990,7 +997,7 @@ def _code_agent_send_rg_available():
             return []
 
         rendered = []
-        for msg in getattr(self.conversation, "messages", []):
+        for msg in self.conversation.stored_messages():
             content = msg.get("content", "")
             for name, attachment in (msg.get("_attachments") or {}).items():
                 if isinstance(attachment, TextAttachment):
@@ -1000,7 +1007,7 @@ def _code_agent_send_rg_available():
             render_preview_refs(content, expanded, self._preview_blob_content, rendered)
         has_coalesced_messages = any(
             msg.get("_coalesced")
-            for msg in getattr(self.conversation, "messages", [])
+            for msg in self.conversation.stored_messages()
         )
         if has_coalesced_messages:
             for uri in expanded:
@@ -1095,16 +1102,19 @@ def _code_agent_send_rg_available():
         return messages
 
     def _invalidate_attachment(self, name: str):
-        had_attachment = any(name in msg.get('_attachments', {}) for msg in self.conversation.messages)
-        had_ref = any(name in (msg.get('_attachment_refs') or {}) for msg in self.conversation.messages)
+        stored_messages = self.conversation.stored_messages()
+        had_attachment = any(name in msg.get('_attachments', {}) for msg in stored_messages)
+        had_ref = any(name in (msg.get('_attachment_refs') or {}) for msg in stored_messages)
         had_pending_ref = name in self._explicit_attachment_refs or name in self._pending_explicit_attachment_refs
         super()._invalidate_attachment(name)
-        for msg in self.conversation.messages:
+        for msg in self.conversation.stored_messages():
             refs = msg.get('_attachment_refs')
             if refs and name in refs:
-                del refs[name]
-                if not refs:
-                    del msg['_attachment_refs']
+                refs = {key: value for key, value in refs.items() if key != name}
+                if refs:
+                    self.conversation.update_message(msg, _attachment_refs=refs)
+                else:
+                    self.conversation.remove_message_fields(msg, '_attachment_refs')
         self._explicit_attachment_refs.pop(name, None)
         self._pending_explicit_attachment_refs.pop(name, None)
         if getattr(self, '_suspend_persistence', False):
@@ -1139,7 +1149,7 @@ def _code_agent_send_rg_available():
         if conversation is not None:
             messages = [
                 {k: v for k, v in msg.items() if not k.startswith("_")}
-                for msg in conversation._messages()
+                for msg in conversation.projected_messages()
             ]
         marker = f"[Attachment: {path}]"
         prospective_content = current_output + marker + "\n"
@@ -1189,7 +1199,7 @@ def _code_agent_send_rg_available():
             expanded[uri] = {"numbered": bool(numbered)}
             messages = [
                 {k: v for k, v in msg.items() if not k.startswith("_")}
-                for msg in conversation._messages()
+                for msg in conversation.projected_messages()
             ]
             estimated = client._estimate_input_tokens(client._input_bytes(messages))
         except Exception:
@@ -1395,7 +1405,7 @@ def _code_agent_send_rg_available():
 
     def _attached_file_name(self, path: str) -> str | None:
         """Return the active attachment name for a filesystem path."""
-        for msg in self.conversation.messages:
+        for msg in self.conversation.stored_messages():
             for name in msg.get('_attachments', {}):
                 if self._is_memory_attachment_name(name):
                     continue
@@ -1541,7 +1551,7 @@ def _code_agent_send_rg_available():
 
     def _reconstruct_observation_counters(self, messages=None) -> None:
         self._reset_observation_counters()
-        for message in messages if messages is not None else getattr(self.conversation, "messages", []):
+        for message in messages if messages is not None else self.conversation.stored_messages():
             self._update_observation_counters_from_message(message)
 
     def _context_accounting(self):
@@ -1556,7 +1566,7 @@ def _code_agent_send_rg_available():
             self.conversation.ephemeral_provider = None
             messages = [
                 {k: v for k, v in msg.items() if not k.startswith("_")}
-                for msg in self.conversation._messages()
+                for msg in self.conversation.projected_messages()
             ]
         finally:
             self.ephemeral = old_ephemeral
@@ -1829,10 +1839,10 @@ def _code_agent_send_rg_available():
                 )
             kwargs['_attachment_refs'] = refs
             self._read_attachments = {}
-        before_len = len(self.conversation.messages)
+        before_len = len(self.conversation.stored_messages())
         result = super().usermsg(content, **kwargs)
-        if len(self.conversation.messages) > before_len:
-            self._persist_message(self.conversation.messages[-1])
+        if len(self.conversation.stored_messages()) > before_len:
+            self._persist_message(self.conversation.stored_messages()[-1])
         self.ephemeral = ""
         return result
 
@@ -2749,7 +2759,7 @@ If you don't know how to proceed:
             self._next_event_seq = self._session_store.get_next_seq(session_id)
             self._explicit_attachment_refs = {}
             self._pending_explicit_attachment_refs = {}
-            for msg in self.conversation.messages:
+            for msg in self.conversation.stored_messages():
                 for name, ref in (msg.get('_attachment_refs') or {}).items():
                     self._explicit_attachment_refs[name] = ref
             missing.extend(self._materialize_replayed_attachment_refs())
@@ -2822,8 +2832,8 @@ Return only the replacement user prompt text.
         old_ephemeral = self.ephemeral
         try:
             self.ephemeral = ""
-            msg = self.llm_client.text_call(
-                self.conversation._messages() + [{"role": "user", "content": instruction}]
+            msg = self.conversation.call(
+                additional_messages=[{"role": "user", "content": instruction}]
             )
         finally:
             self.ephemeral = old_ephemeral
@@ -2854,7 +2864,7 @@ Return only the replacement user prompt text.
             self._next_event_seq = self._session_store.get_next_seq(self._session_id)
             self._explicit_attachment_refs = {}
             self._pending_explicit_attachment_refs = {}
-            for msg in self.conversation.messages:
+            for msg in self.conversation.stored_messages():
                 for name, ref in (msg.get('_attachment_refs') or {}).items():
                     self._explicit_attachment_refs[name] = ref
             self._materialize_replayed_attachment_refs()
@@ -2893,11 +2903,14 @@ Return only the replacement user prompt text.
             ('assistant', assistant_emit),
             ('user', user_emit_output),
         ):
-            self.conversation.messages.append({"role": role, "content": content, "_synthetic": True})
-        self.conversation.messages[-1]["_stdout"] = user_emit_output
-        self.conversation.messages[-1]["_render_segments"] = [
-            {"type": "stdout", "content": user_emit_output}
-        ]
+            last_message = self.conversation.append_message(
+                {"role": role, "content": content, "_synthetic": True}
+            )
+        self.conversation.update_message(
+            last_message,
+            _stdout=user_emit_output,
+            _render_segments=[{"type": "stdout", "content": user_emit_output}],
+        )
         self._last_was_repl_output = True
 
     def _reset_interaction_state(self) -> None:
@@ -3127,7 +3140,7 @@ Return only the replacement user prompt text.
                         self._quiet_replay_session()
                         self._replay_display_output()
                         self._display_text(f"{DIM}Conversation rewound.{RESET}", kind="status")
-                        last = self.conversation.messages[-1] if self.conversation.messages else None
+                        last = self.conversation.stored_messages()[-1]
                         self._last_was_repl_output = bool(last and last.get('role') == 'user')
                         preload_input = rewind_result.get("preload_input", "") or ""
                     elif rewind_shortcut:
@@ -3387,7 +3400,7 @@ Return only the replacement user prompt text.
                 crash_file = tempfile.NamedTemporaryFile(
                     mode='w', suffix='.json', prefix='repl_crash_', delete=False
                 )
-                json.dump(self.conversation._messages(), crash_file, indent=2)
+                json.dump(self.conversation.projected_messages(), crash_file, indent=2)
                 crash_file.close()
                 print(f"\n*** Conversation saved to: {crash_file.name} ***", file=sys.stderr)
             # Clean up temp files from truncated output
@@ -3406,20 +3419,23 @@ Return only the replacement user prompt text.
 class CodeAgent(MCPMixin, CodeAgentBase):
     """Code agent with REPL-proxied tools."""
 
-    def _last_pinnable_turn(self):
-        for msg in reversed(self.conversation.messages):
-            if msg.get("role") != "assistant" or msg.get("_synthetic"):
-                continue
-            return msg
-        return None
-
     @REPLAgent.tool
     def pin(self):
         """Pin the immediately previous completed assistant turn for preview expansion after coalescing."""
-        turn = self._last_pinnable_turn()
+        turn = next((
+            message
+            for message in reversed(self.conversation.stored_messages())
+            if (
+                message.get("role") == "assistant"
+                and not message.get("_synthetic")
+            )
+        ), None)
         if turn is None:
             return "No previous turn to pin."
-        turn["_pinned_coalesce"] = {"label": "Pinned previous turn"}
+        self.conversation.update_message(
+            turn,
+            _pinned_coalesce={"label": "Pinned previous turn"},
+        )
         event_seq = turn.get("_event_seq")
         if event_seq is not None:
             old_suspend = getattr(self, "_suspend_persistence", False)

@@ -832,34 +832,38 @@ Important:
         session. The message appears as if emitted via emit().
         """
         # Check if we should append to last REPL output
-        if getattr(self, '_last_was_repl_output', False) and self.conversation.messages:
-            last_msg = self.conversation.messages[-1]
-            if last_msg.get("role") == "user":
-                # Append as output of the previous emit() call
-                # Add trailing \n since this simulates print() output from emit()
+        if getattr(self, '_last_was_repl_output', False):
+            last_msg = self.conversation.stored_messages()[-1]
+            if last_msg and last_msg.get("role") == "user":
+                # Append as output of the previous emit() call.
                 prev = last_msg["content"]
                 sep = "" if prev.endswith("\n") else "\n"
-                last_msg["content"] = prev + sep + content + "\n"
-                last_msg["_user_content"] = content
+                changes = {
+                    "content": prev + sep + content + "\n",
+                    "_user_content": content,
+                    "_render_segments": [
+                        *last_msg.get("_render_segments", []),
+                        {"type": "input", "content": content},
+                    ],
+                }
 
-                # Also update _stdout with the appended content
                 if '_stdout' in last_msg:
                     prev_stdout = last_msg['_stdout']
                     sep_stdout = "" if prev_stdout.endswith("\n") else "\n"
-                    last_msg['_stdout'] = prev_stdout + sep_stdout + content + "\n"
+                    changes['_stdout'] = prev_stdout + sep_stdout + content + "\n"
 
                 if '_attachments' in kwargs:
-                    attachments = last_msg.get('_attachments', {})
-                    attachments.update(kwargs['_attachments'])
-                    last_msg['_attachments'] = attachments
+                    changes['_attachments'] = {
+                        **last_msg.get('_attachments', {}),
+                        **kwargs['_attachments'],
+                    }
                 if '_attachment_refs' in kwargs:
-                    refs = last_msg.get('_attachment_refs', {})
-                    refs.update(kwargs['_attachment_refs'])
-                    last_msg['_attachment_refs'] = refs
+                    changes['_attachment_refs'] = {
+                        **last_msg.get('_attachment_refs', {}),
+                        **kwargs['_attachment_refs'],
+                    }
 
-                last_msg.setdefault("_render_segments", []).append(
-                    {"type": "input", "content": content}
-                )
+                self.conversation.update_message(last_msg, **changes)
 
                 if hasattr(self, '_on_append_last_user_message'):
                     self._on_append_last_user_message(last_msg, content, kwargs)
@@ -869,17 +873,16 @@ Important:
 
         # Fall back to normal message append
         self._last_was_repl_output = False
-        result = super().usermsg(content, **kwargs)
-        new_msg = self.conversation.messages[-1]
-        if new_msg.get("role") == "user":
+        new_msg = super().usermsg(content, **kwargs)
+        if new_msg and new_msg.get("role") == "user":
             if kwargs.get('_user_content') is not None:
                 seg = {"type": "input", "content": kwargs['_user_content']}
             else:
                 # Prefer _stdout (unfiltered REPL output) over content (which may
                 # have emit chunks filtered out for the LLM).
                 seg = {"type": "stdout", "content": kwargs.get('_stdout') or content}
-            new_msg["_render_segments"] = [seg]
-        return result
+            self.conversation.update_message(new_msg, _render_segments=[seg])
+        return new_msg
 
     def _ensure_setup(self) -> None:
         """Initialize the ToolREPL."""
@@ -995,24 +998,22 @@ You have full access to Python. These additional functions are available:
 Call help(function_name) for parameter descriptions.
 """
 
-    def _llm_text_call_with_context_recovery(self, messages):
+    def _conversation_call_with_context_recovery(self, messages):
         try:
-            return self.llm_client.text_call(messages)
+            return self.conversation.call(messages)
         except ContextOverflowError:
             if not hasattr(self, "_coalesce_context"):
                 raise
-            self.conversation.messages.append({
+            boundary = self.conversation.append_message({
                 "role": "assistant",
                 "content": "emit(None, release=True)",
                 "_synthetic": True,
                 "_virtual_interaction_boundary": True,
             })
             if hasattr(self, '_on_assistant_message_committed'):
-                self._on_assistant_message_committed(self.conversation.messages[-1])
+                self._on_assistant_message_committed(boundary)
             self._coalesce_context()
-            return self.llm_client.text_call(
-                self.conversation._messages()
-            )
+            return self.conversation.call()
 
 
 
@@ -1033,7 +1034,7 @@ Call help(function_name) for parameter descriptions.
         for turn in range(max_turns):
             # Get REPL each turn to handle session restart (re-injects tools if needed)
             repl = self._get_tool_repl()
-            messages = self.conversation._messages()
+            messages = self.conversation.projected_messages()
 
             # Fire execute hook once at start of turn (before any attempts)
             if hasattr(self, 'on_repl_execute'):
@@ -1050,7 +1051,7 @@ Call help(function_name) for parameter descriptions.
                     try:
                         try:
                             try:
-                                resp = self._llm_text_call_with_context_recovery(messages)
+                                resp = self._conversation_call_with_context_recovery(messages)
                             finally:
                                 if hasattr(self, "on_llm_call_complete"):
                                     self.on_llm_call_complete()
@@ -1062,7 +1063,7 @@ Call help(function_name) for parameter descriptions.
                             if hasattr(self, 'on_retry'):
                                 self.on_retry("native_repl", native_retry)
                             _emit_event("native_repl_retry", attempt=native_retry)
-                            messages = self.conversation._messages() + [{
+                            messages = self.conversation.projected_messages() + [{
                                     "role": "user",
                                     "content": repl_retry_hint(
                                         getattr(self.llm_client, "tool_mode", None),
@@ -1119,7 +1120,7 @@ Call help(function_name) for parameter descriptions.
                         "If you need to communicate text, do it from Python, for example with print(...) or the appropriate provided Python function.\n\n"
                         "Return only valid Python code."
                     )
-                    messages = self.conversation._messages() + [
+                    messages = self.conversation.projected_messages() + [
                             {"role": "assistant", "content": content},
                             {"role": "user", "content": f"{output}\n{hint}"}
                         ]
@@ -1136,7 +1137,7 @@ Call help(function_name) for parameter descriptions.
                 # Record the terminal assistant message before returning
                 if getattr(self, "complete", False) and getattr(self, "_final_result", None) is not None:
                     resp["_final_result"] = self._final_result
-                self.conversation.messages.append(resp)
+                self.conversation.append_message(resp)
                 if hasattr(self, '_on_assistant_message_committed'):
                     self._on_assistant_message_committed(resp)
                 if hasattr(self, '_complete_value'):
@@ -1152,7 +1153,7 @@ Call help(function_name) for parameter descriptions.
             # Commit successful response to conversation
             if getattr(self, "complete", False) and getattr(self, "_final_result", None) is not None:
                 resp["_final_result"] = self._final_result
-            self.conversation.messages.append(resp)
+            self.conversation.append_message(resp)
             if hasattr(self, '_on_assistant_message_committed'):
                 self._on_assistant_message_committed(resp)
 
