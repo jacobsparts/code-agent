@@ -242,25 +242,33 @@ def _surviving_rollup_boundary_indexes(
     ]
 
 
-def _assert_rollup_boundaries_align(
+def _exact_projected_boundary_turns(
     turns: list[CompletedTurn],
     projected_messages: list[dict],
-    indexes: list[int],
-) -> None:
-    """Fail loudly when listed boundaries do not align with the projection."""
-    spans = [
-        select_projected_span(
-            projected_messages,
-            source_start_seq=turns[left].source_start_seq,
-            source_end_seq=turns[right - 1].source_end_seq,
-        )
-        for left, right in zip(indexes, indexes[1:])
-    ]
-    for left, right in zip(spans, spans[1:]):
-        if left.end_index != right.start_index:
-            raise RuntimeError(
-                "rollup candidate turns are not contiguous in the current projection"
-            )
+) -> list[int]:
+    """Return indexes of turns usable as either endpoint of a rollup range.
+
+    A range resolves to the selected start turn's projected-node start and the
+    projected-node end of the turn immediately before the selected end turn, so
+    both boundaries must match exactly one projected node.
+    """
+    starts: dict[int, list[int]] = {}
+    ends: dict[int, list[int]] = {}
+    for index, message in enumerate(projected_messages):
+        source_range = message_source_range(message)
+        if source_range is None:
+            continue
+        starts.setdefault(source_range[0], []).append(index)
+        ends.setdefault(source_range[1], []).append(index)
+
+    usable = []
+    for index, turn in enumerate(turns):
+        if len(starts.get(turn.source_start_seq, [])) != 1:
+            continue
+        if index and len(ends.get(turns[index - 1].source_end_seq, [])) != 1:
+            continue
+        usable.append(index)
+    return usable
 
 
 def derive_rollup_candidate_turns(
@@ -287,6 +295,7 @@ def derive_rollup_candidate_turns(
     if frontier < 1:
         return ()
 
+    usable = set(_exact_projected_boundary_turns(turns, projected_messages))
     indexes = [
         index
         for index in _surviving_rollup_boundary_indexes(
@@ -294,12 +303,11 @@ def derive_rollup_candidate_turns(
             projected_messages,
             persisted_state,
         )
-        if index <= frontier
+        if index <= frontier and index in usable
     ]
     if len(indexes) < 2:
         return ()
 
-    _assert_rollup_boundaries_align(turns, projected_messages, indexes)
     return tuple(turns[index].turn_id for index in indexes)
 
 

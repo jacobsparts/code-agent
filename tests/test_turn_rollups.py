@@ -455,18 +455,27 @@ def test_candidate_frontier_is_earlier_of_three_turns_ago_and_last_execution():
     )
 
 
-def test_candidate_list_fails_hard_when_projection_boundaries_do_not_align():
-    events, _ = completed_events(7)
-    projection = projected_messages(events)
-    projection[2]["_source_start_seq"] = 1
-    projection[2]["_source_end_seq"] = 999
+def test_ambiguous_projected_boundaries_are_not_listed_as_candidates():
+    events, ids = completed_events(7)
 
-    with pytest.raises(Exception):
-        derive_rollup_candidate_turns(
-            events,
-            projection,
-            PersistedPreviewState.empty(),
-        )
+    projection = projected_messages(events)
+    projection.insert(2, copy.deepcopy(projection[1]))
+    candidates = derive_rollup_candidate_turns(
+        events,
+        projection,
+        PersistedPreviewState.empty(),
+    )
+    assert ids[0] not in candidates
+
+    projection = projected_messages(events)
+    projection.insert(3, copy.deepcopy(projection[2]))
+    candidates = derive_rollup_candidate_turns(
+        events,
+        projection,
+        PersistedPreviewState.empty(),
+    )
+    assert ids[0] in candidates
+    assert ids[1] not in candidates
 
 
 def test_active_child_hides_only_internal_candidate_turns():
