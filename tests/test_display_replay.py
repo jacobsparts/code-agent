@@ -951,7 +951,7 @@ def test_rewind_restores_collapsed_state_after_later_expand(tmp_path):
     assert "expanded body" not in agent.conversation.projected_messages()[1]["content"]
 
 
-def test_replay_duplicate_is_idempotent_and_same_range_conflict_is_skipped(tmp_path):
+def test_replay_duplicate_is_idempotent_and_same_range_replacement_wins(tmp_path):
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
@@ -973,9 +973,9 @@ def test_replay_duplicate_is_idempotent_and_same_range_conflict_is_skipped(tmp_p
     replay_session_into_agent(agent, session_id, store)
 
     visible = agent.conversation.stored_messages()[1]["content"]
-    assert "session://preview/a" in visible
-    assert "session://preview/b" not in visible
-    assert agent._persisted_preview_state.active_placements == {(1, 1): 2}
+    assert "session://preview/b" in visible
+    assert "session://preview/a" not in visible
+    assert agent._persisted_preview_state.active_placements == {(1, 1): 5}
 
 
 def test_create_resume_expand_fork_resume_end_to_end(tmp_path):
@@ -1091,7 +1091,7 @@ def test_adversarial_history_shared_authoritative_state_matches_replay_and_allow
     assert definitions == agent._persisted_preview_state.definitions
     assert placements == agent._persisted_preview_state.active_placements
     assert exec_start_seq == agent._persisted_preview_state.exec_start_seq
-    assert placements == {(1, 1): 9}
+    assert placements == {(1, 1): 11}
     assert exec_start_seq == 0
 
     key, created_seq = agent.create_persisted_preview(
@@ -1101,7 +1101,7 @@ def test_adversarial_history_shared_authoritative_state_matches_replay_and_allow
     )
     assert created_seq == 22
     assert agent._persisted_preview_state.active_placements == {
-        (1, 1): 9,
+        (1, 1): 11,
         (13, 13): 22,
     }
 

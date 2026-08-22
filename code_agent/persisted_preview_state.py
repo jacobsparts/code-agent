@@ -21,7 +21,7 @@ class PersistedPreviewState:
         requested = (source_start_seq, source_end_seq)
         existing = self.active_placements.get(requested)
         if existing is not None:
-            return "duplicate" if existing == preview_event_seq else "conflict"
+            return "duplicate" if existing == preview_event_seq else "apply"
         for start, end in self.active_placements:
             if source_start_seq <= end and start <= source_end_seq:
                 contains = source_start_seq <= start and end <= source_end_seq

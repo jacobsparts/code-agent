@@ -469,16 +469,14 @@ class SessionStore:
                     raise ValueError("preview source range must precede preview creation")
                 if source_start_seq <= active_exec_start_seq:
                     raise ValueError("preview placement crosses the active exec boundary")
-                requested = (source_start_seq, source_end_seq)
-                if requested in active_placements:
-                    raise ValueError("preview range already has an active placement")
                 for start, end in active_placements:
                     if source_start_seq <= end and start <= source_end_seq:
+                        equal = source_start_seq == start and source_end_seq == end
                         contains = source_start_seq <= start and end <= source_end_seq
                         contained = start <= source_start_seq and source_end_seq <= end
-                        if contained:
+                        if contained and not equal:
                             raise ValueError("preview range is inside an active placement")
-                        if not contains:
+                        if not contains and not equal:
                             raise ValueError("preview range partially overlaps an active placement")
 
                 blob = conn.execute(

@@ -427,7 +427,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         from code_agent.turn_rollups import (
             completed_turns,
             derive_agent_rollup_context,
-            resolve_rollup_boundary_interval,
+            resolve_rollup_interval,
         )
 
         if type(start_turn) is not int or type(end_turn) is not int:
@@ -454,14 +454,12 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         context = derive_agent_rollup_context(self)
         if context is None:
             raise RuntimeError("rollup is unavailable without a live persisted session.")
-        events, authoritative_messages, authoritative_state, eligibility = context
-        if not eligibility.all_units:
-            raise ValueError("no canonical completed rollup boundaries are available.")
-        if not eligibility.units:
-            raise ValueError("no rollup boundaries are currently eligible.")
+        events, authoritative_messages, authoritative_state, candidate_turns = context
+        if len(candidate_turns) < 2:
+            raise ValueError("No turns are currently available for rollup.")
 
-        source_start_seq, source_end_seq, _ = resolve_rollup_boundary_interval(
-            eligibility,
+        source_start_seq, source_end_seq, _ = resolve_rollup_interval(
+            candidate_turns,
             completed_turns(events),
             start_turn,
             end_turn,
@@ -499,7 +497,7 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
                 source_end_seq=source_end_seq,
                 expected_next_seq=store.get_next_seq(session_id),
             )
-        return (
+        print(
             f"Rolled up turns {start_turn}-{end_turn} into preview {key} "
             f"(event {preview_event_seq})."
         )
@@ -1592,20 +1590,14 @@ def _code_agent_send_rg_available():
 
         return derive_agent_rollup_context(self)
 
-    def _derive_rollup_eligibility(self):
-        try:
-            context = self._rollup_context()
-        except Exception:
-            return None
-        return None if context is None else context[3]
+    def _rollup_candidate_turns(self) -> tuple[int, ...]:
+        context = self._rollup_context()
+        return () if context is None else context[3]
 
     def _rollup_eligibility_ephemeral(self) -> str:
         from code_agent.turn_rollups import eligible_rollup_line
 
-        eligibility = self._derive_rollup_eligibility()
-        if eligibility is None:
-            return ""
-        return eligible_rollup_line([list(group) for group in eligibility.groups])
+        return eligible_rollup_line(self._rollup_candidate_turns())
 
     @staticmethod
     def _attachment_size_bytes(content) -> int | None:
@@ -1708,7 +1700,7 @@ def _code_agent_send_rg_available():
         self,
         *,
         accounting,
-        rollup_eligibility,
+        rollup_candidate_turns: tuple[int, ...],
         detachable_names: list[str],
     ) -> list[str]:
         notices = []
@@ -1723,9 +1715,7 @@ def _code_agent_send_rg_available():
         if usage_percent is None or constraint is None:
             return notices
 
-        has_eligible_rollups = bool(
-            rollup_eligibility is not None and getattr(rollup_eligibility, "units", ())
-        )
+        has_eligible_rollups = len(rollup_candidate_turns) >= 2
         has_detachable = bool(detachable_names)
 
         if usage_percent >= 80:
@@ -1767,20 +1757,18 @@ def _code_agent_send_rg_available():
         inventory_items = self._current_context_inventory()
         names = [item["name"] for item in inventory_items]
         accounting = self._context_accounting()
-        eligibility = self._derive_rollup_eligibility()
+        candidate_turns = self._rollup_candidate_turns()
         sections = []
         inventory = self._context_inventory_ephemeral(inventory_items, accounting)
         if inventory:
             sections.append(inventory)
-        rollup_line = ""
-        if eligibility is not None:
-            from code_agent.turn_rollups import eligible_rollup_line
-            rollup_line = eligible_rollup_line([list(group) for group in eligibility.groups])
+        from code_agent.turn_rollups import eligible_rollup_line
+        rollup_line = eligible_rollup_line(candidate_turns)
         if rollup_line:
             sections.append(rollup_line)
         for notice in self._context_management_notices_ephemeral(
             accounting=accounting,
-            rollup_eligibility=eligibility,
+            rollup_candidate_turns=candidate_turns,
             detachable_names=names,
         ):
             sections.append(notice)
@@ -1944,13 +1932,12 @@ Model-facing user messages beginning with `# Turn N` use N as the stable
 canonical identifier for that user-initiated interaction. These labels are
 navigation metadata; do not repeat or edit them.
 
-When present, `Eligible rollup turns: [...] | [...]` lists bracketed groups of
-surviving historical boundaries available to a future
-`rollup(start_turn, end_turn, summary)` call. Combine boundaries only within
-one bracketed group. A rollup from A to B replaces completed history beginning
-at A and ending immediately before B. A and B remain as outer boundaries;
-strict interior boundaries disappear. Adjacent rollups may share a boundary.
-Recent, active, unlisted, and strict interior boundaries cannot be selected.
+When present, `Eligible rollup turns: ...` lists the turn numbers available to
+a future `rollup(start_turn, end_turn, summary)` call. Any two listed numbers,
+earlier one first, form a valid rollup. A rollup from A to B replaces completed
+history beginning at A and ending immediately before B, like range(A, B). A and
+B remain listed afterwards; numbers between them do not. Numbers that are not
+listed cannot be used.
 
 Use rollup only when detailed historical content is no longer needed in active
 context. When context pressure is high, consider rolling up eligible historical

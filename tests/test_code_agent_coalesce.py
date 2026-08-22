@@ -1848,17 +1848,18 @@ def test_module_persistence_requires_complete_authoritative_state(tmp_path):
     assert stale.definitions == {}
     assert stale.active_placements == {}
 
-    with pytest.raises(PreviewPlacementError, match="conflict"):
-        create_persisted_preview(
-            projected,
-            Preview("equal-range conflict"),
-            source_start_seq=1,
-            source_end_seq=1,
-            store=store,
-            session_id=session_id,
-            state=state,
-        )
-    assert store.get_events(session_id) == committed
+    projected, _, replacement_seq, _ = create_persisted_preview(
+        projected,
+        Preview("equal-range replacement"),
+        source_start_seq=1,
+        source_end_seq=1,
+        store=store,
+        session_id=session_id,
+        expected_next_seq=store.get_next_seq(session_id),
+        state=state,
+    )
+    assert state.active_placements[(1, 1)] == replacement_seq
+    assert len(store.get_events(session_id)) == len(committed) + 2
 
 
 def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):

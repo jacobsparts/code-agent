@@ -827,38 +827,38 @@ def test_context_constraint_resolution_validation_and_max_input_exclusion():
 
 def test_context_guidance_tiers_and_available_actions():
     agent = make_agent()
-    eligibility = type("Eligibility", (), {"units": (object(),)})()
+    candidate_turns = (1, 2)
 
     assert agent._context_management_notices_ephemeral(
         accounting={"constraint": 100, "usage_percent": 29},
-        rollup_eligibility=eligibility,
+        rollup_candidate_turns=candidate_turns,
         detachable_names=[],
     ) == []
 
     soft = agent._context_management_notices_ephemeral(
         accounting={"constraint": 100, "usage_percent": 30},
-        rollup_eligibility=eligibility,
+        rollup_candidate_turns=candidate_turns,
         detachable_names=[],
     )
     assert "Eligible rollups exist" in soft[-1]
 
     no_rollup = agent._context_management_notices_ephemeral(
         accounting={"constraint": 100, "usage_percent": 30},
-        rollup_eligibility=None,
+        rollup_candidate_turns=(),
         detachable_names=[],
     )
     assert no_rollup == []
 
     cases = [
-        (eligibility, [], "Roll up eligible old context", "unview"),
-        (None, ["file.py"], "unview(...)", "Warn the user"),
-        (eligibility, ["file.py"], "Roll up eligible old context and detach", "Warn the user"),
-        (None, [], "Warn the user", "You are expected"),
+        (candidate_turns, [], "Roll up eligible old context", "unview"),
+        ((), ["file.py"], "unview(...)", "Warn the user"),
+        (candidate_turns, ["file.py"], "Roll up eligible old context and detach", "Warn the user"),
+        ((), [], "Warn the user", "You are expected"),
     ]
     for available, names, included, excluded in cases:
         notice = agent._context_management_notices_ephemeral(
             accounting={"constraint": 100, "usage_percent": 80},
-            rollup_eligibility=available,
+            rollup_candidate_turns=available,
             detachable_names=names,
         )[-1]
         assert included in notice
@@ -881,7 +881,7 @@ def test_context_accounting_estimation_failure_is_nonfatal():
     }
     assert agent._context_management_notices_ephemeral(
         accounting=accounting,
-        rollup_eligibility=None,
+        rollup_candidate_turns=(),
         detachable_names=[],
     ) == []
 
