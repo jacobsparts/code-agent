@@ -15,7 +15,6 @@ ExecServerMessage oneof enumeration in EXEC_SERVER_TOOL_FIELDS.
 
 from __future__ import annotations
 
-import ast
 from collections import deque
 from dataclasses import dataclass, field
 import errno
@@ -33,11 +32,13 @@ import struct
 import sys
 import time
 from types import MappingProxyType
-from typing import Iterable, Iterator, Mapping
+from typing import Iterable, Mapping
 import uuid
 from urllib.parse import urljoin, urlsplit
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from . import cursor_schema
 
 
 # === Configuration globals ===
@@ -126,14 +127,9 @@ def _debug_bidi_event(event: str, **details) -> None:
         pass
 
 
-# === Protobuf wire codec ===
+# === Message classification ===
 
-
-
-
-UINT64_MAX = (1 << 64) - 1
-MAX_FIELD_NUMBER = (1 << 29) - 1
-RESERVED_FIELD_RANGE = range(19000, 20000)
+from . import cursor_schema as _schema
 
 NATIVE_EXEC_FIELD_NAMES = {
     2: "shell_args", 3: "write_args", 4: "delete_args", 5: "grep_args",
@@ -165,202 +161,6 @@ INTERACTION_UPDATE_FIELD_NAMES = {
     20: "active_branch_change", 21: "feedback_request",
     22: "response_comparison",
 }
-
-def _validate_field_number(number: int) -> None:
-    if not isinstance(number, int):
-        raise TypeError("field number must be int")
-    if not 1 <= number <= MAX_FIELD_NUMBER:
-        raise ValueError(f"field number must be 1..{MAX_FIELD_NUMBER}")
-    # Reserved numbers are accepted: this is a schema-free wire library, and
-    # rejecting them would prevent lossless handling of otherwise valid bytes.
-
-
-def encode_varint(value: int) -> bytes:
-    if not isinstance(value, int):
-        raise TypeError("varint must be int")
-    if not 0 <= value <= UINT64_MAX:
-        raise ValueError("varint must fit uint64")
-    out = bytearray()
-    while value >= 0x80:
-        out.append((value & 0x7f) | 0x80)
-        value >>= 7
-    out.append(value)
-    return bytes(out)
-
-
-def _read_varint(data: bytes, offset: int) -> tuple[int, int, bytes]:
-    start = offset
-    value = 0
-    for index in range(10):
-        if offset >= len(data):
-            raise ValueError("truncated varint")
-        byte = data[offset]
-        offset += 1
-        if index == 9 and byte > 1:
-            raise ValueError("varint exceeds uint64")
-        value |= (byte & 0x7f) << (index * 7)
-        if byte < 0x80:
-            return value, offset, data[start:offset]
-    raise ValueError("unterminated varint exceeds 10 bytes")
-
-
-@dataclass(frozen=True, slots=True)
-class Field:
-    number: int
-    wire_type: int
-    value: int | bytes
-    _tag_bytes: bytes | None = field(default=None, repr=False, compare=False)
-    _value_bytes: bytes | None = field(default=None, repr=False, compare=False)
-    _length_bytes: bytes | None = field(default=None, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        _validate_field_number(self.number)
-        if self.wire_type not in (0, 1, 2, 5):
-            raise ValueError(f"unsupported wire type {self.wire_type}")
-        if self.wire_type == 2:
-            if not isinstance(self.value, bytes):
-                raise TypeError("length-delimited value must be bytes")
-        elif not isinstance(self.value, int):
-            raise TypeError("numeric wire value must be int")
-        elif self.wire_type == 0 and not 0 <= self.value <= UINT64_MAX:
-            raise ValueError("varint value must fit uint64")
-        elif self.wire_type == 1 and not 0 <= self.value < (1 << 64):
-            raise ValueError("fixed64 value must fit uint64")
-        elif self.wire_type == 5 and not 0 <= self.value < (1 << 32):
-            raise ValueError("fixed32 value must fit uint32")
-
-    @classmethod
-    def varint(cls, number: int, value: int) -> "Field":
-        return cls(number, 0, value)
-
-    @classmethod
-    def fixed64(cls, number: int, value: int) -> "Field":
-        return cls(number, 1, value)
-
-    @classmethod
-    def bytes(cls, number: int, value: bytes) -> "Field":
-        return cls(number, 2, value)
-
-    @classmethod
-    def fixed32(cls, number: int, value: int) -> "Field":
-        return cls(number, 5, value)
-
-    def replacing(self, *, number: int | None = None, value: int | bytes | None = None) -> "Field":
-        return Field(
-            self.number if number is None else number,
-            self.wire_type,
-            self.value if value is None else value,
-        )
-
-    def encode(self) -> bytes:
-        tag = self._tag_bytes or encode_varint((self.number << 3) | self.wire_type)
-        if self.wire_type == 0:
-            return tag + (self._value_bytes or encode_varint(self.value))
-        if self.wire_type == 1:
-            return tag + (self._value_bytes or struct.pack("<Q", self.value))
-        if self.wire_type == 5:
-            return tag + (self._value_bytes or struct.pack("<I", self.value))
-        return tag + (self._length_bytes or encode_varint(len(self.value))) + self.value
-
-    def nested(self) -> "RawMessage":
-        if self.wire_type != 2:
-            raise TypeError("only length-delimited fields can be decoded as nested")
-        return RawMessage.decode(self.value)
-
-    def __repr__(self) -> str:
-        value = (
-            "b''" if self.value == b"" else
-            f"0x{self.value.hex()}" if isinstance(self.value, bytes) else
-            repr(self.value)
-        )
-        canonical = Field(self.number, self.wire_type, self.value).encode()
-        exact = self.encode()
-        suffix = "" if exact == canonical else f", encoded=0x{exact.hex()}"
-        return f"Field({self.number}, {self.wire_type}, value={value}{suffix})"
-
-
-@dataclass(frozen=True, slots=True)
-class RawMessage:
-    fields: tuple[Field, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.fields, tuple):
-            object.__setattr__(self, "fields", tuple(self.fields))
-
-    @classmethod
-    def decode(cls, data: bytes) -> "RawMessage":
-        if not isinstance(data, bytes):
-            raise TypeError("protobuf input must be bytes")
-        fields = []
-        offset = 0
-        while offset < len(data):
-            tag, offset, tag_bytes = _read_varint(data, offset)
-            number, wire_type = tag >> 3, tag & 7
-            _validate_field_number(number)
-            if wire_type == 0:
-                value, offset, raw = _read_varint(data, offset)
-                fields.append(Field(number, 0, value, tag_bytes, raw))
-            elif wire_type == 1:
-                end = offset + 8
-                if end > len(data):
-                    raise ValueError("truncated fixed64")
-                raw = data[offset:end]
-                fields.append(Field(number, 1, struct.unpack("<Q", raw)[0], tag_bytes, raw))
-                offset = end
-            elif wire_type == 2:
-                length, offset, length_bytes = _read_varint(data, offset)
-                end = offset + length
-                if end > len(data):
-                    raise ValueError("truncated length-delimited value")
-                fields.append(Field(number, 2, data[offset:end], tag_bytes, None, length_bytes))
-                offset = end
-            elif wire_type == 5:
-                end = offset + 4
-                if end > len(data):
-                    raise ValueError("truncated fixed32")
-                raw = data[offset:end]
-                fields.append(Field(number, 5, struct.unpack("<I", raw)[0], tag_bytes, raw))
-                offset = end
-            else:
-                raise ValueError(f"unsupported wire type {wire_type}")
-        return cls(tuple(fields))
-
-    @classmethod
-    def canonical(cls, fields: Iterable[Field]) -> "RawMessage":
-        return cls(tuple(Field(item.number, item.wire_type, item.value) for item in fields))
-
-    def replacing(self, index: int, new_field: Field) -> "RawMessage":
-        fields = list(self.fields)
-        fields[index] = new_field
-        return RawMessage(tuple(fields))
-
-    def encode(self) -> bytes:
-        return b"".join(item.encode() for item in self.fields)
-
-    def matching(self, number: int, wire_type: int | None = None) -> tuple[Field, ...]:
-        return tuple(
-            item for item in self.fields
-            if item.number == number and (wire_type is None or item.wire_type == wire_type)
-        )
-
-    def first_bytes(self, number: int) -> bytes | None:
-        fields = self.matching(number, 2)
-        return fields[0].value if fields else None
-
-    def has(self, number: int, wire_type: int | None = None) -> bool:
-        return bool(self.matching(number, wire_type))
-
-    def __repr__(self) -> str:
-        return f"RawMessage(fields={list(self.fields)!r})"
-
-
-def protobuf_field(number: int, wire_type: int, value: int | bytes) -> Field:
-    return Field(number, wire_type, value)
-
-
-def protobuf_message(*fields: Field) -> bytes:
-    return RawMessage(tuple(fields)).encode()
-
 
 @dataclass(frozen=True, slots=True)
 class ConnectFrame:
@@ -427,395 +227,27 @@ def encode_connect_frame(payload: bytes, flags: int = 0, compress: bool = False)
     return ConnectFrame.from_decoded(payload, flags=flags, compress=compress).encode()
 
 
-@dataclass(frozen=True, slots=True)
-class SemanticField:
-    """A visible, self-contained semantic replacement for one wire token."""
-
-    number: int
-    wire_type: int
-    name: str
-    value: object
-    tag_bytes: bytes | None = None
-    value_bytes: bytes | None = None
-    length_bytes: bytes | None = None
-
-    @classmethod
-    def from_field(cls, name: str, value: object, source: Field) -> "SemanticField":
-        canonical_tag = encode_varint((source.number << 3) | source.wire_type)
-        canonical_value = _semantic_wire_value(value, source.wire_type)
-        canonical_value_bytes = (
-            encode_varint(canonical_value) if source.wire_type == 0 else
-            struct.pack("<Q", canonical_value) if source.wire_type == 1 else
-            struct.pack("<I", canonical_value) if source.wire_type == 5 else None
-        )
-        canonical_length = (
-            encode_varint(len(canonical_value)) if source.wire_type == 2 else None
-        )
-        return cls(
-            source.number,
-            source.wire_type,
-            name,
-            value,
-            source._tag_bytes if source._tag_bytes != canonical_tag else None,
-            source._value_bytes if source._value_bytes != canonical_value_bytes else None,
-            source._length_bytes if source._length_bytes != canonical_length else None,
-        )
-
-    def encode(self) -> bytes:
-        value = _semantic_wire_value(self.value, self.wire_type)
-        tag = self.tag_bytes or encode_varint((self.number << 3) | self.wire_type)
-        if self.wire_type == 0:
-            return tag + (self.value_bytes or encode_varint(value))
-        if self.wire_type == 1:
-            return tag + (self.value_bytes or struct.pack("<Q", value))
-        if self.wire_type == 5:
-            return tag + (self.value_bytes or struct.pack("<I", value))
-        return tag + (self.length_bytes or encode_varint(len(value))) + value
-
-    def __repr__(self) -> str:
-        metadata = ""
-        if self.tag_bytes is not None:
-            metadata += f", tag=0x{self.tag_bytes.hex()}"
-        if self.value_bytes is not None:
-            metadata += f", value_encoding=0x{self.value_bytes.hex()}"
-        if self.length_bytes is not None:
-            metadata += f", length=0x{self.length_bytes.hex()}"
-        return (
-            f"SemanticField({self.number}, {self.wire_type}, "
-            f"{self.name}={self.value!r}{metadata})"
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class NestedField:
-    """A visible, self-contained length-delimited semantic envelope."""
-
-    number: int
-    content: "MessageRepresentation"
-    tag_bytes: bytes | None = None
-    length_bytes: bytes | None = None
-
-    @classmethod
-    def from_field(
-        cls, source: Field, content: "MessageRepresentation",
-    ) -> "NestedField":
-        canonical_tag = encode_varint((source.number << 3) | 2)
-        canonical_length = encode_varint(len(source.value))
-        return cls(
-            source.number,
-            content,
-            source._tag_bytes if source._tag_bytes != canonical_tag else None,
-            source._length_bytes if source._length_bytes != canonical_length else None,
-        )
-
-    def encode(self) -> bytes:
-        value = self.content.encode()
-        tag = self.tag_bytes or encode_varint((self.number << 3) | 2)
-        length = self.length_bytes or encode_varint(len(value))
-        return tag + length + value
-
-    def __repr__(self) -> str:
-        metadata = ""
-        if self.tag_bytes is not None:
-            metadata += f", tag=0x{self.tag_bytes.hex()}"
-        if self.length_bytes is not None:
-            metadata += f", length=0x{self.length_bytes.hex()}"
-        return f"NestedField({self.number}, {self.content!r}{metadata})"
-
-
-@dataclass(frozen=True, slots=True)
-class MessageRepresentation:
-    """Ordered lossless semantic/raw token stream."""
-
-    parts: tuple[Field | SemanticField | NestedField, ...]
-
-    def encode(self) -> bytes:
-        return b"".join(part.encode() for part in self.parts)
-
-    def __repr__(self) -> str:
-        return f"MessageRepresentation({list(self.parts)!r})"
-
-
-def _semantic_wire_value(value: object, wire_type: int) -> int | bytes:
-    if wire_type == 2:
-        if isinstance(value, bytes):
-            return value
-        if isinstance(value, str):
-            return value.encode("utf-8", "surrogateescape")
-        raise TypeError("length-delimited semantic value must be bytes or str")
-    if not isinstance(value, int):
-        raise TypeError("numeric semantic value must be int")
-    return value
-
-
-def _field_index(raw: RawMessage, number: int, wire_type: int | None = None) -> int | None:
-    for index, item in enumerate(raw.fields):
-        if item.number == number and (wire_type is None or item.wire_type == wire_type):
-            return index
-    return None
-
-
-def _representation(
-    raw: RawMessage,
-    replacements: Mapping[tuple[int, ...], tuple[str, object]],
-) -> MessageRepresentation:
-    parts: list[Field | SemanticField | NestedField] = []
-    for index, item in enumerate(raw.fields):
-        direct = replacements.get((index,))
-        children = {
-            path[1:]: replacement
-            for path, replacement in replacements.items()
-            if len(path) > 1 and path[0] == index
-        }
-        if direct is not None:
-            parts.append(SemanticField.from_field(direct[0], direct[1], item))
-        elif children and item.wire_type == 2:
-            nested = RawMessage.decode(item.value)
-            content = _representation(nested, children)
-            parts.append(NestedField.from_field(item, content))
-        else:
-            parts.append(item)
-    return MessageRepresentation(tuple(parts))
-
-
 @dataclass(frozen=True, slots=True, repr=False)
 class CursorMessage:
-    raw: RawMessage
+    """A decoded Run_res / AgentClientMessage envelope plus its classification."""
+
+    decoded: dict
     classification: str
     direction: str
-
-    def encode(self) -> bytes:
-        return self.raw.encode()
-
-    @property
-    def all_fields(self) -> tuple[Field, ...]:
-        return self.raw.fields
-
-    def representation(self) -> MessageRepresentation:
-        replacements: dict[tuple[int, ...], tuple[str, object]] = {}
-
-        if isinstance(self, AnswerText):
-            outer = _field_index(self.raw, 1, 2)
-            one = _decode_or_none(self.raw.fields[outer].value) if outer is not None else None
-            middle = _field_index(one, 1, 2) if one is not None else None
-            two = (
-                _decode_or_none(one.fields[middle].value)
-                if one is not None and middle is not None else None
-            )
-            leaf = _field_index(two, 1, 2) if two is not None else None
-            if None not in (outer, middle, leaf):
-                replacements[(outer, middle, leaf)] = ("text", self.text)
-
-        elif isinstance(self, NativeExec):
-            outer = _field_index(self.raw, 2, 2)
-            execution = (
-                _decode_or_none(self.raw.fields[outer].value)
-                if outer is not None else None
-            )
-            leaf = (
-                _field_index(execution, self.field_number, 2)
-                if execution is not None else None
-            )
-            if outer is not None and leaf is not None:
-                replacements[(outer, leaf)] = (
-                    self.subtype,
-                    self.arguments_payload,
-                )
-
-        elif isinstance(self, InteractionUpdate) and self.subtype_number:
-            outer = _field_index(self.raw, 1, 2)
-            interaction = (
-                _decode_or_none(self.raw.fields[outer].value)
-                if outer is not None else None
-            )
-            leaf = (
-                _field_index(interaction, self.subtype_number)
-                if interaction is not None else None
-            )
-            if (
-                outer is not None
-                and leaf is not None
-                and interaction.fields[leaf].wire_type == 2
-            ):
-                replacements[(outer, leaf)] = (
-                    self.subtype,
-                    self.update_payload,
-                )
-
-        elif isinstance(self, LiveMCPCall):
-            outer = _field_index(self.raw, 2, 2)
-            execution = (
-                _decode_or_none(self.raw.fields[outer].value)
-                if outer is not None else None
-            )
-            if outer is not None and execution is not None:
-                server_id = _field_index(execution, 1, 0)
-                args_index = _field_index(execution, 11, 2)
-                execution_id = _field_index(execution, 15, 2)
-                if server_id is not None:
-                    replacements[(outer, server_id)] = (
-                        "server_message_id", self.server_message_id,
-                    )
-                if execution_id is not None:
-                    replacements[(outer, execution_id)] = (
-                        "execution_id", self.execution_id,
-                    )
-                if args_index is not None:
-                    args = _decode_or_none(execution.fields[args_index].value)
-                    if args is not None:
-                        semantic_args = (
-                            (1, "name", self.name),
-                            (3, "tool_call_id", self.tool_call_id),
-                            (4, "provider_identifier", self.provider_identifier),
-                            (5, "tool_name", self.tool_name),
-                            (9, "server_identifier", self.server_identifier),
-                        )
-                        for number, name, value in semantic_args:
-                            index = _field_index(args, number, 2)
-                            if index is not None:
-                                replacements[(outer, args_index, index)] = (
-                                    name, value,
-                                )
-
-        elif isinstance(self, CompletedMCPUpdate):
-            path_numbers = (1, 2, 2, 15, 1)
-            current = self.raw
-            path: list[int] = []
-            for depth, number in enumerate(path_numbers):
-                index = _field_index(current, number, 2)
-                if index is None:
-                    break
-                path.append(index)
-                if depth < len(path_numbers) - 1:
-                    current = _decode_or_none(current.fields[index].value)
-                    if current is None:
-                        break
-            if len(path) == len(path_numbers):
-                args = _decode_or_none(current.fields[path[-1]].value)
-                if args is not None:
-                    semantic_args = (
-                        (1, "name", self.name),
-                        (3, "tool_call_id", self.tool_call_id),
-                        (4, "provider_identifier", self.provider_identifier),
-                        (5, "tool_name", self.tool_name),
-                    )
-                    for number, name, value in semantic_args:
-                        index = _field_index(args, number, 2)
-                        if index is not None:
-                            replacements[tuple(path + [index])] = (name, value)
-
-        return _representation(self.raw, replacements)
 
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}("
             f"classification={self.classification!r}, "
-            f"direction={self.direction!r}, "
-            f"content={self.representation()!r})"
+            f"direction={self.direction!r})"
         )
-
-
-def parse_message_repr(text: str) -> MessageRepresentation:
-    """Parse a CursorMessage repr and reconstruct its visible representation."""
-
-    tree = ast.parse(text, mode="eval")
-
-    def hex_bytes(node: ast.AST) -> bytes:
-        if not isinstance(node, ast.Constant) or not isinstance(node.value, int):
-            raise ValueError("encoding metadata must be a hexadecimal integer")
-        source = ast.get_source_segment(text, node)
-        if source is None or not source.lower().startswith("0x"):
-            raise ValueError("encoding metadata must use hexadecimal notation")
-        token = source[2:].replace("_", "")
-        if len(token) % 2:
-            token = "0" + token
-        return bytes.fromhex(token)
-
-    def parse_node(node: ast.AST) -> object:
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, ast.List):
-            return tuple(parse_node(item) for item in node.elts)
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-            raise ValueError("unsupported repr syntax")
-        name = node.func.id
-        keywords = {item.arg: item.value for item in node.keywords}
-        if name not in {
-            "MessageRepresentation", "Field", "SemanticField", "NestedField",
-        }:
-            if "content" not in keywords:
-                raise ValueError("message repr has no content")
-            result = parse_node(keywords["content"])
-            if not isinstance(result, MessageRepresentation):
-                raise ValueError("message content is not a representation")
-            return result
-        if name == "MessageRepresentation":
-            if len(node.args) != 1:
-                raise ValueError("invalid MessageRepresentation repr")
-            return MessageRepresentation(tuple(parse_node(node.args[0])))
-        if name == "Field":
-            if len(node.args) != 2 or "value" not in keywords:
-                raise ValueError("invalid Field repr")
-            number = ast.literal_eval(node.args[0])
-            wire_type = ast.literal_eval(node.args[1])
-            value_node = keywords["value"]
-            if (
-                wire_type == 2 and isinstance(value_node, ast.Constant)
-                and isinstance(value_node.value, int)
-            ):
-                value = hex_bytes(value_node)
-            else:
-                value = ast.literal_eval(value_node)
-            encoded = keywords.get("encoded")
-            if encoded is None:
-                return Field(number, wire_type, value)
-            exact = RawMessage.decode(hex_bytes(encoded))
-            if len(exact.fields) != 1:
-                raise ValueError("Field encoded metadata is not one field")
-            return exact.fields[0]
-        if name == "SemanticField":
-            if len(node.args) != 2 or len(keywords) < 1:
-                raise ValueError("invalid SemanticField repr")
-            semantic = [
-                (key, value) for key, value in keywords.items()
-                if key not in {"tag", "value_encoding", "length"}
-            ]
-            if len(semantic) != 1:
-                raise ValueError("SemanticField requires one named value")
-            semantic_name, value_node = semantic[0]
-            return SemanticField(
-                ast.literal_eval(node.args[0]),
-                ast.literal_eval(node.args[1]),
-                semantic_name,
-                ast.literal_eval(value_node),
-                hex_bytes(keywords["tag"]) if "tag" in keywords else None,
-                hex_bytes(keywords["value_encoding"])
-                if "value_encoding" in keywords else None,
-                hex_bytes(keywords["length"]) if "length" in keywords else None,
-            )
-        if len(node.args) != 2:
-            raise ValueError("invalid NestedField repr")
-        content = parse_node(node.args[1])
-        if not isinstance(content, MessageRepresentation):
-            raise ValueError("NestedField content is not a representation")
-        return NestedField(
-            ast.literal_eval(node.args[0]),
-            content,
-            hex_bytes(keywords["tag"]) if "tag" in keywords else None,
-            hex_bytes(keywords["length"]) if "length" in keywords else None,
-        )
-
-    result = parse_node(tree.body)
-    if not isinstance(result, MessageRepresentation):
-        raise ValueError("repr did not contain a message representation")
-    return result
 
 
 @dataclass(frozen=True, slots=True, repr=False)
 class NativeExec(CursorMessage):
     field_number: int
     subtype: str
-    arguments_payload: bytes
+    arguments: dict
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -827,7 +259,7 @@ class LiveMCPCall(CursorMessage):
     provider_identifier: str
     tool_name: str
     server_identifier: str
-    arguments_raw: bytes
+    arguments: dict
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -836,35 +268,19 @@ class CompletedMCPUpdate(CursorMessage):
     name: str
     provider_identifier: str
     tool_name: str
-    arguments_raw: bytes
+    arguments: dict
 
 
 @dataclass(frozen=True, slots=True, repr=False)
 class AnswerText(CursorMessage):
     text: str
 
-    @classmethod
-    def create(cls, text: str) -> "AnswerText":
-        leaf = protobuf_message(Field.bytes(1, text.encode()))
-        middle = protobuf_message(Field.bytes(1, leaf))
-        raw = RawMessage((Field.bytes(1, middle),))
-        return cls(raw, "agent_server.answer_text", "IN", text)
-
 
 @dataclass(frozen=True, slots=True, repr=False)
 class InteractionUpdate(CursorMessage):
     subtype_number: int
     subtype: str
-    update_payload: bytes
-
-    @classmethod
-    def create(cls, subtype: str, payload: bytes = b"") -> "InteractionUpdate":
-        reverse = {name: number for number, name in INTERACTION_UPDATE_FIELD_NAMES.items()}
-        number = reverse[subtype]
-        interaction = protobuf_message(Field.bytes(number, payload))
-        raw = RawMessage((Field.bytes(1, interaction),))
-        return cls(raw, f"agent_server.interaction_update.{subtype}", "IN",
-                   number, subtype, payload)
+    update: object
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -912,172 +328,125 @@ class Control(CursorMessage):
     pass
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ClientHeartbeat(CursorMessage):
-    @classmethod
-    def create(cls) -> "ClientHeartbeat":
-        raw = RawMessage((Field.bytes(7, b""),))
-        return cls(raw, "agent_client.heartbeat", "OUT")
-
-
-def _decode_or_none(data: bytes | None) -> RawMessage | None:
-    if data is None:
-        return None
-    try:
-        return RawMessage.decode(data)
-    except ValueError:
-        return None
-
-
-def _nested(raw: RawMessage | None, number: int) -> RawMessage | None:
-    return _decode_or_none(raw.first_bytes(number)) if raw is not None else None
-
-
-def _decode_text(data: bytes | None) -> str:
-    return "" if data is None else data.decode("utf-8", "surrogateescape")
-
-
-def _first_varint(raw: RawMessage, number: int) -> int:
-    fields = raw.matching(number, 0)
-    return fields[0].value if fields else 0
-
-
-def _answer_decode_text(raw: RawMessage) -> str:
-    one = _nested(raw, 1)
-    two = _nested(one, 1)
-    value = two.first_bytes(1) if two else None
-    return _decode_text(value) if value else ""
-
-
-def _live_mcp(raw: RawMessage) -> dict[str, object] | None:
-    execution = _nested(raw, 2)
-    if execution is None:
-        return None
-    args_raw = execution.first_bytes(11)
-    execution_id = execution.first_bytes(15)
-    args = _decode_or_none(args_raw)
-    if args is None or not execution_id:
-        return None
-    name = args.first_bytes(1) or args.first_bytes(5)
-    call_id = args.first_bytes(3)
-    if not name or not call_id:
-        return None
-    return {
-        "server_message_id": _first_varint(execution, 1),
-        "execution_id": execution_id,
-        "tool_call_id": _decode_text(call_id),
-        "name": _decode_text(name),
-        "provider_identifier": _decode_text(args.first_bytes(4)),
-        "tool_name": _decode_text(args.first_bytes(5) or name),
-        "server_identifier": _decode_text(args.first_bytes(9)),
-        "arguments_raw": args_raw,
-    }
-
-
-def _completed_mcp(raw: RawMessage) -> dict[str, object] | None:
-    update = _nested(raw, 1)
-    completed = _nested(update, 2)
-    tool = _nested(completed, 2)
-    mcp = _nested(tool, 15)
-    args_raw = mcp.first_bytes(1) if mcp else None
-    args = _decode_or_none(args_raw)
-    if args is None:
-        return None
-    name = args.first_bytes(1) or args.first_bytes(5)
-    call_id = args.first_bytes(3)
-    if not name or not call_id:
-        return None
-    return {
-        "tool_call_id": _decode_text(call_id),
-        "name": _decode_text(name),
-        "provider_identifier": _decode_text(args.first_bytes(4)),
-        "tool_name": _decode_text(args.first_bytes(5) or name),
-        "arguments_raw": args_raw,
-    }
-
-
-def classify(raw: RawMessage, direction: str) -> CursorMessage:
+def classify(payload: bytes, direction: str) -> CursorMessage:
     direction = direction.upper()
     if direction not in ("IN", "OUT"):
         raise ValueError("direction must be IN or OUT")
-    if direction == "OUT":
-        # Go intentionally tests nonempty byte values for fields 1/2/3/5,
-        # while heartbeat field 7 is presence-based.
-        for number, kind, name in (
-            (1, RunRequest, "agent_client.run_request"),
-            (2, ClientExecMessage, "agent_client.exec_message"),
-            (3, KVResponse, "agent_client.kv_response"),
-            (5, Control, "agent_client.control"),
-        ):
-            value = raw.first_bytes(number)
-            if value is not None and len(value) > 0:
-                return kind(raw, name, direction)
-        if raw.has(7):
-            return ClientHeartbeat(raw, "agent_client.heartbeat", direction)
-        return CursorMessage(raw, "unknown", direction)
+    message_type = "AgentClientMessage" if direction == "OUT" else "Run_res"
+    decoded = cursor_schema.decode(payload, message_type)
 
-    execution = _nested(raw, 2)
-    if execution is not None:
-        for item in execution.fields:
-            if item.wire_type == 2 and item.number in NATIVE_EXEC_FIELD_NAMES:
-                subtype = NATIVE_EXEC_FIELD_NAMES[item.number]
-                return NativeExec(raw, f"agent_server.native_exec.{subtype}", direction,
-                                  item.number, subtype, item.value)
-    live = _live_mcp(raw)
-    if live:
-        return LiveMCPCall(raw, f"agent_server.mcp_exec.{live['name']}", direction, **live)
-    completed = _completed_mcp(raw)
-    if completed:
-        return CompletedMCPUpdate(
-            raw, f"agent_server.completed_mcp_update.{completed['name']}",
-            direction, **completed,
+    def make(kind, name, *extra):
+        return kind(decoded, name, direction, *extra)
+
+    if direction == "OUT":
+        for key, kind, name in (
+            ("runRequest", RunRequest, "agent_client.run_request"),
+            ("execClientMessage", ClientExecMessage, "agent_client.exec_message"),
+            ("kvClientMessage", KVResponse, "agent_client.kv_response"),
+            ("execClientControlMessage", Control, "agent_client.control"),
+            ("_field4", Control, "agent_client.control"),
+        ):
+            if key in decoded:
+                return make(kind, name)
+        if "clientHeartbeat" in decoded:
+            return make(ClientHeartbeat, "agent_client.heartbeat")
+        return make(CursorMessage, "unknown")
+
+    interaction = decoded.get("interactionUpdate")
+    if interaction:
+        for field in cursor_schema.MESSAGES["InteractionUpdate"]:
+            if field.name not in interaction:
+                continue
+            subtype = _snake(field.name)
+            value = interaction[field.name]
+            if field.name == "textDelta":
+                return make(
+                    AnswerText,
+                    "agent_server.answer_text",
+                    value.get("text", "") if isinstance(value, dict) else "",
+                )
+            return make(
+                InteractionUpdate,
+                f"agent_server.interaction_update.{subtype}",
+                field.num,
+                subtype,
+                value,
+            )
+        return make(
+            InteractionUpdate,
+            "agent_server.interaction_update.unclassified",
+            0,
+            "unclassified",
+            {},
         )
-    answer = _answer_decode_text(raw)
-    if answer:
-        return AnswerText(raw, "agent_server.answer_text", direction, answer)
-    value = raw.first_bytes(1)
-    if value is not None and len(value) > 0:
-        interaction = _decode_or_none(value)
-        if interaction is not None:
-            for item in interaction.fields:
-                if item.number in INTERACTION_UPDATE_FIELD_NAMES:
-                    subtype = INTERACTION_UPDATE_FIELD_NAMES[item.number]
-                    payload = item.value if item.wire_type == 2 else item.encode()
-                    return InteractionUpdate(
-                        raw, f"agent_server.interaction_update.{subtype}", direction,
-                        item.number, subtype, payload,
-                    )
-        return InteractionUpdate(raw, "agent_server.interaction_update.unclassified",
-                                 direction, 0, "unclassified", value)
-    for number, kind, name in (
-        (2, AgentExecMessage, "agent_server.exec_message.unclassified"),
-        (3, CheckpointUpdate, "agent_server.conversation_checkpoint_update"),
-    ):
-        value = raw.first_bytes(number)
-        if value is not None and len(value) > 0:
-            return kind(raw, name, direction)
-    value = raw.first_bytes(4)
-    if value is not None and len(value) > 0:
-        kv = _decode_or_none(value)
-        subtype = "unclassified"
-        if kv and kv.has(2):
-            subtype = "get_blob_args"
-        elif kv and kv.has(3):
-            subtype = "set_blob_args"
-        return KVServerMessage(raw, f"agent_server.kv_server_message.{subtype}",
-                               direction, subtype)
-    for number, kind, name in (
-        (5, ExecControlMessage, "agent_server.exec_control_message"),
-        (7, InteractionQuery, "agent_server.interaction_query"),
-    ):
-        value = raw.first_bytes(number)
-        if value is not None and len(value) > 0:
-            return kind(raw, name, direction)
-    return CursorMessage(raw, "unknown", direction)
+
+    execution = decoded.get("execServerMessage")
+    if execution:
+        for field in cursor_schema.MESSAGES["ExecServerMessage"]:
+            if field.name not in execution or field.num in (1, 15, 19, 55):
+                continue
+            value = execution[field.name]
+            if field.name == "mcpArgs":
+                return _live_mcp_from_schema(
+                    decoded, execution, value, direction
+                )
+            subtype = NATIVE_EXEC_FIELD_NAMES.get(field.num)
+            if subtype is None:
+                continue
+            return make(
+                NativeExec,
+                f"agent_server.native_exec.{subtype}",
+                field.num,
+                subtype,
+                value,
+            )
+        return make(AgentExecMessage, "agent_server.exec_message.unclassified")
+
+    if "conversationCheckpointUpdate" in decoded:
+        return make(CheckpointUpdate, "agent_server.conversation_checkpoint_update")
+    kv = decoded.get("kvServerMessage")
+    if kv is not None:
+        subtype = (
+            "get_blob_args" if "getBlobArgs" in kv else
+            "set_blob_args" if "setBlobArgs" in kv else
+            "unclassified"
+        )
+        return make(
+            KVServerMessage,
+            f"agent_server.kv_server_message.{subtype}",
+            subtype,
+        )
+    return make(CursorMessage, "unknown")
 
 
 def decode_cursor_payload(payload: bytes, direction: str) -> CursorMessage:
-    return classify(RawMessage.decode(payload), direction)
+    return classify(payload, direction)
+
+
+def _snake(name: str) -> str:
+    return "".join(
+        ("_" + char.lower()) if char.isupper() else char
+        for char in name
+    ).lstrip("_")
+
+
+def _live_mcp_from_schema(
+    decoded, execution, args, direction,
+) -> LiveMCPCall:
+    name = args.get("name") or args.get("toolName") or "mcp"
+    return LiveMCPCall(
+        decoded,
+        f"agent_server.mcp_exec.{name}",
+        direction,
+        execution.get("id", 0),
+        execution.get("execId", "").encode(),
+        args.get("toolCallId") or execution.get("execId", ""),
+        name,
+        args.get("providerIdentifier", ""),
+        args.get("toolName") or name,
+        args.get("serverIdentifier", ""),
+        args,
+    )
 
 
 def parse_eos_metadata(payload: bytes) -> tuple[object | None, str | None]:
@@ -1155,212 +524,6 @@ class CursorFrame:
         return self.connect.encode()
 
 
-@dataclass(frozen=True, slots=True)
-class FrameGroup:
-    """A contiguous lossless group under the README's simplified rules."""
-
-    kind: str
-    frames: tuple[CursorFrame, ...]
-
-    def __post_init__(self) -> None:
-        if not self.frames:
-            raise ValueError("frame group cannot be empty")
-
-    def encode_connect(self) -> bytes:
-        return b"".join(frame.encode_connect() for frame in self.frames)
-
-
-class LosslessFrameGrouper:
-    """Groups one ordered connection; it is not full AgentRun.Next state."""
-
-    def __init__(self) -> None:
-        self._pending: list[CursorFrame] = []
-        self._connection_id: str | None = None
-
-    @property
-    def connection_id(self) -> str | None:
-        return self._connection_id
-
-    def _bind_stream(self, frame: CursorFrame) -> None:
-        value = frame.metadata.get("connection_id")
-        if value is None:
-            return
-        identity = str(value).strip()
-        if not identity:
-            return
-        if self._connection_id is None:
-            self._connection_id = identity
-        elif self._connection_id != identity:
-            raise ValueError(
-                f"frame connection_id {identity!r} conflicts with "
-                f"grouper connection_id {self._connection_id!r}"
-            )
-
-    def _flush(self) -> list[FrameGroup]:
-        if not self._pending:
-            return []
-        group = FrameGroup("interaction", tuple(self._pending))
-        self._pending.clear()
-        return [group]
-
-    def feed(self, frame: CursorFrame) -> list[FrameGroup]:
-        if not isinstance(frame, CursorFrame):
-            raise TypeError("frame must be CursorFrame")
-        self._bind_stream(frame)
-        if frame.connect.eos:
-            return self._flush() + [FrameGroup("eos_error" if frame.eos_error else "eos",
-                                                (frame,))]
-        message = frame.message
-        if isinstance(message, InteractionUpdate):
-            self._pending.append(frame)
-            return []
-        if isinstance(message, (AnswerText, CompletedMCPUpdate)):
-            self._pending.append(frame)
-            return self._flush()
-        # Flush before an intervening immediate, KV, or singleton frame so
-        # flattened output remains byte-for-byte ordered.
-        kind = (
-            "native_exec" if isinstance(message, NativeExec) else
-            "live_mcp" if isinstance(message, LiveMCPCall) else
-            "kv_internal" if isinstance(message, KVServerMessage) else
-            "singleton"
-        )
-        return self._flush() + [FrameGroup(kind, (frame,))]
-
-    def finish(self) -> list[FrameGroup]:
-        return self._flush()
-
-
-def flatten_groups(groups: Iterable[FrameGroup]) -> tuple[CursorFrame, ...]:
-    return tuple(frame for group in groups for frame in group.frames)
-
-
-def reconstitute_connect(groups: Iterable[FrameGroup]) -> bytes:
-    return b"".join(frame.encode_connect() for frame in flatten_groups(groups))
-
-
-def _record_to_frame(record: Mapping[str, object], default_direction: str | None) -> CursorFrame:
-    direction_value = record.get("direction", default_direction)
-    if direction_value is None:
-        raise ValueError("frame record is missing direction")
-    direction = str(direction_value).upper()
-    flags_value = record.get("flags")
-    if flags_value is None:
-        raise ValueError("frame record is missing flags")
-    flags = int(flags_value, 0) if isinstance(flags_value, str) else int(flags_value)
-    wire_hex = record.get("wire_payload_hex")
-    decoded_hex = record.get("decoded_payload_hex")
-    if isinstance(wire_hex, str):
-        wire_payload = bytes.fromhex(wire_hex)
-        connect = ConnectFrame(flags, wire_payload)
-        if isinstance(decoded_hex, str) and connect.decoded_payload != bytes.fromhex(decoded_hex):
-            raise ValueError("wire and decoded payload metadata disagree")
-    elif isinstance(decoded_hex, str):
-        decoded = bytes.fromhex(decoded_hex)
-        if flags & 1:
-            raise ValueError("compressed record requires wire_payload_hex")
-        connect = ConnectFrame(flags, decoded)
-    else:
-        raise ValueError("frame record has no payload hex")
-    return CursorFrame.decode(connect, direction, record)
-
-
-def load_log(path: str, default_direction: str | None = None) -> Iterator[CursorFrame]:
-    """Stream marker-delimited production records or one-object-per-line JSONL."""
-
-    begin = "========== CURSOR FRAME BEGIN"
-    end = "========== CURSOR FRAME END"
-    in_record = False
-    record_lines: list[str] = []
-    with open(path, "r", encoding="utf-8", errors="strict") as stream:
-        for line_number, line in enumerate(stream, 1):
-            stripped = line.strip()
-            if stripped.startswith(begin):
-                if in_record:
-                    raise ValueError(f"nested frame marker at line {line_number}")
-                in_record = True
-                record_lines = []
-                continue
-            if stripped.startswith(end):
-                if not in_record:
-                    raise ValueError(f"frame end without begin at line {line_number}")
-                try:
-                    record = json.loads("".join(record_lines))
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"malformed frame JSON ending at line {line_number}") from exc
-                if not isinstance(record, dict):
-                    raise ValueError(f"frame JSON ending at line {line_number} is not an object")
-                yield _record_to_frame(record, default_direction)
-                in_record = False
-                record_lines = []
-                continue
-            if in_record:
-                record_lines.append(line)
-                continue
-            if stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    record = json.loads(stripped)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"malformed JSONL frame at line {line_number}") from exc
-                if not isinstance(record, dict):
-                    raise ValueError(f"JSONL frame at line {line_number} is not an object")
-                if "decoded_payload_hex" in record or "wire_payload_hex" in record:
-                    yield _record_to_frame(record, default_direction)
-            elif (stripped.startswith("{")
-                  and ("decoded_payload_hex" in stripped or "wire_payload_hex" in stripped)):
-                raise ValueError(f"malformed JSONL frame at line {line_number}")
-        if in_record:
-            raise ValueError("unterminated CURSOR FRAME record")
-
-
-def production_conformance(path: str) -> dict[str, object]:
-    counts: dict[str, int] = {}
-    total = connect_round_trips = raw_round_trips = typed_round_trips = 0
-    for frame in load_log(path):
-        total += 1
-        expected_connect = (
-            bytes((frame.flags,))
-            + len(frame.wire_payload).to_bytes(4, "big")
-            + frame.wire_payload
-        )
-        if frame.encode_connect() != expected_connect:
-            raise AssertionError(f"Connect round-trip failed at frame {total}")
-        connect_round_trips += 1
-        counts[frame.classification] = counts.get(frame.classification, 0) + 1
-        if frame.connect.eos:
-            continue
-        raw = RawMessage.decode(frame.decoded_payload)
-        if raw.encode() != frame.decoded_payload:
-            raise AssertionError(f"raw round-trip failed at frame {total}")
-        raw_round_trips += 1
-        if frame.message is None or frame.message.encode() != frame.decoded_payload:
-            raise AssertionError(f"typed round-trip failed at frame {total}")
-        typed_round_trips += 1
-    return {
-        "total_frames": total,
-        "connect_round_trips": connect_round_trips,
-        "raw_round_trips": raw_round_trips,
-        "typed_round_trips": typed_round_trips,
-        "classifications": counts,
-    }
-
-
-__all__ = [
-    "UINT64_MAX", "MAX_FIELD_NUMBER", "RESERVED_FIELD_RANGE",
-    "Field", "RawMessage", "SemanticField", "NestedField",
-    "MessageRepresentation", "ConnectFrame", "CursorFrame",
-    "decode_connect_frames", "encode_connect_frame", "encode_varint",
-    "protobuf_field", "protobuf_message", "CursorMessage", "NativeExec",
-    "LiveMCPCall", "CompletedMCPUpdate", "AnswerText",
-    "InteractionUpdate", "AgentExecMessage", "CheckpointUpdate",
-    "KVServerMessage", "ExecControlMessage", "InteractionQuery",
-    "RunRequest", "ClientExecMessage", "KVResponse", "Control",
-    "ClientHeartbeat", "FrameGroup", "LosslessFrameGrouper",
-    "flatten_groups", "reconstitute_connect", "classify",
-    "decode_cursor_payload", "parse_message_repr", "parse_eos_metadata", "load_log",
-    "production_conformance", "NATIVE_EXEC_FIELD_NAMES",
-    "INTERACTION_UPDATE_FIELD_NAMES",
-]
 
 
 # === Connect/SSE transport ===
@@ -2547,32 +1710,14 @@ class SSEClient:
 # === Cursor Agent client ===
 
 
-def _message(*fields: Field) -> bytes:
-    return RawMessage(tuple(fields)).encode()
-
-
-def _bytes(number: int, payload: bytes) -> Field:
-    return Field.bytes(number, payload)
-
-
-def _string(number: int, value: str) -> Field:
-    return _bytes(number, value.encode())
-
-
 def extract_prefetched_blobs(client_payload: bytes) -> dict[bytes, bytes]:
-    client = RawMessage.decode(client_payload)
-    run_payload = client.first_bytes(1)
-    if run_payload is None:
-        return {}
-    run = RawMessage.decode(run_payload)
-    blobs = {}
-    for field in run.matching(17, 2):
-        blob = RawMessage.decode(field.value)
-        blob_id = blob.first_bytes(1)
-        value = blob.first_bytes(2)
-        if blob_id is not None and value is not None:
-            blobs[blob_id] = value
-    return blobs
+    client = cursor_schema.decode(client_payload, "AgentClientMessage")
+    run = client.get("runRequest", {})
+    return {
+        blob["blobId"]: blob["value"]
+        for blob in run.get("prefetchedBlobs", ())
+        if "blobId" in blob and "value" in blob
+    }
 
 
 def is_generation_progress(message: CursorMessage | None) -> bool:
@@ -2594,90 +1739,72 @@ def is_generation_progress(message: CursorMessage | None) -> bool:
     }
 
 
-def build_kv_response(server_payload: bytes, blobs) -> bytes | None:
-    server = RawMessage.decode(server_payload)
-    kv_payload = server.first_bytes(4)
-    if kv_payload is None:
+def build_kv_response(server: Mapping[str, object], blobs) -> bytes | None:
+    kv = server.get("kvServerMessage")
+    if kv is None:
         return None
-    kv = RawMessage.decode(kv_payload)
-    request_id_fields = kv.matching(1, 0)
-    request_id = (
-        int(request_id_fields[0].value) if request_id_fields else 0
-    )
-    get_args_payload = kv.first_bytes(2)
-    if get_args_payload is not None:
-        args = RawMessage.decode(get_args_payload)
-        blob_id = args.first_bytes(1)
+    response = {"id": kv.get("id", 0)}
+    if "getBlobArgs" in kv:
+        blob_id = kv["getBlobArgs"].get("blobId")
         if blob_id is None:
             return None
-        result_fields = []
-        value = blobs.get(blob_id)
-        if value is not None:
-            result_fields.append(_bytes(1, value))
-        kv_client = _message(
-            Field.varint(1, request_id),
-            _bytes(2, _message(*result_fields)),
-        )
-        return _message(_bytes(3, kv_client))
-    if kv.first_bytes(3) is not None:
-        kv_client = _message(
-            Field.varint(1, request_id),
-            _bytes(3, b""),
-        )
-        return _message(_bytes(3, kv_client))
-    return None
+        result = {}
+        if blob_id in blobs:
+            result["_field1"] = blobs[blob_id]
+        response["getBlobResult"] = result
+    elif "setBlobArgs" in kv:
+        response["setBlobResult"] = {}
+    else:
+        return None
+    return cursor_schema.encode(
+        {"kvClientMessage": response}, "AgentClientMessage"
+    )
 
 
 def is_response_boundary_blob_write(
-    server_payload: bytes, request_id: str
+    server: Mapping[str, object], request_id: str
 ) -> bool:
     try:
-        server = RawMessage.decode(server_payload)
-        kv_payload = server.first_bytes(4)
-        if kv_payload is None:
+        kv = server.get("kvServerMessage")
+        if not kv:
             return False
-        kv = RawMessage.decode(kv_payload)
-        set_args_payload = kv.first_bytes(3)
-        if set_args_payload is None:
+        set_args = kv.get("setBlobArgs")
+        if not set_args:
             return False
-        set_args = RawMessage.decode(set_args_payload)
-        blob_payload = set_args.first_bytes(2)
+        blob_payload = set_args.get("blobData")
         if blob_payload is None:
             return False
-        blob = RawMessage.decode(blob_payload)
-        structure_payload = blob.first_bytes(1)
-        if structure_payload is None:
+        blob = cursor_schema.decode(blob_payload, "_BoundaryBlob")
+        structure = blob.get("structure")
+        if not structure:
             return False
-        structure = RawMessage.decode(structure_payload)
-    except ValueError:
+        unknown = structure.get(cursor_schema.UNKNOWN)
+        if unknown:
+            return False
+        user_messages = structure.get("userMessage")
+        steps = structure.get("step") or ()
+        request_id_value = structure.get("requestId", "")
+    except (ValueError, IndexError):
         return False
 
-    if any(
-        field.number not in (1, 2, 3, 4, 5)
-        or field.wire_type != (0 if field.number == 5 else 2)
-        for field in structure.fields
-    ):
-        return False
-    user_messages = structure.matching(1, 2)
-    steps = structure.matching(2, 2)
-    request_ids = structure.matching(3, 2)
     if (
-        len(user_messages) != 1
-        or len(user_messages[0].value) != 32
+        not isinstance(user_messages, bytes)
+        or len(user_messages) != 32
         or not steps
-        or any(len(step.value) != 32 for step in steps)
-        or len(request_ids) != 1
+        or any(len(step) != 32 for step in steps)
     ):
         return False
+
     try:
-        return request_ids[0].value.decode() == request_id
+        return request_id_value == request_id
     except UnicodeDecodeError:
         return False
 
 
 def build_user_cancelled_message() -> bytes:
-    return _message(
-        _bytes(4, _message(_bytes(3, _message(_string(1, "user_cancelled")))))
+    return cursor_schema.encode(
+        {"_field4": {"_field3": {"reason": "user_cancelled"}}},
+        "AgentClientMessage",
     )
 
 
@@ -2690,60 +1817,58 @@ class ConversationMessage:
     tool_name: str = ""
 
 
-def _protobuf_value(value) -> bytes:
+def _value_dict(value):
     if value is None:
-        return _message(Field.varint(1, 0))
+        return {"nullValue": 0}
     if isinstance(value, bool):
-        return _message(Field.varint(4, int(value)))
+        return {"boolValue": value}
     if isinstance(value, (int, float)):
-        return _message(Field(2, 1, struct.pack("<d", float(value))))
+        return {"numberValue": float(value)}
     if isinstance(value, str):
-        return _message(_string(3, value))
+        return {"stringValue": value}
     if isinstance(value, dict):
-        entries = [
-            _bytes(
-                1,
-                _message(
-                    _string(1, str(key)),
-                    _bytes(2, _protobuf_value(item)),
-                ),
-            )
-            for key, item in value.items()
-        ]
-        return _message(_bytes(5, _message(*entries)))
+        return {
+            "structValue": {
+                "fields": [
+                    {"key": str(key), "value": _value_dict(item)}
+                    for key, item in value.items()
+                ]
+            }
+        }
     if isinstance(value, (list, tuple)):
-        items = [_bytes(1, _protobuf_value(item)) for item in value]
-        return _message(_bytes(6, _message(*items)))
-    return _message(_string(3, json.dumps(value, separators=(",", ":"))))
+        return {"listValue": {"values": [_value_dict(item) for item in value]}}
+    return {
+        "stringValue": json.dumps(value, separators=(",", ":"))
+    }
 
 
 def _historical_tool_step(
     call: "ToolCall", result: ConversationMessage | None
 ) -> bytes:
-    argument_fields = [
-        _string(1, call.name),
-        _string(3, call.id),
-        _string(4, call.provider_identifier),
-        _string(5, call.name),
-    ]
-    for key, value in call.arguments.items():
-        argument_fields.append(
-            _bytes(
-                2,
-                _message(
-                    _string(1, key),
-                    _bytes(2, _protobuf_value(value)),
-                ),
-            )
-        )
-    mcp_fields = [_bytes(1, _message(*argument_fields))]
+    payload = {
+        "_field1": {
+            "name": call.name,
+            "arguments": [
+                (str(key), _value_dict(value))
+                for key, value in call.arguments.items()
+            ],
+            "toolCallId": call.id,
+            "providerIdentifier": call.provider_identifier,
+            "toolName": call.name,
+        }
+    }
     if result is not None:
-        text = _message(_string(1, result.content))
-        item = _message(_bytes(1, text))
-        success = _message(_bytes(1, item), Field.varint(2, 0))
-        mcp_fields.append(_bytes(2, _message(_bytes(1, success))))
-    return _message(
-        _bytes(2, _message(_bytes(15, _message(*mcp_fields))))
+        payload["_field2"] = {
+            "_field1": {"content": result.content},
+            "_field2": False,
+        }
+    return cursor_schema.encode(
+        {
+            "_field2": {
+                "_field15": payload,
+            }
+        },
+        "_HistoricalToolStep",
     )
 
 
@@ -2795,18 +1920,24 @@ def encode_conversation_state(
     history, mode: int = 1
 ) -> tuple[bytes, list[bytes]]:
     history = list(history)
-    state_fields = [Field.varint(10, mode)]
+    state = {"mode": mode}
+    root_blobs = []
+    turns = []
     prefetched = []
 
     def add_blob(value: bytes) -> bytes:
         blob_id = hashlib.sha256(value).digest()
-        prefetched.append(_message(_bytes(1, blob_id), _bytes(2, value)))
+        prefetched.append({"blobId": blob_id, "value": value})
         return blob_id
+
+    def add_turn(turn):
+        turn_blob = add_blob(cursor_schema.encode(turn, "_HistoricalTurn"))
+        turns.append(turn_blob)
 
     for message in history:
         encoded = _conversation_message_json(message)
         if encoded:
-            state_fields.append(_bytes(1, add_blob(encoded)))
+            root_blobs.append(add_blob(encoded))
 
     index = 0
     while index < len(history):
@@ -2820,10 +1951,9 @@ def encode_conversation_state(
         user_id = "history-" + hashlib.sha256(
             messages[0].content.encode()
         ).hexdigest()[:16]
-        user_message = _message(
-            _string(1, messages[0].content),
-            _string(2, user_id),
-            Field.varint(4, mode),
+        user_message = cursor_schema.encode(
+            {"text": messages[0].content, "messageId": user_id, "mode": mode},
+            "UserMessage",
         )
         results = {
             message.tool_call_id: message
@@ -2835,8 +1965,9 @@ def encode_conversation_state(
             if message.role != "assistant":
                 continue
             if message.content and message.content != "[empty]":
-                step = _message(
-                    _bytes(1, _message(_string(1, message.content)))
+                step = cursor_schema.encode(
+                    {"_field1": {"content": message.content}},
+                    "_HistoricalToolTextWrapper",
                 )
                 step_ids.append(add_blob(step))
             for call in message.tool_calls:
@@ -2845,25 +1976,27 @@ def encode_conversation_state(
                         _historical_tool_step(call, results.get(call.id))
                     )
                 )
-        agent_turn = _message(
-            _bytes(1, add_blob(user_message)),
-            *(_bytes(2, step_id) for step_id in step_ids),
-        )
-        state_fields.append(
-            _bytes(8, add_blob(_message(_bytes(1, agent_turn))))
-        )
+        add_turn({
+            "_field1": add_blob(user_message),
+            "_field2": step_ids,
+        })
         index = end
-    return _message(*state_fields), prefetched
+    state["rootPromptMessagesJson"] = root_blobs
+    state["turns"] = turns
+    return cursor_schema.encode(state, "ConversationCheckpointUpdate"), prefetched
 
 
 def encode_model_details(model: str) -> bytes:
     """Encode AgentRunRequest model details (field 3)."""
-    return _message(
-        _string(1, model),
-        _string(3, model),
-        _string(4, model),
-        _string(5, model),
-        Field.varint(7, 1),
+    return cursor_schema.encode(
+        {
+            "_field1": model,
+            "_field3": model,
+            "_field4": model,
+            "_field5": model,
+            "_field7": True,
+        },
+        "_ModelDetails",
     )
 
 
@@ -2891,76 +2024,60 @@ def build_run_request(
     )
     message_id = message_id or str(uuid.uuid4())
 
-    user_fields: list[Field] = [
-        _string(1, prompt),
-        _string(2, message_id),
-        _bytes(3, b""),
-        Field.varint(4, user_config.mode),
-    ]
+    selected_context: object = {}
     if user_config.selected_context is not None:
-        user_fields.append(_bytes(3, user_config.selected_context))
-    if user_config.is_simulated_msg is not None:
-        user_fields.append(Field.varint(5, int(user_config.is_simulated_msg)))
-    if user_config.best_of_n_group_id is not None:
-        user_fields.append(_string(6, user_config.best_of_n_group_id))
-    if user_config.try_use_best_of_n_promotion is not None:
-        user_fields.append(
-            Field.varint(7, int(user_config.try_use_best_of_n_promotion))
-        )
-    if user_config.rich_text is not None:
-        user_fields.append(_string(8, user_config.rich_text))
-    if user_config.simulated_msg_reason is not None:
-        user_fields.append(Field.varint(9, user_config.simulated_msg_reason))
-    if user_config.conversation_state_blob_id:
-        user_fields.append(_bytes(10, user_config.conversation_state_blob_id))
-    if user_config.subagent_system_reminder is not None:
-        user_fields.append(_string(11, user_config.subagent_system_reminder))
-    if user_config.triggering_user_info is not None:
-        user_fields.append(_bytes(13, user_config.triggering_user_info))
-    if user_config.execute_plan_info is not None:
-        user_fields.append(_bytes(14, user_config.execute_plan_info))
-    if user_config.simulated_message_metadata is not None:
-        user_fields.append(_bytes(15, user_config.simulated_message_metadata))
-    if user_config.prompt_reference_id is not None:
-        user_fields.append(_string(16, user_config.prompt_reference_id))
-    if user_config.thread_id is not None:
-        user_fields.append(_string(17, user_config.thread_id))
-    if user_config.text_blob_id is not None:
-        user_fields.append(_bytes(18, user_config.text_blob_id))
-    if user_config.rich_text_blob_id is not None:
-        user_fields.append(_bytes(19, user_config.rich_text_blob_id))
-    user_fields.extend(
-        _bytes(21, value)
-        for value in user_config.hook_additional_contexts
-    )
-    if user_config.custom_mode_intent is not None:
-        user_fields.append(_bytes(22, user_config.custom_mode_intent))
-    user_message = _message(*user_fields)
-    user_message_action = _message(
-        _bytes(1, user_message),
-        _bytes(2, b""),
-    )
-    action = _message(_bytes(1, user_message_action))
+        selected_context = {cursor_schema.UNKNOWN: {1: [(2, user_config.selected_context)]}}
+    user_message = {
+        "text": prompt,
+        "messageId": message_id,
+        "selectedContext": selected_context,
+        "mode": user_config.mode,
+        "isSimulatedMsg": user_config.is_simulated_msg,
+        "bestOfNGroupId": user_config.best_of_n_group_id,
+        "tryUseBestOfNPromotion": user_config.try_use_best_of_n_promotion,
+        "richText": user_config.rich_text,
+        "simulatedMsgReason": user_config.simulated_msg_reason,
+        "conversationStateBlobId": (
+            user_config.conversation_state_blob_id or None
+        ),
+        "subagentSystemReminder": user_config.subagent_system_reminder,
+        "triggeringUserInfo": user_config.triggering_user_info,
+        "executePlanInfo": user_config.execute_plan_info,
+        "simulatedMessageMetadata": user_config.simulated_message_metadata,
+        "promptReferenceId": user_config.prompt_reference_id,
+        "threadId": user_config.thread_id,
+        "textBlobId": user_config.text_blob_id,
+        "richTextBlobId": user_config.rich_text_blob_id,
+        "hookAdditionalContexts": list(
+            user_config.hook_additional_contexts
+        ) or None,
+        "customModeIntent": user_config.custom_mode_intent,
+    }
+    action = {"userMessage": user_message, "requestContext": {}}
     conversation_state, prefetched = encode_conversation_state(
         history, user_config.mode
     )
     if run_config.conversation_state is not None:
         conversation_state = run_config.conversation_state
     model_details = encode_model_details(model)
-    run_fields = [
-        _bytes(1, conversation_state),
-        _bytes(2, run_config.action or action),
-        _bytes(3, run_config.model_details or model_details),
-        _bytes(4, encode_mcp_tools(tools)),
-        _string(5, conversation_id),
-        *(_bytes(17, blob) for blob in prefetched),
-    ]
+    unknown: dict[int, list[tuple[int, bytes]]] = {
+        1: [(2, conversation_state)],
+        3: [(2, run_config.model_details or model_details)],
+        4: [(2, encode_mcp_tools(tools))],
+    }
+    if run_config.action is not None:
+        unknown[2] = [(2, run_config.action)]
+    else:
+        action_bytes = cursor_schema.encode(
+            {"userMessageAction": action}, "RunRequestAction"
+        )
+        unknown[2] = [(2, action_bytes)]
     for number, value in (
         (6, run_config.mcp_file_system_options),
         (7, run_config.skill_options),
     ):
         if value is not None:
-            run_fields.append(_bytes(number, value))
+            unknown[number] = [(2, value)]
     for number, value in (
         (8, run_config.custom_system_prompt),
         (11, run_config.subagent_type_name),
@@ -2969,7 +2086,7 @@ def build_run_request(
         (18, run_config.dev_raw_model_slug),
     ):
         if value is not None:
-            run_fields.append(_string(number, value))
+            unknown[number] = [(2, value.encode())]
     for number, value in (
         (10, run_config.suggest_next_prompt),
         (12, run_config.exclude_workspace_context),
@@ -2979,26 +2096,29 @@ def build_run_request(
         (23, run_config.client_supports_send_to_user),
     ):
         if value is not None:
-            run_fields.append(Field.varint(number, int(value)))
-    run_fields.extend(
-        _bytes(14, value)
-        for value in run_config.selected_subagent_models
-    )
-    run_fields.extend(
-        _bytes(15, value)
-        for value in run_config.selected_subagent_model_details
-    )
-    run_fields.extend(
-        _bytes(20, value)
-        for value in run_config.subagent_model_overrides
-    )
-    run_fields.extend(run_config.extra_fields)
-    run_request = _message(*run_fields)
-    return _message(_bytes(1, run_request))
+            unknown[number] = [(0, bytes([int(bool(value))]))]
+    for value in run_config.selected_subagent_models:
+        unknown.setdefault(14, []).append((2, value))
+    for value in run_config.selected_subagent_model_details:
+        unknown.setdefault(15, []).append((2, value))
+    for value in run_config.subagent_model_overrides:
+        unknown.setdefault(20, []).append((2, value))
+    for number, occurrences in (run_config.extra_fields or {}).items():
+        unknown.setdefault(number, []).extend(occurrences)
+    run_request = {
+        "conversationId": conversation_id,
+        "suggestNextPrompt": None,
+        cursor_schema.UNKNOWN: unknown,
+        "prefetchedBlobs": prefetched or None,
+    }
+    client_message = {
+        "runRequest": run_request,
+    }
+    return cursor_schema.encode(client_message, "AgentClientMessage")
 
 
 def build_bidi_request_id(request_id: str) -> bytes:
-    return _message(_string(1, request_id))
+    return cursor_schema.encode({"requestId": request_id}, "_BidiRequestId")
 
 
 def build_bidi_append(
@@ -3008,15 +2128,15 @@ def build_bidi_append(
     append_seqno: int = 0,
     binary: bool = True,
 ) -> bytes:
-    fields = []
+    obj = {}
     if not binary:
-        fields.append(_string(1, payload.hex()))
-    fields.append(_bytes(2, build_bidi_request_id(request_id)))
+        obj["payloadHex"] = payload.hex()
+    obj["requestId"] = {"requestId": request_id}
     if append_seqno:
-        fields.append(Field.varint(3, append_seqno))
+        obj["appendSeqno"] = append_seqno
     if binary:
-        fields.append(_bytes(4, payload))
-    return _message(*fields)
+        obj["payload"] = payload
+    return cursor_schema.encode(obj, "_BidiAppendRequest")
 
 
 class ConnectStreamDecoder:
@@ -3048,14 +2168,13 @@ class TurnUsage:
     reasoning_tokens: int = 0
 
 
-def parse_turn_usage(payload: bytes) -> TurnUsage:
-    update = RawMessage.decode(payload)
+def parse_turn_usage(update: Mapping[str, object]) -> TurnUsage:
     return TurnUsage(
-        input_tokens=_first_varint(update, 1),
-        output_tokens=_first_varint(update, 2),
-        cache_read_tokens=_first_varint(update, 3),
-        cache_write_tokens=_first_varint(update, 4),
-        reasoning_tokens=_first_varint(update, 5),
+        input_tokens=update.get("inputTokens", 0),
+        output_tokens=update.get("outputTokens", 0),
+        cache_read_tokens=update.get("cacheReadTokens", 0),
+        cache_write_tokens=update.get("cacheWriteTokens", 0),
+        reasoning_tokens=update.get("reasoningTokens", 0),
     )
 
 
@@ -3069,8 +2188,9 @@ def openai_usage(usage: TurnUsage) -> dict:
 def _checkpoint_timestamp(frame: CursorFrame) -> int | None:
     if not isinstance(frame.message, CheckpointUpdate):
         return None
-    checkpoint = RawMessage.decode(frame.message.raw.first_bytes(3) or b"")
-    value = _int(checkpoint, 26)
+    value = frame.message.decoded.get("conversationCheckpointUpdate", {}).get(
+        "conversationStartedTimestampMs", 0
+    )
     return value or None
 
 
@@ -3081,12 +2201,15 @@ def build_filtered_usage_request(
     page: int = 1,
     page_size: int = 20,
 ) -> bytes:
-    return _message(
-        Field.varint(1, 0),
-        Field.varint(2, start_date),
-        Field.varint(3, end_date),
-        Field.varint(6, page),
-        Field.varint(7, page_size),
+    return cursor_schema.encode(
+        {
+            "_field1": 0,
+            "startDate": start_date,
+            "endDate": end_date,
+            "page": page,
+            "pageSize": page_size,
+        },
+        "_FilteredUsageRequest",
     )
 
 
@@ -3095,30 +2218,28 @@ def parse_filtered_usage(
     conversation_id: str,
     request_started_ms: int,
 ) -> TurnUsage | None:
-    response = RawMessage.decode(payload)
+    response = cursor_schema.decode(payload, "_FilteredUsageResponse")
     candidates = []
-    for field in response.matching(3, 2):
-        event = RawMessage.decode(field.value)
-        timestamp = _int(event, 1)
+    for event in response.get("events", ()):
+        timestamp = event.get("timestamp", 0)
         if (
-            _text(event, 23) != conversation_id
-            or not _int(event, 8)
+            event.get("conversationId", "") != conversation_id
+            or not event.get("_field8")
             or timestamp < request_started_ms
         ):
             continue
-        token_payload = event.first_bytes(9)
-        if token_payload is None:
+        token = event.get("tokenUsage")
+        if not token:
             continue
-        token = RawMessage.decode(token_payload)
-        uncached_input = _int(token, 1)
-        cache_read = _int(token, 4)
+        uncached_input = token.get("uncachedInput", 0)
+        cache_read = token.get("cacheRead", 0)
         candidates.append((
             timestamp,
             TurnUsage(
                 input_tokens=uncached_input + cache_read,
-                output_tokens=_int(token, 2),
+                output_tokens=token.get("outputTokens", 0),
                 cache_read_tokens=cache_read,
-                cache_write_tokens=_int(token, 3),
+                cache_write_tokens=token.get("cacheWrite", 0),
             ),
         ))
     return min(candidates, key=lambda item: item[0])[1] if candidates else None
@@ -3194,14 +2315,13 @@ class ToolCall:
     field_number: int = 0
     oneof_name: str = ""
     payload_type: str = ""
-    arguments_raw: bytes = b""
 
 
 @dataclass(frozen=True)
 class UnknownToolCall:
     field_number: int
     oneof_name: str
-    arguments_raw: bytes
+    arguments: object
     server_message_id: int = 0
     exec_id: str = ""
 
@@ -3250,53 +2370,70 @@ class RunConfig:
     can_create_cloud_subagents: bool | None = None
     suppress_subagent_progress_update_tool: bool | None = None
     client_supports_send_to_user: bool | None = False
-    extra_fields: tuple[Field, ...] = ()
+    # Raw wire occurrences appended verbatim to runRequest:
+    # {field_number: [(wire_type, raw_bytes_or_int), ...]}
+    extra_fields: dict[int, list[tuple[int, int | bytes]]] | None = None
 
 
-def _int(raw: RawMessage, number: int, default: int = 0) -> int:
-    fields = raw.matching(number, 0)
-    return int(fields[0].value) if fields else default
-
-
-def _text(raw: RawMessage, number: int) -> str:
-    value = raw.first_bytes(number)
-    return value.decode(errors="replace") if value is not None else ""
-
-
-def _decode_value(payload: bytes):
-    value = RawMessage.decode(payload)
-    if value.matching(1, 0):
-        return None
-    if value.matching(2, 1):
-        return struct.unpack("<d", value.matching(2, 1)[0].encoded_value)[0]
-    text = value.first_bytes(3)
-    if text is not None:
-        return text.decode(errors="replace")
-    boolean = value.matching(4, 0)
-    if boolean:
-        return bool(boolean[0].value)
-    struct_value = value.first_bytes(5)
+def _decode_value(value: Mapping[str, object]):
+    if "numberValue" in value:
+        return value["numberValue"]
+    if "stringValue" in value:
+        return value["stringValue"]
+    if "boolValue" in value:
+        return value["boolValue"]
+    struct_value = value.get("structValue")
     if struct_value is not None:
-        return _decode_map(RawMessage.decode(struct_value), 1)
-    list_value = value.first_bytes(6)
+        return {
+            entry["key"]: _decode_value_field(entry.get("value"))
+            for entry in struct_value.get("fields", ())
+        }
+    list_value = value.get("listValue")
     if list_value is not None:
-        items = RawMessage.decode(list_value)
         return [
-            _decode_value(field.value)
-            for field in items.matching(1, 2)
+            _decode_value_field(item)
+            for item in list_value.get("values", ())
         ]
     return None
 
 
-def _decode_map(raw: RawMessage, number: int) -> dict:
-    result = {}
-    for field in raw.matching(number, 2):
-        entry = RawMessage.decode(field.value)
-        key = _text(entry, 1)
-        value = entry.first_bytes(2)
-        if key:
-            result[key] = _decode_value(value) if value is not None else None
-    return result
+def _decode_value_field(value):
+    if isinstance(value, dict) and cursor_schema.UNKNOWN in value and len(value) == 1:
+        occurrences = next(iter(value[cursor_schema.UNKNOWN].values()))
+        wt, raw = occurrences[0]
+        if wt == 0:
+            return None
+        if wt == 1:
+            return struct.unpack("<d", raw)[0]
+        if wt == 2:
+            return raw.decode(errors="replace")
+        return False
+    return _decode_dict_value(value)
+
+
+def _decode_dict_value(value):
+    if isinstance(value, dict):
+        if "structValue" in value or "listValue" in value:
+            decoded = {}
+            if "structValue" in value:
+                decoded = {
+                    entry["key"]: _decode_value_field(entry.get("value"))
+                    for entry in value["structValue"].get("fields", ())
+                }
+            else:
+                decoded = [
+                    _decode_value_field(item)
+                    for item in value["listValue"].get("values", ())
+                ]
+            return decoded
+        return _decode_value(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, float):
+        return value
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 EXEC_SERVER_TOOL_FIELDS = {
@@ -3341,275 +2478,73 @@ EXEC_SERVER_TOOL_FIELDS = {
 }
 
 
-NATIVE_ARGUMENT_SCHEMAS = {
-    "shell_args": {
-        1: ("command", "string"), 2: ("working_directory", "string"),
-        3: ("timeout", "int32"), 4: ("tool_call_id", "string"),
-        5: ("simple_commands", "string"), 6: ("has_input_redirect", "bool"),
-        7: ("has_output_redirect", "bool"), 8: ("parsing_result", "message"),
-        9: ("requested_sandbox_policy", "message"),
-        10: ("file_output_threshold_bytes", "uint64"),
-        11: ("is_background", "bool"), 12: ("skip_approval", "bool"),
-        13: ("timeout_behavior", "enum"), 14: ("hard_timeout", "int32"),
-        15: ("description", "string"), 16: ("classifier_result", "message"),
-        17: ("close_stdin", "bool"), 18: ("output_notification", "message"),
-        19: ("smart_mode_approval", "message"),
-        20: ("hook_approval_requirement", "message"),
-        21: ("conversation_id", "string"),
-    },
-    "shell_stream_args": "shell_args",
-    "write_args": {
-        1: ("path", "string"), 2: ("file_text", "string"),
-        3: ("tool_call_id", "string"),
-        4: ("return_file_content_after_write", "bool"),
-        5: ("file_bytes", "bytes"), 6: ("encoding_hint", "string"),
-    },
-    "delete_args": {1: ("path", "string"), 2: ("tool_call_id", "string")},
-    "grep_args": {
-        1: ("pattern", "string"), 2: ("path", "string"),
-        3: ("glob", "string"), 4: ("output_mode", "string"),
-        5: ("context_before", "int32"), 6: ("context_after", "int32"),
-        7: ("context", "int32"), 8: ("case_insensitive", "bool"),
-        9: ("type", "string"), 10: ("head_limit", "int32"),
-        11: ("multiline", "bool"), 12: ("sort", "string"),
-        13: ("sort_ascending", "bool"), 14: ("tool_call_id", "string"),
-        15: ("sandbox_policy", "message"), 16: ("offset", "int32"),
-    },
-    "read_args": {
-        1: ("path", "string"), 2: ("tool_call_id", "string"),
-        4: ("offset", "int32"), 5: ("limit", "uint32"),
-        6: ("encoding_hint", "string"),
-    },
-    "redacted_read_args": "read_args",
-    "ls_args": {
-        1: ("path", "string"), 2: ("ignore", "string"),
-        3: ("tool_call_id", "string"), 4: ("sandbox_policy", "message"),
-        5: ("timeout_ms", "uint32"),
-    },
-    "diagnostics_args": {
-        1: ("path", "string"), 2: ("tool_call_id", "string"),
-    },
-    "request_context_args": {
-        2: ("notes_session_id", "string"), 3: ("workspace_id", "string"),
-        4: ("read_only_pinned_tree_sha", "string"),
-        5: ("read_only_plugin_cache_root", "string"),
-        7: ("use_cached", "bool"),
-    },
-    "mcp_args": {
-        1: ("name", "string"), 3: ("tool_call_id", "string"),
-        4: ("provider_identifier", "string"), 5: ("tool_name", "string"),
-        6: ("smart_mode_approval", "message"),
-        7: ("smart_mode_approval_only", "bool"),
-        8: ("skip_approval", "bool"), 9: ("server_identifier", "string"),
-    },
-    "background_shell_spawn_args": {
-        1: ("command", "string"), 2: ("working_directory", "string"),
-        3: ("tool_call_id", "string"), 4: ("parsing_result", "message"),
-        5: ("sandbox_policy", "message"),
-        6: ("enable_write_shell_stdin_tool", "bool"),
-        7: ("description", "string"), 8: ("classifier_result", "message"),
-        9: ("output_notification", "message"),
-        10: ("smart_mode_approval", "message"),
-        11: ("hook_approval_requirement", "message"),
-        12: ("skip_approval", "bool"), 13: ("conversation_id", "string"),
-    },
-    "list_mcp_resources_exec_args": {1: ("server", "string")},
-    "read_mcp_resource_exec_args": {
-        1: ("server", "string"), 2: ("uri", "string"),
-        3: ("download_path", "string"), 4: ("tool_call_id", "string"),
-        5: ("smart_mode_approval", "message"),
-    },
-    "fetch_args": {1: ("url", "string"), 2: ("tool_call_id", "string")},
-    "record_screen_args": {
-        1: ("mode", "enum"), 2: ("tool_call_id", "string"),
-        3: ("save_as_filename", "string"),
-    },
-    "computer_use_args": {
-        1: ("tool_call_id", "string"), 2: ("actions", "message"),
-    },
-    "write_shell_stdin_args": {
-        1: ("shell_id", "uint32"), 2: ("chars", "string"),
-    },
-    "execute_hook_args": {1: ("request", "message")},
-    "subagent_args": {
-        1: ("tool_call_id", "string"), 2: ("subagent_type", "string"),
-        3: ("model_id", "string"), 4: ("prompt", "string"),
-        5: ("readonly", "bool"), 6: ("resume_agent_id", "string"),
-        7: ("run_in_background", "bool"),
-        8: ("continuation_config", "message"),
-        9: ("parent_conversation_id", "string"),
-        10: ("api_key_credentials", "message"),
-        11: ("azure_credentials", "message"),
-        12: ("bedrock_credentials", "message"), 13: ("interrupt", "bool"),
-        14: ("mode", "enum"), 15: ("fork_agent_id", "string"),
-        16: ("root_parent_conversation_id", "string"),
-        17: ("selected_context", "message"),
-        18: ("direct_meta_parent_child_subagent", "bool"),
-        19: ("environment", "enum"), 20: ("cloud_base_branch", "string"),
-    },
-    "force_background_shell_args": {1: ("tool_call_id", "string")},
-    "force_background_subagent_args": {1: ("tool_call_id", "string")},
-    "mcp_state_exec_args": {
-        1: ("server_identifiers", "string"), 2: ("kick_only", "bool"),
-    },
-    "subagent_await_args": {
-        1: ("agent_id", "string"), 2: ("timeout_ms", "uint32"),
-    },
-    "smart_mode_classifier_args": {
-        1: ("tool_call_id", "string"),
-        2: ("parent_conversation_id", "string"), 3: ("target", "message"),
-        4: ("conversation_context", "message"),
-    },
-    "canvas_diagnostics_args": {
-        1: ("path", "string"), 2: ("tool_call_id", "string"),
-    },
-    "shell_allowlist_precheck_args": {
-        1: ("command", "string"), 2: ("working_directory", "string"),
-        3: ("parsing_result", "message"),
-        4: ("classifier_result", "message"), 5: ("tool_call_id", "string"),
-    },
-    "mcp_allowlist_precheck_args": {
-        1: ("provider_identifier", "string"), 2: ("tool_name", "string"),
-        3: ("tool_call_id", "string"),
-    },
-    "web_fetch_allowlist_precheck_args": {
-        1: ("url", "string"), 2: ("tool_call_id", "string"),
-    },
-    "git_diff_request": {
-        1: ("cwd", "string"), 2: ("ref", "string"),
-        3: ("base_ref", "string"), 4: ("merge_base", "bool"),
-        5: ("target_paths", "string"),
-        6: ("unified_context_lines", "int32"),
-        7: ("max_untracked_files", "int32"), 8: ("output_format", "enum"),
-        9: ("submodule_recurse_depth", "int32"),
-        10: ("include_space_changes", "bool"),
-        11: ("committed_only", "bool"), 12: ("compute_patch_id", "bool"),
-        13: ("return_head_sha", "bool"), 14: ("max_response_bytes", "int32"),
-    },
-    "pi_read_args": {
-        1: ("path", "string"), 2: ("offset", "int32"),
-        3: ("limit", "int32"),
-    },
-    "pi_bash_args": {1: ("command", "string"), 2: ("timeout", "double")},
-    "pi_edit_args": {1: ("path", "string"), 2: ("edits", "message")},
-    "pi_write_args": {1: ("path", "string"), 2: ("content", "string")},
-    "pi_grep_args": {
-        1: ("pattern", "string"), 2: ("path", "string"),
-        3: ("glob", "string"), 4: ("ignore_case", "bool"),
-        5: ("literal", "bool"), 6: ("context", "int32"),
-        7: ("limit", "int32"),
-    },
-    "pi_find_args": {
-        1: ("pattern", "string"), 2: ("path", "string"),
-        3: ("limit", "int32"),
-    },
-    "pi_ls_args": {1: ("path", "string"), 2: ("limit", "int32")},
-    "conversation_search_args": {
-        1: ("query", "string"), 2: ("tool_call_id", "string"),
-        3: ("limit", "int32"),
-    },
-}
 
 
-def _native_argument_schema(oneof_name: str) -> dict:
-    schema = NATIVE_ARGUMENT_SCHEMAS.get(oneof_name, {})
-    if isinstance(schema, str):
-        return NATIVE_ARGUMENT_SCHEMAS[schema]
-    return schema
+def _generic_arguments(arguments: Mapping[str, object]) -> dict:
+    return {
+        _snake(name): value
+        for name, value in arguments.items()
+        if name != cursor_schema.UNKNOWN
+    }
 
 
-def _generic_arguments(payload: bytes, oneof_name: str = "") -> dict:
-    raw = RawMessage.decode(payload)
-    schema = _native_argument_schema(oneof_name)
-    arguments = {}
-    for field in raw.fields:
-        name, value_type = schema.get(
-            field.number, (str(field.number), None)
-        )
-        if value_type in ("message", "bytes"):
-            value = field.value
-        elif value_type == "double" and field.wire_type == 1:
-            value = struct.unpack("<d", struct.pack("<Q", field.value))[0]
-        elif value_type == "bool":
-            value = bool(field.value)
-        elif field.wire_type == 0:
-            value = int(field.value)
-        elif field.wire_type in (1, 5):
-            value = field.value
-        elif field.wire_type == 2:
-            try:
-                value = field.value.decode()
-            except UnicodeDecodeError:
-                value = field.value
-        else:
-            value = field.value
-        if name in arguments:
-            current = arguments[name]
-            if not isinstance(current, list):
-                current = [current]
-            current.append(value)
-            arguments[name] = current
-        else:
-            arguments[name] = value
-    return arguments
-
-
-def decode_tool_call(payload: bytes) -> ToolCall | UnknownToolCall | None:
-    message = RawMessage.decode(payload)
-    exec_payload = message.first_bytes(2)
-    if not exec_payload:
+def decode_tool_call(
+    message: CursorMessage,
+) -> ToolCall | UnknownToolCall | None:
+    execution = message.decoded.get("execServerMessage")
+    if not execution:
         return None
-    execution = RawMessage.decode(exec_payload)
-    server_message_id = _int(execution, 1)
-    exec_id = _text(execution, 15)
+    server_message_id = execution.get("id", 0)
+    exec_id = execution.get("execId", "")
 
-    mcp_payload = execution.first_bytes(11)
-    if mcp_payload is not None:
-        mcp = RawMessage.decode(mcp_payload)
-        name = _text(mcp, 1) or _text(mcp, 5)
-        tool_name = _text(mcp, 5) or name
-        call_id = _text(mcp, 3) or exec_id
+    if "mcpArgs" in execution:
+        mcp = execution["mcpArgs"]
+        name = mcp.get("name") or mcp.get("toolName") or "mcp"
+        tool_name = mcp.get("toolName") or name
+        call_id = mcp.get("toolCallId") or exec_id
+        arguments = {
+            key: _decode_value(value)
+            for key, value in mcp.get("arguments", ())
+            if value is not None
+        }
         return ToolCall(
             id=call_id,
-            name=name or tool_name or "mcp",
-            arguments=_decode_map(mcp, 2),
-            provider_identifier=_text(mcp, 4),
+            name=name,
+            arguments=arguments,
+            provider_identifier=mcp.get("providerIdentifier", ""),
             tool_name=tool_name,
-            server_identifier=_text(mcp, 9),
+            server_identifier=mcp.get("serverIdentifier", ""),
             native=False,
             server_message_id=server_message_id,
             exec_id=exec_id,
             field_number=11,
             oneof_name="mcp_args",
             payload_type="agent.v1.McpArgs",
-            arguments_raw=mcp_payload,
         )
 
-    for field in execution.fields:
-        if field.wire_type != 2 or field.number in (15, 19):
+    fields = {field.name: field for field in cursor_schema.MESSAGES["ExecServerMessage"]}
+    for name, arguments in execution.items():
+        field = fields.get(name)
+        if field is None or field.num in (1, 15, 19, 55):
             continue
-        definition = EXEC_SERVER_TOOL_FIELDS.get(field.number)
+        definition = EXEC_SERVER_TOOL_FIELDS.get(field.num)
         if definition is None:
             return UnknownToolCall(
-                field.number,
-                "field_" + str(field.number),
-                field.value,
-                server_message_id,
-                exec_id,
+                field.num, "field_" + str(field.num), arguments,
+                server_message_id, exec_id,
             )
         oneof_name, payload_type = definition
         return ToolCall(
             id=exec_id,
             name=oneof_name.removesuffix("_args"),
-            arguments=_generic_arguments(field.value, oneof_name),
+            arguments=_generic_arguments(arguments),
             tool_name=oneof_name.removesuffix("_args"),
             native=True,
             server_message_id=server_message_id,
             exec_id=exec_id,
-            field_number=field.number,
+            field_number=field.num,
             oneof_name=oneof_name,
             payload_type=payload_type,
-            arguments_raw=field.value,
         )
     return None
 
@@ -3622,15 +2557,16 @@ def encode_mcp_tools(tools) -> bytes:
             parameters = {}
         if not isinstance(parameters, str):
             parameters = json.dumps(parameters, separators=(",", ":"))
-        definition = _message(
-            _string(1, tool.name),
-            _string(4, tool.provider_identifier),
-            _string(5, tool.name),
-            _string(2, tool.description),
-            _string(6, parameters),
+        definitions.append(
+            {
+                "_field1": tool.name,
+                "_field4": tool.provider_identifier,
+                "_field5": tool.name,
+                "_field2": tool.description,
+                "_field6": parameters,
+            }
         )
-        definitions.append(_bytes(1, definition))
-    return _message(*definitions)
+    return cursor_schema.encode({"_field1": definitions}, "_McpTools")
 
 
 
@@ -3901,7 +2837,7 @@ class CursorClient:
                 transport.reset_heartbeat_timeout()
             if not connect.eos:
                 kv_response = build_kv_response(
-                    connect.decoded_payload, prefetched_blobs
+                    frame.message.decoded, prefetched_blobs
                 )
                 if kv_response is not None:
                     if (
@@ -3935,7 +2871,7 @@ class CursorClient:
                         append(kv_response, callback=blob_appended)
                     else:
                         append(kv_response)
-                call = decode_tool_call(connect.decoded_payload)
+                call = decode_tool_call(frame.message)
                 if call is not None:
                     identity = (
                         type(call),
@@ -3951,7 +2887,7 @@ class CursorClient:
                 == "agent_server.interaction_update.turn_ended"
             ):
                 turn_ended = True
-                usage = parse_turn_usage(frame.message.update_payload)
+                usage = parse_turn_usage(frame.message.update)
                 transport.close()
             elif (
                 frame.classification
@@ -3965,7 +2901,7 @@ class CursorClient:
                 not response_boundary_seen
                 and not connect.eos
                 and is_response_boundary_blob_write(
-                    connect.decoded_payload, request_id
+                    frame.message.decoded, request_id
                 )
             ):
                 response_boundary_seen = True
@@ -4351,12 +3287,7 @@ def _native_call_content(call: ToolCall):
 
 
 def _native_call_params(call: ToolCall) -> dict:
-    schema = _native_argument_schema(call.oneof_name)
-    return {
-        schema.get(int(key), (str(key), None))[0]
-        if str(key).isdigit() else str(key): value
-        for key, value in call.arguments.items()
-    }
+    return call.arguments
 
 
 def _native_repl_code(call: ToolCall) -> str:

@@ -11,7 +11,7 @@ from io import BytesIO
 
 import pytest
 
-from code_agent import codex
+from code_agent.transports import codex
 from code_agent.client import LLMClient
 from code_agent.conversation import Conversation
 from code_agent.repl_tool_adapter import REPL_EXECUTE_TOOL

@@ -3,16 +3,133 @@ import json
 import os
 import selectors
 import stat
+import struct
 import subprocess
 import sys
 import time
 
 import pytest
 
-from code_agent import cursor
+from code_agent.transports import cursor
 from code_agent.client import LLMClient
 from code_agent.llm_registry import get_model_config
 from code_agent.repl_tool_adapter import REPL_EXECUTE_TOOL
+
+
+# --- Test-only protobuf wire helpers (production no longer ships these) ---
+
+def _encode_varint(value: int) -> bytes:
+    assert 0 <= value < (1 << 64)
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _wire_tag(number: int, wire_type: int) -> bytes:
+    return _encode_varint((number << 3) | wire_type)
+
+
+def pb_varint(number: int, value: int) -> bytes:
+    return _wire_tag(number, 0) + _encode_varint(value)
+
+
+def pb_fixed64(number: int, value: int) -> bytes:
+    return _wire_tag(number, 1) + struct.pack("<Q", value)
+
+
+def pb_bytes(number: int, value: bytes) -> bytes:
+    return _wire_tag(number, 2) + _encode_varint(len(value)) + value
+
+
+def pb_message(*fields: bytes) -> bytes:
+    return b"".join(fields)
+
+
+def pb_fields(data: bytes) -> list[tuple[int, int, object]]:
+    """Decode a protobuf message into (number, wire_type, value) tuples."""
+    out = []
+    i = 0
+    while i < len(data):
+        tag, i = _read_one(data, i)
+        number, wt = tag >> 3, tag & 7
+        if wt == 0:
+            v, i = _read_one(data, i)
+        elif wt == 1:
+            v, i = struct.unpack("<Q", data[i:i + 8])[0], i + 8
+        elif wt == 2:
+            n, i = _read_one(data, i)
+            v, i = data[i:i + n], i + n
+        elif wt == 5:
+            v, i = struct.unpack("<I", data[i:i + 4])[0], i + 4
+        else:
+            raise ValueError(f"bad wire type {wt}")
+        out.append((number, wt, v))
+    return out
+
+
+def _read_one(data: bytes, i: int) -> tuple[int, int]:
+    r = s = 0
+    while True:
+        c = data[i]
+        i += 1
+        r |= (c & 0x7F) << s
+        if not c & 0x80:
+            return r, i
+        s += 7
+
+
+def pb_first_bytes(data: bytes, number: int) -> bytes | None:
+    for num, wt, v in pb_fields(data):
+        if num == number and wt == 2:
+            return v
+    return None
+
+
+def pb_ints(data: bytes, number: int) -> list[int]:
+    return [v for num, wt, v in pb_fields(data) if num == number and wt == 0]
+
+
+def pb_texts(data: bytes, number: int) -> list[str]:
+    values = []
+    for num, wt, v in pb_fields(data):
+        if num == number and wt == 2 and isinstance(v, bytes):
+            values.append(v.decode())
+    return values
+
+
+def answer_text_frame(text: str) -> bytes:
+    leaf = pb_bytes(1, text.encode())
+    middle = pb_bytes(1, leaf)
+    return pb_bytes(1, middle)
+
+
+def interaction_update_frame(subtype_number: int, payload: bytes = b"") -> bytes:
+    interaction = pb_bytes(subtype_number, payload)
+    return pb_bytes(1, interaction)
+
+
+def pb_value(value) -> bytes:
+    """Build a Google.protobuf Value-style wrapper: str->bytes field 1,
+    bool->varint field 2, number->varint field 3."""
+    if isinstance(value, bool):
+        return pb_varint(2, int(value))
+    if isinstance(value, (int, float)):
+        return pb_varint(3, int(value))
+    return pb_bytes(1, str(value).encode())
+
+
+_subtype_numbers = {name: num for num, name in cursor.INTERACTION_UPDATE_FIELD_NAMES.items()}
+_THINKING_DELTA_NUMBER = _subtype_numbers["thinking_delta"]
+_TOOL_CALL_COMPLETED_NUMBER = _subtype_numbers["tool_call_completed"]
+_HEARTBEAT_NUMBER = _subtype_numbers["heartbeat"]
+_TURN_ENDED_NUMBER = _subtype_numbers["turn_ended"]
+
+
+def decode_cursor(payload: bytes) -> "cursor.CursorMessage":
+    return cursor.decode_cursor_payload(payload, "IN")
 
 
 def test_cursor_registry(tmp_path):
@@ -271,16 +388,17 @@ def test_grep_native_tool_translates_to_grep():
 
 
 def test_shell_stream_wire_arguments_use_recovered_schema():
-    arguments = cursor.protobuf_message(
-        cursor.Field.bytes(1, b"date"),
-        cursor.Field.bytes(2, b"/tmp"),
-        cursor.Field.varint(3, 30000),
-        cursor.Field.varint(11, 1),
-        cursor.Field.bytes(15, b"Get current system date"),
-        cursor.Field.varint(17, 1),
+    arguments = pb_message(
+        pb_bytes(1, b"date"),
+        pb_bytes(2, b"/tmp"),
+        pb_varint(3, 30000),
+        pb_varint(11, 1),
+        pb_bytes(15, b"Get current system date"),
+        pb_varint(17, 1),
     )
 
-    assert cursor._generic_arguments(arguments, "shell_stream_args") == {
+    decoded_arguments = cursor.cursor_schema.decode(arguments, "ShellArgs")
+    assert cursor._generic_arguments(decoded_arguments) == {
         "command": "date",
         "working_directory": "/tmp",
         "timeout": 30000,
@@ -306,21 +424,21 @@ def test_cursor_client_requires_repl_execute(monkeypatch):
 
 
 def _decode_model_details(payload: bytes):
-    client = cursor.RawMessage.decode(payload)
-    run = cursor.RawMessage.decode(client.first_bytes(1))
-    details = cursor.RawMessage.decode(run.first_bytes(3))
+    client = payload
+    run = pb_first_bytes(client, 1)
+    details = pb_first_bytes(run, 3)
     return {
-        number: (details.first_bytes(number) or b"").decode()
+        number: (pb_first_bytes(details, number) or b"").decode()
         for number in (1, 3, 4, 5)
-    }, cursor._int(details, 7), run
+    }, pb_ints(details, 7)[0], run
 
 
 def test_encode_model_details():
-    raw = cursor.RawMessage.decode(
+    raw = (
         cursor.encode_model_details("cursor-grok-4.5-high")
     )
     assert {
-        number: (raw.first_bytes(number) or b"").decode()
+        number: (pb_first_bytes(raw, number) or b"").decode()
         for number in (1, 3, 4, 5)
     } == {
         1: "cursor-grok-4.5-high",
@@ -328,7 +446,7 @@ def test_encode_model_details():
         4: "cursor-grok-4.5-high",
         5: "cursor-grok-4.5-high",
     }
-    assert cursor._int(raw, 7) == 1
+    assert pb_ints(raw, 7) == [1]
 
 
 def test_build_run_request_uses_legacy_model_details_only():
@@ -341,8 +459,8 @@ def test_build_run_request_uses_legacy_model_details_only():
         5: "cursor-grok-4.5-high",
     }
     assert mode == 1
-    assert not run.has(9)
-    assert not run.has(14)
+    assert pb_first_bytes(run, 9) is None
+    assert pb_first_bytes(run, 14) is None
 
 
 def test_build_run_request_keeps_stable_conversation_id(monkeypatch):
@@ -354,17 +472,13 @@ def test_build_run_request_keeps_stable_conversation_id(monkeypatch):
     second = cursor.build_run_request(
         "two", "composer-2.5", message_id="message-2"
     )
-    first_run = cursor.RawMessage.decode(
-        cursor.RawMessage.decode(first).first_bytes(1)
-    )
-    second_run = cursor.RawMessage.decode(
-        cursor.RawMessage.decode(second).first_bytes(1)
-    )
+    first_run = pb_first_bytes(first, 1)
+    second_run = pb_first_bytes(second, 1)
 
-    assert cursor._text(first_run, 5) == "stable-conversation"
-    assert cursor._text(second_run, 5) == "stable-conversation"
-    assert not first_run.has(16)
-    assert not second_run.has(16)
+    assert pb_texts(first_run, 5) == ["stable-conversation"]
+    assert pb_texts(second_run, 5) == ["stable-conversation"]
+    assert pb_first_bytes(first_run, 16) is None
+    assert pb_first_bytes(second_run, 16) is None
 
 
 def test_build_run_request_allows_explicit_conversation_ids():
@@ -377,12 +491,10 @@ def test_build_run_request_allows_explicit_conversation_ids():
             conversation_group_id="explicit-group"
         ),
     )
-    run = cursor.RawMessage.decode(
-        cursor.RawMessage.decode(payload).first_bytes(1)
-    )
+    run = pb_first_bytes(payload, 1)
 
-    assert cursor._text(run, 5) == "explicit-conversation"
-    assert cursor._text(run, 16) == "explicit-group"
+    assert pb_texts(run, 5) == ["explicit-conversation"]
+    assert pb_texts(run, 16) == ["explicit-group"]
 
 
 def _run_result(usage):
@@ -708,70 +820,66 @@ def test_cursor_accumulates_reported_cost_excess():
 
 
 def _response_boundary_frame(request_id):
-    structure = cursor.protobuf_message(
-        cursor.Field.bytes(1, b"u" * 32),
-        cursor.Field.bytes(2, b"s" * 32),
-        cursor.Field.bytes(3, request_id.encode()),
-        cursor.Field.varint(5, 0),
+    structure = pb_message(
+        pb_bytes(1, b"u" * 32),
+        pb_bytes(2, b"s" * 32),
+        pb_bytes(3, request_id.encode()),
+        pb_varint(5, 0),
     )
-    blob = cursor.protobuf_message(cursor.Field.bytes(1, structure))
-    set_args = cursor.protobuf_message(cursor.Field.bytes(2, blob))
-    kv = cursor.protobuf_message(
-        cursor.Field.varint(1, 9),
-        cursor.Field.bytes(3, set_args),
+    blob = pb_message(pb_bytes(1, structure))
+    set_args = pb_message(pb_bytes(2, blob))
+    kv = pb_message(
+        pb_varint(1, 9),
+        pb_bytes(3, set_args),
     )
-    return cursor.ConnectFrame.from_decoded(
-        cursor.protobuf_message(cursor.Field.bytes(4, kv))
-    )
+    return cursor.ConnectFrame.from_decoded(pb_message(pb_bytes(4, kv)))
 
 
 def test_response_boundary_blob_write_detection():
     request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
     frame = _response_boundary_frame(request_id)
 
-    assert cursor.is_response_boundary_blob_write(
-        frame.decoded_payload, request_id
-    )
-    assert not cursor.is_response_boundary_blob_write(
-        frame.decoded_payload, "other-request"
-    )
+    decoded = cursor.cursor_schema.decode(frame.decoded_payload, "Run_res")
+    assert cursor.is_response_boundary_blob_write(decoded, request_id)
+    assert not cursor.is_response_boundary_blob_write(decoded, "other-request")
 
 
 def test_build_kv_response_acknowledges_set_blob():
-    set_args = cursor.protobuf_message(
-        cursor.Field.bytes(1, b"blob-id"),
-        cursor.Field.bytes(2, b"blob-data"),
+    set_args = pb_message(
+        pb_bytes(1, b"blob-id"),
+        pb_bytes(2, b"blob-data"),
     )
-    server = cursor.protobuf_message(
-        cursor.Field.bytes(
+    server = pb_message(
+        pb_bytes(
             4,
-            cursor.protobuf_message(
-                cursor.Field.varint(1, 9),
-                cursor.Field.bytes(3, set_args),
+            pb_message(
+                pb_varint(1, 9),
+                pb_bytes(3, set_args),
             ),
         )
     )
 
-    response = cursor.RawMessage.decode(
-        cursor.build_kv_response(server, {})
+    response = cursor.build_kv_response(
+        cursor.cursor_schema.decode(server, "Run_res"), {}
     )
-    kv = cursor.RawMessage.decode(response.first_bytes(3))
+    kv = pb_first_bytes(response, 3)
 
-    assert cursor._int(kv, 1) == 9
-    assert kv.first_bytes(3) == b""
-    assert kv.first_bytes(2) is None
+    assert pb_ints(kv, 1) == [9]
+    assert pb_first_bytes(kv, 3) == b""
+    assert pb_first_bytes(kv, 2) is None
 
 
 def test_parse_turn_usage():
-    payload = cursor.protobuf_message(
-        cursor.Field.varint(1, 25311),
-        cursor.Field.varint(2, 220),
-        cursor.Field.varint(3, 12625),
-        cursor.Field.varint(4, 7),
-        cursor.Field.varint(5, 11),
+    payload = pb_message(
+        pb_varint(1, 25311),
+        pb_varint(2, 220),
+        pb_varint(3, 12625),
+        pb_varint(4, 7),
+        pb_varint(5, 11),
     )
 
-    assert cursor.parse_turn_usage(payload) == cursor.TurnUsage(
+    update = cursor.cursor_schema.decode(payload, "TurnEnded")
+    assert cursor.parse_turn_usage(update) == cursor.TurnUsage(
         input_tokens=25311,
         output_tokens=220,
         cache_read_tokens=12625,
@@ -789,31 +897,23 @@ def test_parse_filtered_usage_selects_earliest_event_after_request_start():
     conversation_id = "conversation-1"
 
     def event(timestamp, conversation, input_tokens, output_tokens, cache_read):
-        token_usage = cursor.protobuf_message(
-            cursor.Field.varint(1, input_tokens),
-            cursor.Field.varint(2, output_tokens),
-            cursor.Field.varint(4, cache_read),
+        token_usage = pb_message(
+            pb_varint(1, input_tokens),
+            pb_varint(2, output_tokens),
+            pb_varint(4, cache_read),
         )
-        return cursor.protobuf_message(
-            cursor.Field.varint(1, timestamp),
-            cursor.Field.varint(8, 1),
-            cursor.Field.bytes(9, token_usage),
-            cursor.Field.bytes(23, conversation.encode()),
+        return pb_message(
+            pb_varint(1, timestamp),
+            pb_varint(8, 1),
+            pb_bytes(9, token_usage),
+            pb_bytes(23, conversation.encode()),
         )
 
-    response = cursor.protobuf_message(
-        cursor.Field.bytes(
-            3, event(10_090, conversation_id, 100, 20, 30)
-        ),
-        cursor.Field.bytes(
-            3, event(10_050, conversation_id, 200, 40, 50)
-        ),
-        cursor.Field.bytes(
-            3, event(9_990, conversation_id, 700, 70, 60)
-        ),
-        cursor.Field.bytes(
-            3, event(10_100, "other-conversation", 900, 90, 80)
-        ),
+    response = pb_message(
+        pb_bytes(3, event(10_090, conversation_id, 100, 20, 30)),
+        pb_bytes(3, event(10_050, conversation_id, 200, 40, 50)),
+        pb_bytes(3, event(9_990, conversation_id, 700, 70, 60)),
+        pb_bytes(3, event(10_100, "other-conversation", 900, 90, 80)),
     )
 
     assert cursor.parse_filtered_usage(
@@ -1018,32 +1118,30 @@ def test_sse_post_blob_timeout_raises_without_polling(monkeypatch):
 
 
 def test_generation_progress_classification():
-    assert cursor.is_generation_progress(cursor.AnswerText.create("x"))
-    assert not cursor.is_generation_progress(cursor.AnswerText.create(""))
+    assert cursor.is_generation_progress(decode_cursor(answer_text_frame("x")))
+    assert not cursor.is_generation_progress(decode_cursor(answer_text_frame("")))
     assert cursor.is_generation_progress(
-        cursor.InteractionUpdate.create("thinking_delta", b"x")
+        decode_cursor(interaction_update_frame(_THINKING_DELTA_NUMBER, pb_bytes(1, b"x")))
     )
     assert cursor.is_generation_progress(
-        cursor.InteractionUpdate.create("tool_call_completed")
+        decode_cursor(interaction_update_frame(_TOOL_CALL_COMPLETED_NUMBER))
     )
     assert not cursor.is_generation_progress(
-        cursor.InteractionUpdate.create("heartbeat")
+        decode_cursor(interaction_update_frame(_HEARTBEAT_NUMBER))
     )
     assert not cursor.is_generation_progress(
-        cursor.InteractionUpdate.create("turn_ended")
+        decode_cursor(interaction_update_frame(_TURN_ENDED_NUMBER))
     )
 
 
 
 def _get_blob_frame(request_id, blob_id=b"b" * 32):
-    args = cursor.protobuf_message(cursor.Field.bytes(1, blob_id))
-    kv = cursor.protobuf_message(
-        cursor.Field.varint(1, request_id),
-        cursor.Field.bytes(2, args),
+    args = pb_message(pb_bytes(1, blob_id))
+    kv = pb_message(
+        pb_varint(1, request_id),
+        pb_bytes(2, args),
     )
-    return cursor.ConnectFrame.from_decoded(
-        cursor.protobuf_message(cursor.Field.bytes(4, kv))
-    ).encode()
+    return cursor.ConnectFrame.from_decoded(pb_message(pb_bytes(4, kv))).encode()
 
 
 def test_latest_blob_response_completion_arms_timeout(monkeypatch):
@@ -1140,7 +1238,7 @@ def test_generation_progress_invalidates_pending_blob_response(monkeypatch):
             self.headers_callback(200, {})
             self.stream_callback(_get_blob_frame(1))
             answer = cursor.ConnectFrame.from_decoded(
-                cursor.AnswerText.create("started").encode()
+                answer_text_frame("started")
             )
             self.stream_callback(answer.encode())
             blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
@@ -1186,7 +1284,7 @@ def test_cursor_text_boundary_starts_usage_grace(monkeypatch):
         def run_forever(self, timeout=None, *, heartbeat_timeout=None):
             self.headers_callback(200, {})
             answer = cursor.ConnectFrame.from_decoded(
-                cursor.AnswerText.create("done").encode()
+                answer_text_frame("done")
             )
             self.stream_callback(answer.encode())
             assert not hasattr(self, "grace_timeout")
@@ -1243,16 +1341,16 @@ def test_cursor_turn_ended_closes_and_records_usage(monkeypatch):
         def run_forever(self, timeout=None, *, heartbeat_timeout=None):
             self.headers_callback(200, {})
             self.stream_callback(_response_boundary_frame(request_id).encode())
-            update = cursor.InteractionUpdate.create(
-                "turn_ended",
-                cursor.protobuf_message(
-                    cursor.Field.varint(1, 25311),
-                    cursor.Field.varint(2, 220),
-                    cursor.Field.varint(3, 12625),
+            update = interaction_update_frame(
+                _TURN_ENDED_NUMBER,
+                pb_message(
+                    pb_varint(1, 25311),
+                    pb_varint(2, 220),
+                    pb_varint(3, 12625),
                 ),
             )
             self.stream_callback(
-                cursor.ConnectFrame.from_decoded(update.encode()).encode()
+                cursor.ConnectFrame.from_decoded(update).encode()
             )
             assert self.closed
 
@@ -1275,25 +1373,25 @@ def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
     posted_payloads = []
 
     def tool_frame(call_id, code):
-        arguments = cursor.protobuf_message(
-            cursor.Field.bytes(1, b"repl_execute"),
-            cursor.Field.bytes(
+        arguments = pb_message(
+            pb_bytes(1, b"repl_execute"),
+            pb_bytes(
                 2,
-                cursor.protobuf_message(
-                    cursor.Field.bytes(1, b"code"),
-                    cursor.Field.bytes(2, cursor._protobuf_value(code)),
+                pb_message(
+                    pb_bytes(1, b"code"),
+                    pb_bytes(2, pb_value(code)),
                 ),
             ),
-            cursor.Field.bytes(3, call_id.encode()),
-            cursor.Field.bytes(5, b"repl_execute"),
+            pb_bytes(3, call_id.encode()),
+            pb_bytes(5, b"repl_execute"),
         )
-        execution = cursor.protobuf_message(
-            cursor.Field.varint(1, 1),
-            cursor.Field.bytes(11, arguments),
-            cursor.Field.bytes(15, (call_id + "-exec").encode()),
+        execution = pb_message(
+            pb_varint(1, 1),
+            pb_bytes(11, arguments),
+            pb_bytes(15, (call_id + "-exec").encode()),
         )
         return cursor.ConnectFrame.from_decoded(
-            cursor.protobuf_message(cursor.Field.bytes(2, execution))
+            pb_message(pb_bytes(2, execution))
         ).encode()
 
     class FakeSSEClient:
@@ -1309,8 +1407,7 @@ def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
             self.close()
 
         def post(self, url, body=b"", headers=None, callback=None):
-            bidi = cursor.RawMessage.decode(body)
-            payload = bidi.first_bytes(4)
+            payload = pb_first_bytes(body, 4)
             if payload is not None:
                 posted_payloads.append(payload)
             callback({"status": 200, "headers": {}, "body": b""})
