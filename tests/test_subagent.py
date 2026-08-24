@@ -3,6 +3,8 @@ import pickle
 import signal
 import socket
 import struct
+import subprocess
+import sys
 import weakref
 from unittest.mock import MagicMock
 
@@ -42,6 +44,65 @@ def test_worker_uses_code_agent_interaction_and_output_hooks():
     assert "def _handle_tool_request(self, repl, req)" not in WORKER_CODE
     assert "agent.usermsg(prompt)" not in WORKER_CODE
     assert "agent.run_loop(max_turns=task_max_turns)" not in WORKER_CODE
+
+
+
+def test_subagent_bootstrap_uses_c_flag_for_nested_multiprocessing(monkeypatch):
+    agent = Subagent(cwd="/tmp", model="test/model")
+    process = MagicMock()
+    process.poll.return_value = None
+    process.stdout = MagicMock()
+    process.stderr = MagicMock()
+    process_stdin = process.stdin
+    popen = MagicMock(return_value=process)
+    server = MagicMock()
+    server.getsockname.return_value = ("127.0.0.1", 12345)
+    connection = MagicMock()
+
+    monkeypatch.setattr(
+        "code_agent.subagent.socket.socket",
+        MagicMock(return_value=server),
+    )
+    monkeypatch.setattr("code_agent.subagent.subprocess.Popen", popen)
+    server.accept.return_value = (connection, None)
+    monkeypatch.setattr("code_agent.subagent._recv_msg", lambda _sock: b"auth")
+    monkeypatch.setattr("code_agent.subagent.os.urandom", lambda _size: b"auth")
+    monkeypatch.setattr("code_agent.subagent._send_msg", MagicMock())
+    monkeypatch.setattr(
+        "code_agent.subagent.fcntl.fcntl",
+        MagicMock(return_value=0),
+    )
+
+    try:
+        agent._ensure_started()
+    finally:
+        agent._proc = None
+        agent._conn = None
+        agent._server = None
+        agent._started = False
+
+    command = popen.call_args.args[0]
+    assert command == [
+        sys.executable,
+        "-c",
+        "import sys; exec(compile(sys.stdin.read(), '<subagent-worker>', 'exec'))",
+    ]
+    assert popen.call_args.kwargs["stdin"] is subprocess.PIPE
+    assert popen.call_args.kwargs["stdout"] is subprocess.DEVNULL
+    assert popen.call_args.kwargs["stderr"] is subprocess.PIPE
+    bootstrap = process_stdin.write.call_args.args[0].decode()
+    assert "worker_main(12345" in bootstrap
+    process_stdin.close.assert_called_once_with()
+
+
+def test_subagent_stderr_drain_retains_only_the_latest_megabyte():
+    agent = Subagent()
+    stream = MagicMock()
+    stream.read.side_effect = [b"a" * (1024 * 1024), b"tail", b""]
+
+    agent._drain_process_stderr(stream)
+
+    assert agent._read_process_stderr() == "a" * (1024 * 1024 - 4) + "tail"
 
 
 def test_subagent_has_no_context_manager_and_response_does_not_own_agent():

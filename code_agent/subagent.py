@@ -98,6 +98,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import weakref
@@ -547,6 +548,9 @@ class Subagent:
         self._server: Optional[socket.socket] = None
         self._current_response: Optional[SubagentResponse] = None
         self._receiver = _IncrementalMessageReceiver()
+        self._stderr_buffer = bytearray()
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: Optional[threading.Thread] = None
         self._started = False
 
         # Register globally
@@ -585,16 +589,30 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
 
         # Start subprocess
         self._proc = subprocess.Popen(
-            [sys.executable, '-'],
+            [
+                sys.executable,
+                "-c",
+                "import sys; exec(compile(sys.stdin.read(), '<subagent-worker>', 'exec'))",
+            ],
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             cwd=self.cwd,
             start_new_session=True,
         )
 
+        self._stderr_buffer.clear()
+        self._stderr_thread = threading.Thread(
+            target=self._drain_process_stderr,
+            args=(self._proc.stderr,),
+            daemon=True,
+            name=f"subagent-{self.id}-stderr",
+        )
+        self._stderr_thread.start()
+
         self._proc.stdin.write(worker_bootstrap.encode())
         self._proc.stdin.close()
+        self._proc.stdin = None
 
         # Accept connection
         try:
@@ -602,8 +620,10 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
             self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except socket.timeout:
             self._proc.kill()
-            stdout, stderr = self._proc.communicate()
-            raise TimeoutError(f"Subagent failed to connect. stderr: {stderr.decode()}")
+            self._proc.wait()
+            raise TimeoutError(
+                f"Subagent failed to connect. stderr: {self._read_process_stderr()}"
+            )
         finally:
             self._server.close()
             self._server = None
@@ -624,31 +644,26 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
         self._receiver = _IncrementalMessageReceiver()
         self._started = True
 
-    def _read_process_stderr(self) -> str:
-        """Return any currently available stderr from the worker process."""
-        if not self._proc or not self._proc.stderr:
-            return ""
+    def _drain_process_stderr(self, stream) -> None:
+        """Continuously drain worker stderr while retaining bounded diagnostics."""
         try:
-            fd = self._proc.stderr.fileno()
-            old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            try:
-                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
-                chunks = []
-                while True:
-                    try:
-                        chunk = self._proc.stderr.read()
-                    except BlockingIOError:
-                        break
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                if not chunks:
-                    return ""
-                return b"".join(chunks).decode(errors="replace")
-            finally:
-                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
-        except Exception as e:
-            return f"[failed to read subagent stderr: {type(e).__name__}: {e}]"
+            while True:
+                chunk = stream.read(65536)
+                if not chunk or not isinstance(chunk, bytes):
+                    break
+                with self._stderr_lock:
+                    self._stderr_buffer.extend(chunk)
+                    if len(self._stderr_buffer) > 1024 * 1024:
+                        del self._stderr_buffer[:-1024 * 1024]
+        except (OSError, ValueError):
+            pass
+
+    def _read_process_stderr(self) -> str:
+        """Return stderr retained by the worker's drain thread."""
+        if self._stderr_thread and self._proc and self._proc.poll() is not None:
+            self._stderr_thread.join(timeout=1)
+        with self._stderr_lock:
+            return bytes(self._stderr_buffer).decode(errors="replace")
 
     def _format_process_failure(self) -> str:
         returncode = self._proc.poll() if self._proc else None
@@ -859,7 +874,11 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
                     os.killpg(self._proc.pid, signal.SIGKILL)
                 except:
                     self._proc.kill()
+                self._proc.wait()
+            if self._stderr_thread:
+                self._stderr_thread.join(timeout=1)
             self._proc = None
+            self._stderr_thread = None
 
         self._started = False
 
