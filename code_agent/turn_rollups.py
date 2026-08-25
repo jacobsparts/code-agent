@@ -371,12 +371,57 @@ def derive_agent_rollup_context(agent):
         projected_messages,
         state,
     )
-    return events, exact_messages, state, candidate_turns
+    rolled_up_upper_turns = rolled_up_upper_boundary_turns(
+        events,
+        state,
+        candidate_turns,
+    )
+    return (
+        events,
+        exact_messages,
+        state,
+        candidate_turns,
+        rolled_up_upper_turns,
+    )
 
 
-def eligible_rollup_line(candidate_turns: tuple[int, ...]) -> str:
+def rolled_up_upper_boundary_turns(
+    events: list[dict],
+    persisted_state: PersistedPreviewState,
+    candidate_turns: tuple[int, ...],
+) -> tuple[int, ...]:
+    turns = completed_turns(events)
+    next_turn_by_end = {
+        turns[index].source_end_seq: turns[index + 1].turn_id
+        for index in range(len(turns) - 1)
+    }
+    candidate_set = set(candidate_turns)
+    return tuple(
+        turn_id
+        for _, source_end in _outer_active_placements(
+            persisted_state.active_placements
+        )
+        if (turn_id := next_turn_by_end.get(source_end)) in candidate_set
+    )
+
+
+def eligible_rollup_line(
+    candidate_turns: tuple[int, ...],
+    rolled_up_upper_turns: tuple[int, ...] = (),
+) -> str:
     if len(candidate_turns) < 2:
         return ""
-    return "Eligible rollup turns: " + ", ".join(
-        str(turn_id) for turn_id in candidate_turns
-    )
+    rolled_up = set(rolled_up_upper_turns)
+    ordinary = tuple(turn for turn in candidate_turns if turn not in rolled_up)
+    lines = []
+    if ordinary:
+        lines.append(
+            "Eligible normal turn boundaries: "
+            + ", ".join(str(turn_id) for turn_id in ordinary)
+        )
+    if rolled_up_upper_turns:
+        lines.append(
+            "Eligible existing-rollup upper boundaries: "
+            + ", ".join(str(turn_id) for turn_id in rolled_up_upper_turns)
+        )
+    return "\n".join(lines)

@@ -431,11 +431,14 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         )
 
         if type(start_turn) is not int or type(end_turn) is not int:
-            raise TypeError("rollup endpoints must be integers.")
+            print("Rollup rejected: rollup endpoints must be integers.")
+            return
         if not isinstance(summary, str):
-            raise TypeError("rollup summary must be a string.")
+            print("Rollup rejected: rollup summary must be a string.")
+            return
         if not summary.strip():
-            raise ValueError("rollup summary must not be blank.")
+            print("Rollup rejected: rollup summary must not be blank.")
+            return
         if (
             "session://preview/" in summary
             or "[PreviewRef:" in summary
@@ -443,27 +446,50 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             or "[ExpandedPreviewRef:" in summary
             or "[/ExpandedPreviewRef]" in summary
         ):
-            raise ValueError("rollup summary must not contain PreviewRef syntax or preview URIs.")
+            print(
+                "Rollup rejected: rollup summary must not contain PreviewRef "
+                "syntax or preview URIs."
+            )
+            return
         store = getattr(self, "_session_store", None)
         session_id = getattr(self, "_session_id", None)
         state = getattr(self, "_persisted_preview_state", None)
         conversation = getattr(self, "_conversation", None)
         if store is None or session_id is None or state is None or conversation is None:
-            raise RuntimeError("rollup is unavailable without a live persisted session.")
+            print(
+                "Rollup rejected: rollup is unavailable without a live "
+                "persisted session."
+            )
+            return
 
         context = derive_agent_rollup_context(self)
         if context is None:
-            raise RuntimeError("rollup is unavailable without a live persisted session.")
-        events, authoritative_messages, authoritative_state, candidate_turns = context
-        if len(candidate_turns) < 2:
-            raise ValueError("No turns are currently available for rollup.")
-
-        source_start_seq, source_end_seq, _ = resolve_rollup_interval(
+            print(
+                "Rollup rejected: rollup is unavailable without a live "
+                "persisted session."
+            )
+            return
+        (
+            events,
+            authoritative_messages,
+            authoritative_state,
             candidate_turns,
-            completed_turns(events),
-            start_turn,
-            end_turn,
-        )
+            _,
+        ) = context
+        if len(candidate_turns) < 2:
+            print("Rollup rejected: no turns are currently available for rollup.")
+            return
+
+        try:
+            source_start_seq, source_end_seq, _ = resolve_rollup_interval(
+                candidate_turns,
+                completed_turns(events),
+                start_turn,
+                end_turn,
+            )
+        except (TypeError, ValueError) as error:
+            print(f"Rollup rejected: {error}")
+            return
         span = select_projected_span(
             authoritative_messages,
             source_start_seq=source_start_seq,
@@ -473,9 +499,11 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             authoritative_messages[span.start_index:span.end_index]
         )
         if len(summary) >= len(replaced_content):
-            raise ValueError(
-                "rollup summary must be shorter than the content it replaces."
+            print(
+                "Rollup rejected: rollup summary must be shorter than the "
+                "content it replaces."
             )
+            return
 
         create_from_projection = getattr(
             self,
@@ -1597,7 +1625,10 @@ def _code_agent_send_rg_available():
     def _rollup_eligibility_ephemeral(self) -> str:
         from code_agent.turn_rollups import eligible_rollup_line
 
-        return eligible_rollup_line(self._rollup_candidate_turns())
+        context = self._rollup_context()
+        if context is None:
+            return ""
+        return eligible_rollup_line(context[3], context[4])
 
     @staticmethod
     def _attachment_size_bytes(content) -> int | None:
@@ -1757,13 +1788,20 @@ def _code_agent_send_rg_available():
         inventory_items = self._current_context_inventory()
         names = [item["name"] for item in inventory_items]
         accounting = self._context_accounting()
-        candidate_turns = self._rollup_candidate_turns()
+        rollup_context = self._rollup_context()
+        candidate_turns = () if rollup_context is None else rollup_context[3]
+        rolled_up_upper_turns = (
+            () if rollup_context is None else rollup_context[4]
+        )
         sections = []
         inventory = self._context_inventory_ephemeral(inventory_items, accounting)
         if inventory:
             sections.append(inventory)
         from code_agent.turn_rollups import eligible_rollup_line
-        rollup_line = eligible_rollup_line(candidate_turns)
+        rollup_line = eligible_rollup_line(
+            candidate_turns,
+            rolled_up_upper_turns,
+        )
         if rollup_line:
             sections.append(rollup_line)
         for notice in self._context_management_notices_ephemeral(
@@ -1932,12 +1970,15 @@ Model-facing user messages beginning with `# Turn N` use N as the stable
 canonical identifier for that user-initiated interaction. These labels are
 navigation metadata; do not repeat or edit them.
 
-When present, `Eligible rollup turns: ...` lists the turn numbers available to
-a future `rollup(start_turn, end_turn, summary)` call. Any two listed numbers,
-earlier one first, form a valid rollup. A rollup from A to B replaces completed
-history beginning at A and ending immediately before B, like range(A, B). A and
-B remain listed afterwards; numbers between them do not. Numbers that are not
-listed cannot be used.
+When present, the rollup eligibility lines separate normal turn boundaries
+from existing-rollup upper boundaries. Together they list the turn numbers
+available to a future `rollup(start_turn, end_turn, summary)` call. Any two
+listed numbers, earlier one first, form a valid rollup. A rollup from A to B
+replaces completed history beginning at A and ending immediately before B,
+like range(A, B). A and B remain listed afterwards; numbers between them do
+not. Existing-rollup upper boundaries identify already-rolled-up history;
+eligibility alone is not a reason to wrap the same history repeatedly.
+Numbers that are not listed cannot be used.
 
 Use rollup only when detailed historical content is no longer needed in active
 context. When context pressure is high, consider rolling up eligible historical

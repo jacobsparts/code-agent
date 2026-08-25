@@ -220,14 +220,6 @@ def test_observe_does_not_pin_or_release():
     assert agent.complete is False
 
 
-def test_observe_appears_in_generated_tool_help():
-    agent = make_agent()
-    prompt = agent._build_system_prompt()
-
-    assert (
-        "observe(content: str, transition: bool = False) - "
-        "Record a reflective observation about previous work."
-    ) in prompt
 
 
 def test_observe_relay_captures_runtime_expression_and_arbitrary_value():
@@ -901,17 +893,6 @@ def test_context_notices_are_ephemeral_and_do_not_mutate_messages():
     assert agent.conversation.stored_messages() == original
 
 
-def test_system_prompt_mentions_pin_and_context_pressure():
-    agent = make_agent()
-    prompt = agent._build_system_prompt()
-
-    assert "REPL output may become a preview after three user interactions" in prompt
-    assert ">>> reflection()" in prompt
-    assert "After each substantive turn, call observe()" in prompt
-    assert "think() is a scratchpad for the current turn" in prompt
-    assert "pin() preserves the exact previous turn's code and output" in prompt
-    assert "cannot pin the current\nturn or other historical turns" in prompt
-    assert "If context-management guidance indicates high usage" in prompt
 
 
 

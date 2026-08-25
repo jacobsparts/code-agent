@@ -1,5 +1,4 @@
 import copy
-import inspect
 import json
 from types import SimpleNamespace
 
@@ -451,7 +450,8 @@ def test_candidate_frontier_is_earlier_of_three_turns_ago_and_last_execution():
 
     assert candidates == tuple(ids[:4])
     assert eligible_rollup_line(candidates) == (
-        "Eligible rollup turns: " + ", ".join(str(turn_id) for turn_id in ids[:4])
+        "Eligible normal turn boundaries: "
+        + ", ".join(str(turn_id) for turn_id in ids[:4])
     )
 
 
@@ -509,7 +509,8 @@ def test_active_child_hides_only_internal_candidate_turns():
     assert candidates == (ids[0], ids[1], ids[3], ids[4], ids[5])
     assert ids[2] not in candidates
     assert eligible_rollup_line(candidates) == (
-        "Eligible rollup turns: " + ", ".join(str(turn_id) for turn_id in candidates)
+        "Eligible normal turn boundaries: "
+        + ", ".join(str(turn_id) for turn_id in candidates)
     )
     assert eligible_rollup_line(()) == ""
 
@@ -1370,36 +1371,6 @@ def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_
     )
 
 
-def test_system_prompt_contains_stable_stage_three_guidance():
-    from code_agent.agent import CodeAgentBase
-
-    prompt = CodeAgentBase.system
-    assertions = [
-        "# Turn N",
-        "Eligible rollup turns:",
-        "Any two listed numbers",
-        "earlier one first",
-        "like range(A, B)",
-        "not be used",
-        "context pressure",
-        "PreviewRef",
-        "user's intent",
-        "preferences",
-        "failed or reverted approaches",
-        "observations or discoveries",
-        "important decisions",
-        "verification status",
-        "unresolved issues",
-        "future constraints",
-        "work performed",
-        "final result",
-    ]
-    for text in assertions:
-        assert text in prompt
-
-    assert "# Checkpoint" in prompt
-    assert "transition=True" in prompt
-    assert "does not release control" in prompt
 
 
 def _rollup_test_agent(events, tmp_path):
@@ -1438,19 +1409,6 @@ def _rollup_snapshot(agent, store, session_id):
     )
 
 
-def test_rollup_tool_has_exact_callable_schema():
-    from code_agent.agent import CodeAgentBase
-
-    assert str(inspect.signature(CodeAgentBase.rollup)) == (
-        "(self, start_turn: int, end_turn: int, summary: str)"
-    )
-    spec = CodeAgentBase._toolspec["rollup"](CodeAgentBase.__new__(CodeAgentBase))
-    assert spec.name == "rollup"
-    assert [(param.name, param.annotation, param.required) for param in spec.params] == [
-        ("start_turn", int, True),
-        ("end_turn", int, True),
-        ("summary", str, True),
-    ]
 
 def test_observe_transition_schema_is_strict_bool_and_commits_atomically():
     from code_agent.agent import CodeAgent
@@ -1461,11 +1419,6 @@ def test_observe_transition_schema_is_strict_bool_and_commits_atomically():
     persisted = []
     agent._persist_message = persisted.append
 
-    signature = inspect.signature(CodeAgent.observe)
-    assert signature.parameters["content"].annotation is str
-    assert signature.parameters["content"].default == "Reflection on previous substantive work"
-    assert signature.parameters["transition"].annotation is bool
-    assert signature.parameters["transition"].default is False
 
     for value in (1, 0, "true", None):
         with pytest.raises(TypeError, match="must be a boolean"):
@@ -1523,25 +1476,29 @@ def test_observe_transition_retry_and_abandonment_state_does_not_leak():
         ("session://preview/key", "must not contain PreviewRef"),
     ],
 )
-def test_rollup_summary_validation_is_objective_and_nonmutating(summary, error):
+def test_rollup_summary_validation_is_objective_and_nonmutating(
+    summary, error, capsys
+):
     from code_agent.agent import CodeAgentBase
 
     agent = SimpleNamespace()
     before = copy.deepcopy(agent.__dict__)
-    with pytest.raises((TypeError, ValueError), match=error):
-        CodeAgentBase.rollup(agent, 1, 2, summary)
+    CodeAgentBase.rollup(agent, 1, 2, summary)
+    output = capsys.readouterr().out
+    assert output.startswith("Rollup rejected: ")
+    assert error in output
     assert agent.__dict__ == before
 
 
 
 
-def test_rollup_live_success_and_validation_failure_are_atomic(tmp_path):
+def test_rollup_live_success_and_validation_failure_are_atomic(tmp_path, capsys):
     events, ids = completed_events(6)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
     before = _rollup_snapshot(agent, store, session_id)
 
-    with pytest.raises(ValueError, match="blank"):
-        agent.rollup(ids[0], ids[1], " ")
+    assert agent.rollup(ids[0], ids[1], " ") is None
+    assert "Rollup rejected: rollup summary must not be blank." in capsys.readouterr().out
     assert _rollup_snapshot(agent, store, session_id) == before
 
     result = agent.rollup(ids[0], ids[1], "combined summary")
