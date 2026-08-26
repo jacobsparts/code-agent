@@ -11,6 +11,7 @@ import base64
 import contextlib
 from collections import defaultdict
 
+class APIError(Exception): pass
 _NO_DEADLINE = object()
 
 
@@ -427,6 +428,15 @@ class LLMClient:
         return message
 
     @staticmethod
+    def _require_non_empty(message):
+        for block in message.get('content') or []:
+            if block['type'] == 'tool_call':
+                return
+            if block['type'] in ('text', 'commentary') and block['text'].strip():
+                return
+        raise EmptyResponseError("LLM returned an empty response")
+
+    @staticmethod
     def _json_size_default(value):
         if isinstance(value, bytes):
             return f"<{len(value)} bytes>"
@@ -621,7 +631,7 @@ class LLMClient:
                     logger.debug(req)
                     raise BadRequestError(response_data.strip())
                 elif response.status != 200:
-                    raise Exception(f"API Error {response.status}: {response_data}")
+                    raise APIError(f"{response.status}: {response_data}")
 
                 response_json = json.loads(response_data)
                 parser = self.model_config.get('response_parser') or _parse_completions_response
@@ -907,7 +917,7 @@ class LLMClient:
             if response.status == 400:
                 raise BadRequestError(response_data.strip())
             if response.status != 200:
-                raise Exception(f"API Error {response.status}: {response_data}")
+                raise APIError(f"{response.status}: {response_data}")
             return self._parse_responses_result(json.loads(response_data))
         finally:
             conn.close()
@@ -940,7 +950,7 @@ class LLMClient:
 
     def _call_codex(self, messages, tools):
         req = self._responses_request(messages, tools)
-        # Stage idle budgets live in code_agent.codex (60s/30s/30s).
+        # Stage idle budgets live in code_agent.transports.codex (60s/30s/30s).
         # Do not impose a total wall-clock timeout here.
         return self._parse_responses_result(codex.responses(req))
 
@@ -1038,7 +1048,7 @@ class LLMClient:
                 logger.debug(req)
                 raise BadRequestError(response_data.strip())
             elif response.status != 200:
-                raise Exception(f"API Error {response.status}: {response_data}")
+                raise APIError(f"{response.status}: {response_data}")
             response_json = json.loads(response_data)
             if usage := response_json.get('usage'):
                 self.usage_tracker.log(self.model_name, usage)
@@ -1223,7 +1233,7 @@ class LLMClient:
                 logger.debug(req)
                 raise BadRequestError(response_data.strip())
             elif response.status != 200:
-                raise Exception(f"API Error {response.status}: {response_data}")
+                raise APIError(f"{response.status}: {response_data}")
             response_json = json.loads(response_data)
             if usage := response_json.get('usageMetadata'):
                 self.usage_tracker.log(self.model_name, usage)
@@ -1300,7 +1310,9 @@ class LLMClient:
             caller = callers[api_type]
         except KeyError:
             raise NotImplementedError(api_type)
-        return self._strip_response_media(caller(messages, tools))
+        message = self._strip_response_media(caller(messages, tools))
+        self._require_non_empty(message)
+        return message
 
     @staticmethod
     def _sleep_backoff(attempt, base=15):
@@ -1322,7 +1334,7 @@ class LLMClient:
             raise
         except Exception as e:
             err = (str(e) if len(str(e)) < 1000 else str(e)[:1000]+'...').replace("\n"," ")
-            logger.error(f"call {type(e).__name__}: {err}", exc_info=True)
+            logger.error(f"call {type(e).__name__}: {err}", exc_info=not isinstance(e, APIError))
             if retry:
                 self._sleep_backoff(attempt)
                 return self.call(messages, retry-1, attempt+1)
