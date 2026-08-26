@@ -1589,7 +1589,12 @@ def _build_overlay_worker_code() -> str:
         env["CODE_AGENT_SESSION_DB"] = session_db
         try:
             child = subprocess.Popen(
-                [sys.executable, "-"],
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; exec(compile(sys.stdin.read(), "
+                    "'<overlay-subagent-worker>', 'exec'))",
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1605,6 +1610,7 @@ def _build_overlay_worker_code() -> str:
         os.close(liveness_read_fd)
         child.stdin.write(bootstrap.encode())
         child.stdin.close()
+        child.stdin = None
         overlay_children[child.pid] = (child, liveness_write_fd)
         return child.pid
 
@@ -2231,7 +2237,12 @@ worker_main(
             env["CODE_AGENT_SESSION_DB"] = self.runtime_config["session_db"]
             try:
                 transport._proc = subprocess.Popen(
-                    [os.sys.executable, "-"],
+                    [
+                        os.sys.executable,
+                        "-c",
+                        "import sys; exec(compile(sys.stdin.read(), "
+                        "'<overlay-subagent-worker>', 'exec'))",
+                    ],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -2252,6 +2263,7 @@ worker_main(
             self._liveness_write_fd = liveness_write_fd
             transport._proc.stdin.write(bootstrap.encode())
             transport._proc.stdin.close()
+            transport._proc.stdin = None
         else:
             self._parent_overlay._spawn_child_worker(self, bootstrap)
 
