@@ -270,6 +270,12 @@ def _extract_released_assistant_text(msg: dict) -> str:
         return str(value)
 
     content = msg.get("content") or ""
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") in ("text", "commentary")
+        )
     try:
         tree = _parse_silently(content)
     except SyntaxError:
@@ -315,6 +321,12 @@ def _is_released_assistant_message(msg: dict) -> bool:
         return True
 
     content = msg.get("content") or ""
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") in ("text", "commentary")
+        )
     try:
         tree = _parse_silently(content)
     except SyntaxError:

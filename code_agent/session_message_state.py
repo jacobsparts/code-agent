@@ -1,6 +1,14 @@
 import copy
 
 
+def _normalize_content_to_blocks(content) -> list[dict]:
+    if isinstance(content, list):
+        return copy.deepcopy(content)
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    return []
+
+
 def coalesce_adjacent_user_messages(messages: list[dict]) -> list[dict]:
     out = []
     for message in messages:
@@ -13,15 +21,20 @@ def coalesce_adjacent_user_messages(messages: list[dict]) -> list[dict]:
             previous.setdefault("_render_segments", []).extend(
                 copy.deepcopy(message.get("_render_segments") or [])
             )
-            previous_content = previous.get("content", "")
-            content = message.get("content", "")
-            separator = (
-                "" if not previous_content or previous_content.endswith("\n") else "\n"
-            )
-            merged = previous_content + separator + content
-            if not merged.endswith("\n"):
-                merged += "\n"
-            previous["content"] = merged
+            previous_content = previous.get("content")
+            content = message.get("content")
+            if isinstance(previous_content, str) and isinstance(content, str):
+                separator = (
+                    "" if not previous_content or previous_content.endswith("\n") else "\n"
+                )
+                merged = previous_content + separator + content
+                if not merged.endswith("\n"):
+                    merged += "\n"
+                previous["content"] = merged
+            else:
+                prev_blocks = _normalize_content_to_blocks(previous_content)
+                new_blocks = _normalize_content_to_blocks(content)
+                previous["content"] = prev_blocks + new_blocks
             if message.get("_stdout"):
                 previous_stdout = previous.get("_stdout", "")
                 stdout_separator = (
