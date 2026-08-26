@@ -9,7 +9,7 @@ Usage:
 
 Defaults to ~/.code-agent/codex-auth.json
 
-Data source mirrors code_agent.codex.CodexAuth rate_limits:
+Data source mirrors code_agent.transports.codex.CodexAuth rate_limits:
     rate_limits = {
         "fetched_at": <unix ts>,
         "limits": {

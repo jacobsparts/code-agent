@@ -484,9 +484,84 @@ def complete_device_code_login(
     return save_credential(auth, cred_file)
 
 
+def _matches_account_selector(selector: str, account_name: Optional[str], index: int) -> bool:
+    s = selector.strip()
+    if account_name and s == account_name:
+        return True
+    if s.lower() == f"cred-{index}".lower():
+        return True
+    return False
+
+
+def remove_credentials(
+    identifiers: list[str] | str,
+    *,
+    path: str = CRED_FILE,
+) -> list[dict]:
+    """Remove credentials matching given identifier(s) (account name or cred-N).
+
+    Returns list of removed credentials.
+    """
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Credentials file not found: {path}")
+
+    if isinstance(identifiers, str):
+        identifiers = [identifiers]
+    target_ids = [i for i in (identifiers or []) if i]
+
+    if not target_ids:
+        raise ValueError("At least one identifier (account name or cred-N) is required.")
+
+    removed: list[dict] = []
+
+    with locked_open(path, "r+", exclusive=True) as f:
+        f.seek(0)
+        try:
+            data = json.load(f)
+        except Exception as exc:
+            raise ValueError(f"Could not parse credentials file {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid format in credentials file {path}: root is not an object")
+
+        credentials = data.get("credentials")
+        if not isinstance(credentials, list):
+            credentials = []
+
+        kept: list[dict] = []
+        for idx, cred in enumerate(credentials):
+            if not isinstance(cred, dict):
+                kept.append(cred)
+                continue
+
+            cred_account = cred.get("account")
+
+            match = False
+            for ident in target_ids:
+                if _matches_account_selector(ident, cred_account, idx):
+                    match = True
+                    break
+
+            if match:
+                cred_copy = dict(cred)
+                cred_copy["_index"] = idx
+                removed.append(cred_copy)
+            else:
+                kept.append(cred)
+
+        if removed:
+            data["credentials"] = kept
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2)
+            f.write("\n")
+
+    return removed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Headless Codex device-code login.",
+        description="Headless Codex device-code login and credential management.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--issuer", default=os.environ.get("CODEX_ISSUER", DEFAULT_ISSUER),
@@ -501,15 +576,68 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Only request the code and print verification_url + user_code, do not poll.")
     p.add_argument("--json", action="store_true",
                    help="When used with --print-only, emit JSON {verification_url, user_code, device_auth_id, interval}")
+    p.add_argument("--remove", dest="remove_targets", nargs="+", metavar="IDENTIFIER", default=None,
+                   help="Remove credential(s) matching account name or cred-N from credentials file")
     return p
+
+
+def _describe_credential(cred: dict) -> str:
+    account = cred.get("account")
+    idx = cred.get("_index")
+    label = account or (f"cred-{idx}" if idx is not None else None)
+
+    email = cred.get("email") or "<no email>"
+    tokens = cred.get("tokens") or {}
+    account_id = tokens.get("account_id") if isinstance(tokens, dict) else None
+    last_refresh = cred.get("last_refresh")
+    bits = []
+    if label:
+        bits.append(f"account={label}")
+    bits.append(f"email={email}")
+    bits.append(f"account_id={account_id or '<none>'}")
+    if last_refresh:
+        bits.append(f"last_refresh={last_refresh}")
+    return ", ".join(bits)
+
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    cred_file = os.path.expanduser(args.cred_file)
+
+    if args.remove_targets is not None:
+        identifiers = list(args.remove_targets)
+        if not identifiers:
+            print("Error: --remove requires at least one identifier (account name or cred-N).", file=sys.stderr)
+            return 2
+
+        try:
+            removed = remove_credentials(
+                identifiers=identifiers,
+                path=cred_file,
+            )
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nCancelled by user.", file=sys.stderr)
+            return 130
+
+        if not removed:
+            print(f"No credentials matched in {cred_file}: {', '.join(identifiers)}", file=sys.stderr)
+            return 1
+
+        print(f"Removed {len(removed)} credential(s) from {cred_file}:")
+        for cred in removed:
+            print(f"  - {_describe_credential(cred)}")
+        return 0
+
     issuer = args.issuer.rstrip("/")
     client_id = args.client_id
-    cred_file = os.path.expanduser(args.cred_file)
 
     try:
         if args.print_only:

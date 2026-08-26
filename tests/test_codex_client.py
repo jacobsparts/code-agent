@@ -13,27 +13,7 @@ import pytest
 
 from code_agent.transports import codex
 from code_agent.client import LLMClient
-from code_agent.conversation import Conversation
 from code_agent.repl_tool_adapter import REPL_EXECUTE_TOOL
-
-
-def _legacy_to_transport(messages):
-    client = object.__new__(LLMClient)
-    captured = {}
-
-    def call(projected, **kwargs):
-        captured["messages"] = projected
-        return {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
-
-    client.call = call
-    Conversation(client, "").call(messages)
-    return captured["messages"]
-
-
-def _transport_to_legacy(message):
-    client = object.__new__(LLMClient)
-    client.call = lambda messages, **kwargs: message
-    return Conversation(client, "").call([])
 
 
 def _jwt(payload):
@@ -393,7 +373,7 @@ def test_headers_reuse_process_session_id(tmp_path):
     assert uuid.UUID(codex.SESSION_ID).version == 7
 
 
-def test_legacy_input_file_survives_responses_projection(monkeypatch):
+def test_provider_id_attachment_survives_responses_projection(monkeypatch):
     config = {
         "provider": "openai",
         "model": "gpt-test",
@@ -408,13 +388,18 @@ def test_legacy_input_file_survives_responses_projection(monkeypatch):
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     client = LLMClient("openai/gpt-test")
 
-    transport = _legacy_to_transport([{
+    transport = [{
         "role": "user",
         "content": [
-            {"type": "input_file", "file_id": "file_123"},
+            {
+                "type": "attachment",
+                "media_type": None,
+                "data_type": "provider_id",
+                "data": "file_123",
+            },
             {"type": "text", "text": "Use this file."},
         ],
-    }])
+    }]
     request = client._responses_request(transport, None)
 
     assert transport[0]["content"] == [
@@ -519,7 +504,7 @@ def test_codex_strips_unsupported_prompt_cache_fields(monkeypatch, tmp_path):
     assert request_body["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
 
 
-def test_responses_order_survives_to_lossy_legacy_boundary(monkeypatch):
+def test_responses_parser_preserves_canonical_block_order(monkeypatch):
     config = {
         "provider": "openai",
         "model": "gpt-test",
@@ -561,14 +546,8 @@ def test_responses_order_survives_to_lossy_legacy_boundary(monkeypatch):
     ]
     assert response["content"][1]["args"] == {"file_path": "app.py"}
 
-    legacy = _transport_to_legacy(response)
-    assert legacy["content"].startswith("# first")
-    assert legacy["content"].endswith("last")
-    assert legacy["tool_calls"][0]["function"]["name"] == "read"
 
-
-
-def test_non_native_history_preserves_legacy_tool_policy(monkeypatch):
+def test_non_native_history_emulates_canonical_tool_messages(monkeypatch):
     config = {
         "provider": "codex",
         "model": "gpt-test",
@@ -592,21 +571,24 @@ def test_non_native_history_preserves_legacy_tool_policy(monkeypatch):
         }
 
     client._call_codex = call
-    Conversation(client, "").call([
+    client.call([
         {
             "role": "assistant",
-            "content": "working",
-            "tool_calls": [{
-                "id": "call",
-                "type": "function",
-                "function": {"name": "read", "arguments": "{}"},
-            }],
+            "content": [
+                {"type": "text", "text": "working"},
+                {
+                    "type": "tool_call",
+                    "id": "call",
+                    "name": "read",
+                    "args": {},
+                },
+            ],
         },
         {
             "role": "tool",
             "name": "read",
             "tool_call_id": "call",
-            "content": "file contents",
+            "content": [{"type": "text", "text": "file contents"}],
             "_private": "discard",
         },
     ])
@@ -996,7 +978,6 @@ def test_saving_rate_limits_preserves_concurrently_refreshed_tokens(tmp_path):
     assert saved["credentials"][0]["rate_limits"]["limits"] == {
         "codex_primary": {"used_percent": 25.0, "reset_at": 1704069000},
     }
-
 
 
 class _FakeSock:
@@ -1394,7 +1375,6 @@ def test_http_429_expires_selected_quota(monkeypatch, tmp_path):
 
     saved = json.loads(path.read_text())
     assert saved["credentials"][0]["rate_limits"]["fetched_at"] == 0
-
 
 
 def test_refresh_401_marks_credential_invalid(monkeypatch, tmp_path):
