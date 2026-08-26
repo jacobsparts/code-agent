@@ -30,6 +30,7 @@ import socket
 import ssl
 import struct
 import sys
+import threading
 import time
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -49,6 +50,7 @@ DEFAULT_TIMEOUT = 30 * 60
 KEY_EXCHANGE_TIMEOUT = 30
 HEARTBEAT_TIMEOUT = 30
 POST_BLOB_PROGRESS_TIMEOUT = 30
+INITIAL_MODEL_PROGRESS_TIMEOUT = 30
 BIDI_APPEND_PIPELINE_DEPTH = 8
 RESPONSE_USAGE_GRACE_TIMEOUT = 3
 USAGE_LOOKUP_ATTEMPTS = 4
@@ -106,6 +108,33 @@ AVAILABLE_MODELS_PATH = "aiserver.v1.AiService/AvailableModels"
 # Cursor uses this identifier for inference routing/cache affinity.
 # A code-agent process represents one conversation session.
 _SESSION_CONVERSATION_ID = str(uuid.uuid4())
+
+# resumeAction wire bytes: ConversationAction{resumeAction{}} - the semantic
+# mid-turn resume action proven to continue inference from a checkpoint graph.
+_RESUME_ACTION_BYTES = bytes.fromhex("12021200")
+
+# Harmless nonce used solely to register a fresh conversation envelope; supplied
+# synthetic state supersedes it on every real call.
+_REGISTRATION_PROMPT = (
+    "Reply with exactly the word ok and nothing else. Do not use any tools."
+)
+
+# conversation_id -> True once a userMessageAction Run has registered the envelope
+# server-side. Guarded by a lock; this transport is synchronous so check-and-set
+# under the lock is sufficient for concurrency safety.
+_REGISTERED_CONVERSATIONS: dict[tuple[str, str], bool] = {}
+_REGISTRATION_LOCK = threading.Lock()
+
+
+def _registration_envelope_key(
+    conversation_id: str, conversation_group_id: str | None
+) -> tuple[str, str]:
+    """Registry identity for a conversation envelope: (id, groupId) pair.
+
+    The server treats conversationId and conversationGroupId as independent
+    registration axes (distinct explicit groups are supported), so both must
+    match before a checkpoint resume is attempted without re-registering."""
+    return (conversation_id, conversation_group_id or conversation_id)
 
 DEBUG = False
 
@@ -344,7 +373,7 @@ def classify(payload: bytes, direction: str) -> CursorMessage:
             ("execClientMessage", ClientExecMessage, "agent_client.exec_message"),
             ("kvClientMessage", KVResponse, "agent_client.kv_response"),
             ("execClientControlMessage", Control, "agent_client.control"),
-            ("_field4", Control, "agent_client.control"),
+            ("conversationAction", Control, "agent_client.control"),
         ):
             if key in decoded:
                 return make(kind, name)
@@ -1667,6 +1696,13 @@ class SSEClient:
                         "post_blob_timeout_expired",
                         **getattr(self, "_post_blob_debug", {}),
                     )
+                    phase = getattr(
+                        self, "_post_blob_debug", {}
+                    ).get("phase")
+                    if phase == "initial_model_progress":
+                        raise SSEError(
+                            "no model progress after initial request"
+                        )
                     raise SSEError(
                         "no model progress after blob hydration"
                     )
@@ -1713,11 +1749,18 @@ class SSEClient:
 def extract_prefetched_blobs(client_payload: bytes) -> dict[bytes, bytes]:
     client = cursor_schema.decode(client_payload, "AgentClientMessage")
     run = client.get("runRequest", {})
-    return {
+    blobs = {
         blob["blobId"]: blob["value"]
         for blob in run.get("prefetchedBlobs", ())
         if "blobId" in blob and "value" in blob
     }
+    # Raw field-17 occurrences carry PrefetchedBlob messages when supplied via
+    # the unknown-field map (no named member exists in the merged schema).
+    for _wire_type, raw in run.get(cursor_schema.UNKNOWN, {}).get("17", ()):
+        blob = cursor_schema.decode(raw, "PrefetchedBlob")
+        if "blobId" in blob and "value" in blob:
+            blobs[blob["blobId"]] = blob["value"]
+    return blobs
 
 
 def is_generation_progress(message: CursorMessage | None) -> bool:
@@ -1803,7 +1846,7 @@ def is_response_boundary_blob_write(
 
 def build_user_cancelled_message() -> bytes:
     return cursor_schema.encode(
-        {"_field4": {"_field3": {"reason": "user_cancelled"}}},
+        {"conversationAction": {"cancelAction": {"reason": "user_cancelled"}}},
         "AgentClientMessage",
     )
 
@@ -1842,103 +1885,176 @@ def _value_dict(value):
     }
 
 
-def _historical_tool_step(
+def _varint_bytes(value: int) -> bytes:
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _canonical_prefix_digest(domain: str, parts) -> bytes:
+    digest = hashlib.sha256()
+    digest.update(domain.encode() + b"\0")
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.digest()
+
+
+def _boundary_uuid(domain: str, parts) -> str:
+    """Deterministic UUID-shaped id from a domain-separated prefix hash."""
+    return str(uuid.UUID(bytes=_canonical_prefix_digest(domain, parts)[:16]))
+
+
+def _message_prefix_parts(history, boundary: int) -> list[bytes]:
+    parts = []
+    for message in history[:boundary]:
+        parts.append(message.role.encode())
+        parts.append(message.content.encode())
+        parts.append(message.tool_call_id.encode())
+        parts.append(message.tool_name.encode())
+        for call in message.tool_calls:
+            arguments = json.dumps(
+                call.arguments, separators=(",", ":"), sort_keys=True
+            )
+            for value in (call.id, call.name, arguments):
+                encoded = value.encode()
+                parts.append(len(encoded).to_bytes(8, "big"))
+                parts.append(encoded)
+    return parts
+
+
+def completed_tool_step(
     call: "ToolCall", result: ConversationMessage | None
 ) -> bytes:
-    payload = {
-        "_field1": {
-            "name": call.name,
-            "arguments": [
-                (str(key), _value_dict(value))
-                for key, value in call.arguments.items()
-            ],
-            "toolCallId": call.id,
-            "providerIdentifier": call.provider_identifier,
-            "toolName": call.name,
-        }
-    }
-    if result is not None:
-        payload["_field2"] = {
-            "_field1": {"content": result.content},
-            "_field2": False,
-        }
-    return cursor_schema.encode(
+    """Completed tool-step blob in the live-validated structure:
+    f2{f8{f1{f1 path}, f2{f1 result{...}}}, f57 toolCallId}. Timestamps are omitted
+    so identical prefixes produce byte-identical blobs."""
+    path = "tool-results/" + call.id
+    content = result.content if result is not None else ""
+    lines = content.count("\n") + 1 if content else 0
+    size = len(content.encode())
+
+    def raw(fields: dict) -> bytes:
+        return cursor_schema.encode({cursor_schema.UNKNOWN: fields}, "Empty")
+
+    result_msg = raw({
+        1: [(2, content.encode())],
+        4: [(0, _varint_bytes(lines))],
+        5: [(0, _varint_bytes(size))],
+        7: [(2, path.encode())],
+        8: [(2, raw({1: [(0, b"\x01")], 2: [(0, b"\x02")]}))],
+    })
+    payload = raw({
+        1: [(2, raw({1: [(2, path.encode())]}))],
+        2: [(2, raw({1: [(2, result_msg)]}))],
+    })
+    return raw({
+        2: [(2, raw({
+            8: [(2, payload)],
+            57: [(2, call.id.encode())],
+        }))],
+    })
+
+
+def _user_root_json(text: str, request_id: str) -> bytes:
+    """User JSON root, exact accepted Cursor shape."""
+    return json.dumps(
         {
-            "_field2": {
-                "_field15": payload,
-            }
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+            "providerOptions": {"cursor": {"requestId": request_id}},
         },
-        "_HistoricalToolStep",
-    )
+        separators=(",", ":"),
+    ).encode()
 
 
-def _conversation_message_json(message: ConversationMessage) -> bytes | None:
-    if message.role == "assistant" and message.tool_calls:
-        if not message.content or message.content == "[empty]":
-            return None
-        payload = {
+def _assistant_root_json(content: str | None, message_id: str) -> bytes:
+    text = "" if content in (None, "[empty]") else content
+    return json.dumps(
+        {
             "role": "assistant",
-            "id": _conversation_message_id("assistant", message),
-            "content": message.content,
-        }
-    elif message.role == "tool":
+            "id": message_id,
+            "content": [{"type": "text", "text": text}],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _assistant_tool_request_json(calls) -> bytes:
+    return json.dumps(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool-call",
+                    "toolCallId": call.id,
+                    "toolName": call.name,
+                    "args": call.arguments,
+                }
+                for call in calls
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _tool_root_json(results) -> bytes:
+    entries = []
+    for message in results:
         try:
-            result = json.loads(message.content)
+            parsed = json.loads(message.content)
         except json.JSONDecodeError:
-            result = message.content
-        payload = {
-            "role": "tool",
-            "id": _conversation_message_id("tool", message),
-            "content": [{
-                "type": "tool-result",
-                "toolCallId": message.tool_call_id,
-                "toolName": message.tool_name,
-                "result": result,
-            }],
+            parsed = message.content
+        entry = {
+            "type": "tool-result",
+            "toolCallId": message.tool_call_id,
+            "toolName": message.tool_name,
+            "result": parsed,
         }
-    else:
-        payload = {
-            "role": message.role,
+        success = {
             "content": message.content,
+            "totalLines": message.content.count("\n") + 1
+            if message.content else 0,
+            "fileSize": len(message.content.encode()),
+            "path": "tool-results/" + message.tool_call_id,
         }
-    return json.dumps(payload, separators=(",", ":")).encode()
-
-
-def _conversation_message_id(
-    role: str, message: ConversationMessage
-) -> str:
-    key = role + "\0" + message.tool_call_id + "\0" + message.content
-    for call in message.tool_calls:
-        arguments = json.dumps(
-            call.arguments, separators=(",", ":"), sort_keys=True
-        )
-        key += "\0" + call.id + "\0" + call.name + "\0" + arguments
-    return hashlib.sha256(key.encode()).hexdigest()
+        entry["providerOptions"] = {"cursor": {
+            "highLevelToolCallResult": {
+                "output": {"success": success},
+                "isError": False,
+            },
+        }}
+        entries.append(entry)
+    return json.dumps({"role": "tool", "content": entries},
+                      separators=(",", ":")).encode()
 
 
 def encode_conversation_state(
-    history, mode: int = 1
-) -> tuple[bytes, list[bytes]]:
+    history,
+    mode: int = 1,
+    conversation_id: str | None = None,
+) -> tuple[bytes, list[dict]]:
+    """Build a wholly synthetic checkpoint graph + its content-addressed blob map.
+
+    The final turn is OPEN (complete flag 0) when history ends with a user message
+    and COMPLETE when it ends with tool results, so resumeAction continues inference
+    exactly where the conversation left off. All ids are derived deterministically
+    from the conversation prefix; no random values enter the graph blobs."""
     history = list(history)
-    state = {"mode": mode}
-    root_blobs = []
-    turns = []
-    prefetched = []
+    conversation_id = conversation_id or "00000000-0000-0000-0000-000000000000"
+    blob_map: dict[bytes, bytes] = {}
 
     def add_blob(value: bytes) -> bytes:
         blob_id = hashlib.sha256(value).digest()
-        prefetched.append({"blobId": blob_id, "value": value})
+        blob_map[blob_id] = value
         return blob_id
 
-    def add_turn(turn):
-        turn_blob = add_blob(cursor_schema.encode(turn, "_HistoricalTurn"))
-        turns.append(turn_blob)
-
-    for message in history:
-        encoded = _conversation_message_json(message)
-        if encoded:
-            root_blobs.append(add_blob(encoded))
-
+    # Group history into user-boundary turns exactly like the legacy encoder did,
+    # but every id now derives from the canonical prefix at the boundary.
+    turns_meta = []  # (prefix_parts, messages) per turn
     index = 0
     while index < len(history):
         if history[index].role != "user":
@@ -1947,43 +2063,125 @@ def encode_conversation_state(
         end = index + 1
         while end < len(history) and history[end].role != "user":
             end += 1
-        messages = history[index:end]
-        user_id = "history-" + hashlib.sha256(
-            messages[0].content.encode()
-        ).hexdigest()[:16]
-        user_message = cursor_schema.encode(
-            {"text": messages[0].content, "messageId": user_id, "mode": mode},
+        turns_meta.append((index, end))
+        index = end
+
+    root_blobs = []
+    turn_addrs = []
+    for start, end in turns_meta:
+        messages = history[start:end]
+        prefix_parts = _message_prefix_parts(history, start + 1)
+        message_id = _boundary_uuid("coda-cursor-message-id", prefix_parts)
+        request_id = _boundary_uuid("coda-cursor-request-id", prefix_parts)
+
+        um_bytes = cursor_schema.encode(
+            {
+                "text": messages[0].content,
+                "messageId": message_id,
+                "selectedContext": {},
+                "mode": mode,
+            },
             "UserMessage",
         )
+        um_addr = add_blob(um_bytes)
+
         results = {
-            message.tool_call_id: message
-            for message in messages[1:]
-            if message.role == "tool"
+            m.tool_call_id: m for m in messages[1:] if m.role == "tool"
         }
-        step_ids = []
-        for message in messages[1:]:
-            if message.role != "assistant":
+        turn_roots = [add_blob(
+            _user_root_json(messages[0].content, request_id))]
+        child_addrs = []
+        for m in messages[1:]:
+            if m.role != "assistant":
                 continue
-            if message.content and message.content != "[empty]":
-                step = cursor_schema.encode(
-                    {"_field1": {"content": message.content}},
-                    "_HistoricalToolTextWrapper",
-                )
-                step_ids.append(add_blob(step))
-            for call in message.tool_calls:
-                step_ids.append(
-                    add_blob(
-                        _historical_tool_step(call, results.get(call.id))
-                    )
-                )
-        add_turn({
-            "_field1": add_blob(user_message),
-            "_field2": step_ids,
-        })
-        index = end
-    state["rootPromptMessagesJson"] = root_blobs
-    state["turns"] = turns
-    return cursor_schema.encode(state, "ConversationCheckpointUpdate"), prefetched
+            calls = tuple(m.tool_calls)
+            if calls:
+                turn_roots.append(add_blob(
+                    _assistant_tool_request_json(calls)))
+                for call in calls:
+                    child_addrs.append(add_blob(
+                        completed_tool_step(call, results.get(call.id))))
+                if m.content and m.content != "[empty]":
+                    turn_roots.append(add_blob(
+                        _assistant_root_json(m.content, message_id)))
+            elif m.content and m.content != "[empty]":
+                turn_roots.append(add_blob(
+                    _assistant_root_json(m.content, message_id)))
+            else:
+                continue
+        tool_results = [m for m in messages[1:] if m.role == "tool"]
+        if tool_results:
+            turn_roots.append(add_blob(_tool_root_json(tool_results)))
+
+        root_blobs.extend(turn_roots)
+
+        complete = 1 if end < len(history) else 0
+        inner_fields = {
+            1: [(2, um_addr)],
+            3: [(2, conversation_id.encode())],
+            4: [(2, _boundary_uuid(
+                "coda-cursor-turn-token", prefix_parts).encode())],
+            5: [(0, bytes([complete]))],
+        }
+        for addr in child_addrs:
+            inner_fields.setdefault(2, []).append((2, addr))
+        inner = cursor_schema.encode(
+            {cursor_schema.UNKNOWN: inner_fields}, "Empty")
+        turn_addrs.append(add_blob(cursor_schema.encode(
+            {"_field1": inner}, "_HistoricalTurn")))
+
+    state = {
+        "rootPromptMessagesJson": root_blobs,
+        "turns": turn_addrs,
+        "mode": mode,
+    }
+    checkpoint = cursor_schema.encode(
+        state, "ConversationCheckpointUpdate")
+    prefetched = [
+        {"blobId": blob_id, "value": value}
+        for blob_id, value in sorted(blob_map.items())
+    ]
+    return checkpoint, prefetched
+
+
+def build_registration_run_request(
+    prompt: str,
+    model: str,
+    *,
+    conversation_id: str,
+    run_config: RunConfig | None = None,
+) -> bytes:
+    """Harmless one-shot userMessageAction Run used only to register a fresh
+    envelope server-side. Its synthetic state is empty; it is never shown to a
+    model as part of a resumed graph because supplied state supersedes it."""
+    run_config = run_config or RunConfig()
+    action = {"userMessageAction": {
+        "userMessage": {
+            "text": prompt,
+            "messageId": str(uuid.uuid4()),
+            "selectedContext": {},
+            "mode": 1,
+        },
+        "requestContext": {},
+    }}
+    unknown = {
+        1: [(2, cursor_schema.encode({}, "ConversationCheckpointUpdate"))],
+        2: [(2, cursor_schema.encode(action, "ConversationAction"))],
+        3: [(2, encode_model_details(model))],
+        4: [(2, cursor_schema.encode({}, "Empty"))],
+        # conversationId (field 5) is supplied via the named run_request key.
+        10: [(0, b"\x00")],
+        12: [(0, b"\x00")],
+        23: [(0, b"\x00")],
+    }
+    run_request = {
+        "conversationId": conversation_id,
+        "suggestNextPrompt": None,
+        cursor_schema.UNKNOWN: unknown,
+    }
+    return cursor_schema.encode({"runRequest": run_request},
+                                "AgentClientMessage")
+
 
 
 def encode_model_details(model: str) -> bytes:
@@ -2013,8 +2211,12 @@ def build_run_request(
     workspace_uri: str | None = None,
     client_name: str | None = None,
 ) -> bytes:
-    """Build the smallest useful AgentClientMessage.run_request."""
+    """Build a synthetic-checkpoint resumeAction RunRequest.
 
+    The conversation graph (checkpoint + content-addressed blob map) is built from
+    the authoritative history plus any final user prompt; inference continues via
+    resumeAction with no synthetic reminder text. RunConfig.action still overrides
+    the action for callers that need a different ConversationAction."""
     user_config = user_config or UserMessageConfig()
     run_config = run_config or RunConfig()
     conversation_id = (
@@ -2022,40 +2224,19 @@ def build_run_request(
         or run_config.conversation_id
         or _SESSION_CONVERSATION_ID
     )
-    message_id = message_id or str(uuid.uuid4())
 
-    selected_context: object = {}
-    if user_config.selected_context is not None:
-        selected_context = {cursor_schema.UNKNOWN: {1: [(2, user_config.selected_context)]}}
-    user_message = {
-        "text": prompt,
-        "messageId": message_id,
-        "selectedContext": selected_context,
-        "mode": user_config.mode,
-        "isSimulatedMsg": user_config.is_simulated_msg,
-        "bestOfNGroupId": user_config.best_of_n_group_id,
-        "tryUseBestOfNPromotion": user_config.try_use_best_of_n_promotion,
-        "richText": user_config.rich_text,
-        "simulatedMsgReason": user_config.simulated_msg_reason,
-        "conversationStateBlobId": (
-            user_config.conversation_state_blob_id or None
-        ),
-        "subagentSystemReminder": user_config.subagent_system_reminder,
-        "triggeringUserInfo": user_config.triggering_user_info,
-        "executePlanInfo": user_config.execute_plan_info,
-        "simulatedMessageMetadata": user_config.simulated_message_metadata,
-        "promptReferenceId": user_config.prompt_reference_id,
-        "threadId": user_config.thread_id,
-        "textBlobId": user_config.text_blob_id,
-        "richTextBlobId": user_config.rich_text_blob_id,
-        "hookAdditionalContexts": list(
-            user_config.hook_additional_contexts
-        ) or None,
-        "customModeIntent": user_config.custom_mode_intent,
-    }
-    action = {"userMessage": user_message, "requestContext": {}}
+    # Fold an explicit prompt into history as the final user message so the
+    # checkpoint graph is the single source of truth for what the model sees.
+    messages = list(history)
+    if prompt:
+        messages.append(ConversationMessage(role="user", content=prompt))
+    elif not messages:
+        messages.append(ConversationMessage(role="user", content=""))
+
     conversation_state, prefetched = encode_conversation_state(
-        history, user_config.mode
+        messages,
+        user_config.mode,
+        conversation_id=conversation_id,
     )
     if run_config.conversation_state is not None:
         conversation_state = run_config.conversation_state
@@ -2068,10 +2249,7 @@ def build_run_request(
     if run_config.action is not None:
         unknown[2] = [(2, run_config.action)]
     else:
-        action_bytes = cursor_schema.encode(
-            {"userMessageAction": action}, "RunRequestAction"
-        )
-        unknown[2] = [(2, action_bytes)]
+        unknown[2] = [(2, _RESUME_ACTION_BYTES)]
     for number, value in (
         (6, run_config.mcp_file_system_options),
         (7, run_config.skill_options),
@@ -2105,11 +2283,15 @@ def build_run_request(
         unknown.setdefault(20, []).append((2, value))
     for number, occurrences in (run_config.extra_fields or {}).items():
         unknown.setdefault(number, []).extend(occurrences)
+    for blob in prefetched:
+        # Field 17 (repeated PrefetchedBlob) has no named member in the merged
+        # RunRequest schema; supply it as raw length-delimited occurrences.
+        unknown.setdefault(17, []).append(
+            (2, cursor_schema.encode(blob, "PrefetchedBlob")))
     run_request = {
         "conversationId": conversation_id,
         "suggestNextPrompt": None,
         cursor_schema.UNKNOWN: unknown,
-        "prefetchedBlobs": prefetched or None,
     }
     client_message = {
         "runRequest": run_request,
@@ -2749,8 +2931,36 @@ class CursorClient:
             "x-cursor-client-version": self.client_version,
         }
 
-    def handle_frame(self, frame: CursorFrame) -> None:
-        pass
+    def _ensure_conversation_registered(
+        self, conversation_id: str, group_id: str | None, model: str,
+    ) -> None:
+        """Register a fresh conversation envelope server-side exactly once.
+
+        The server only accepts checkpoint graphs for conversations it has seen a
+        normal userMessageAction Run for; a harmless one-shot registration Run
+        satisfies that prerequisite without polluting resumed inference. Identity
+        is the (conversationId, conversationGroupId) pair so distinct explicit
+        groups are registered independently. The registry is marked only AFTER a
+        clean registration run; concurrent callers block on the in-flight lock and
+        re-check rather than slipping through an unfinished/failing registration."""
+        envelope = _registration_envelope_key(conversation_id, group_id)
+        with _REGISTRATION_LOCK:
+            if _REGISTERED_CONVERSATIONS.get(envelope):
+                return
+        try:
+            self.run(
+                _REGISTRATION_PROMPT,
+                model,
+                run_config=RunConfig(
+                    conversation_id=conversation_id,
+                    conversation_group_id=group_id,
+                ),
+                _registering=True,
+            )
+        except SSEError as exc:
+            raise SSEError(f"conversation registration failed: {exc}") from exc
+        with _REGISTRATION_LOCK:
+            _REGISTERED_CONVERSATIONS[envelope] = True
 
 
     def run(
@@ -2762,6 +2972,7 @@ class CursorClient:
         history=(),
         user_config: UserMessageConfig | None = None,
         run_config: RunConfig | None = None,
+        _registering: bool = False,
     ) -> RunResult:
         request_id = str(uuid.uuid4())
         model = self.model if model is None else model
@@ -2770,6 +2981,18 @@ class CursorClient:
         conversation_id = (
             effective_run_config.conversation_id or _SESSION_CONVERSATION_ID
         )
+        if (
+            not _registering
+            and effective_run_config.action is None
+            and not _REGISTERED_CONVERSATIONS.get(_registration_envelope_key(
+                conversation_id, effective_run_config.conversation_group_id))
+        ):
+            # First real Run on this envelope: register it server-side with a
+            # harmless userMessageAction so the checkpoint graph is accepted.
+            self._ensure_conversation_registered(
+                conversation_id, effective_run_config.conversation_group_id,
+                model,
+            )
         request_started_ms = int(time.time() * 1000)
         _debug_bidi_event(
             "request_started",
@@ -2777,15 +3000,20 @@ class CursorClient:
             conversation_id=conversation_id,
             model=model,
         )
-        input_payload = build_run_request(
-            prompt,
-            model,
-            tools=tools,
-            history=history,
-            user_config=user_config or self.user_config,
-            run_config=effective_run_config,
-            conversation_id=conversation_id,
-        )
+        if _registering:
+            input_payload = build_registration_run_request(
+                prompt, model, conversation_id=conversation_id,
+            )
+        else:
+            input_payload = build_run_request(
+                prompt,
+                model,
+                tools=tools,
+                history=history,
+                user_config=user_config or self.user_config,
+                run_config=effective_run_config,
+                conversation_id=conversation_id,
+            )
         prefetched_blobs = extract_prefetched_blobs(input_payload)
         downlink_body = ConnectFrame.from_decoded(
             build_bidi_request_id(request_id)
@@ -2811,7 +3039,6 @@ class CursorClient:
                 connect, "IN", {"connection_id": request_id}
             )
             frames.append(frame)
-            self.handle_frame(frame)
             if DEBUG:
                 _debug_bidi_event(
                     "downlink_frame",
@@ -2882,6 +3109,18 @@ class CursorClient:
                     if identity not in seen_tool_calls:
                         seen_tool_calls.add(identity)
                         tool_calls.append(call)
+                        response_boundary_seen = True
+                        turn_ended = True
+                        clear_timeout = getattr(
+                            transport, "clear_post_blob_timeout", None
+                        )
+                        if clear_timeout is not None:
+                            clear_timeout()
+                        append(
+                            build_user_cancelled_message(),
+                            callback=cancelled,
+                        )
+                        return
             if (
                 frame.classification
                 == "agent_server.interaction_update.turn_ended"
@@ -3051,7 +3290,32 @@ class CursorClient:
             if append_started:
                 return
             append_started = True
-            append(input_payload)
+            generation = blob_response_generation
+
+            def initial_appended(response):
+                appended(response)
+                if _registering:
+                    append(
+                        build_user_cancelled_message(),
+                        callback=cancelled,
+                    )
+                elif (
+                    generation == blob_response_generation
+                    and not response_boundary_seen
+                ):
+                    transport._post_blob_debug = {
+                        "request_id": request_id,
+                        "conversation_id": conversation_id,
+                        "append_seqno": 0,
+                        "phase": "initial_model_progress",
+                    }
+                    arm_timeout = getattr(
+                        transport, "arm_post_blob_timeout", None
+                    )
+                    if arm_timeout is not None:
+                        arm_timeout(INITIAL_MODEL_PROGRESS_TIMEOUT)
+
+            append(input_payload, callback=initial_appended)
 
         with SSEClient(
             downlink_url,
@@ -3259,7 +3523,9 @@ def _openai_messages(messages):
         prompt = parsed[active_user_index]["content"]
         history = parsed[:active_user_index]
     elif parsed[-1]["role"] == "tool":
-        prompt = "This is a tool result. Do not mention this reminder to the user."
+        # Tool results are folded into the synthetic checkpoint graph; no
+        # reminder prompt is injected (resumeAction needs no new user text).
+        prompt = ""
         history = parsed
     else:
         prompt = (
@@ -3531,6 +3797,10 @@ def _record_cursor_usage(
 
 
 def _rotate_cursor_conversation(stats: dict) -> None:
+    previous_id = stats.get("conversation_id")
+    if previous_id is not None:
+        with _REGISTRATION_LOCK:
+            _REGISTERED_CONVERSATIONS.pop(_registration_envelope_key(previous_id, stats.get("conversation_group_id")), None)
     stats["conversation_id"] = str(uuid.uuid4())
     stats["previous_request_bytes"] = None
     stats["previous_reported_cost"] = None

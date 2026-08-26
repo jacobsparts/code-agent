@@ -35,8 +35,11 @@ SUPPLEMENTAL_MESSAGES = {
         F('runRequest', 1, type='M:RunRequest'),
         F('execClientMessage', 2, type='M:ExecClientMessage'),
         F('kvClientMessage', 3, type='M:KvClientMessage'),
+        F('conversationAction', 4, type='M:ConversationAction'),
         F('execClientControlMessage', 5, type='M:ExecClientControlMessage'),
+        F('interactionResponse', 6, type='bytes'),
         F('clientHeartbeat', 7, type='M:_ClientHeartbeat'),
+        F('prewarmRequest', 8, type='bytes'),
     ],
     '_ClientHeartbeat': [],
     'BidiRequestId': [
@@ -412,9 +415,6 @@ SUPPLEMENTAL_MESSAGES = {
 }
 
 SUPPLEMENTAL_FIELDS = {
-    'AgentClientMessage': [
-        F('_field4', 4, type='M:_ClientControlMessage'),
-    ],
     'ExecServerMessage': [
         F('shellArgs', 2, type='M:ShellArgs'),
         F('writeArgs', 3, type='M:WriteArgs'),
@@ -497,7 +497,7 @@ SUPPLEMENTAL_FIELDS = {
         F('smartModeApproval', 19, type='bytes'),
         F('hookApprovalRequirement', 20, type='bytes'),
     ],
-    'AgentClientMessage_RunRequest': [
+    'RunRequest': [
         F('modelDetails', 3, type='M:ModelDetails'),
         F('mcpFileSystemOptions', 6, type='bytes'),
         F('skillOptions', 7, type='bytes'),

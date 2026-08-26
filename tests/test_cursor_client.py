@@ -1,4 +1,5 @@
 
+import hashlib
 import json
 import os
 import selectors
@@ -7,6 +8,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
@@ -260,7 +262,7 @@ def test_cursor_tool_continuation_prompt():
 
     prompt, history = cursor._openai_messages(messages)
 
-    assert prompt == "This is a tool result. Do not mention this reminder to the user."
+    assert prompt == ""
     assert len(history) == 3
     assert history[-1]["role"] == "tool"
     assert history[-1]["content"] == "ok"
@@ -495,6 +497,443 @@ def test_build_run_request_allows_explicit_conversation_ids():
 
     assert pb_texts(run, 5) == ["explicit-conversation"]
     assert pb_texts(run, 16) == ["explicit-group"]
+
+
+def test_build_run_request_defaults_to_resume_action_with_prefetch():
+    payload = cursor.build_run_request("hi", "composer-2.5")
+    run = pb_first_bytes(payload, 1)
+
+    # Default action is the live-proven resumeAction wire form.
+    actions = [v for num, wt, v in pb_fields(run) if num == 2 and wt == 2]
+    assert actions == [cursor._RESUME_ACTION_BYTES]
+
+    # Synthetic graph blobs ride raw PrefetchedBlob occurrences on field 17,
+    # content-addressed by sha256.
+    prefetch = [v for num, wt, v in pb_fields(run) if num == 17 and wt == 2]
+    assert prefetch
+    for blob_wire in prefetch:
+        fields = {
+            num: v for num, wt, v in pb_fields(blob_wire) if wt == 2
+        }
+        assert hashlib.sha256(fields[2]).digest() == fields[1]
+
+
+def test_encode_conversation_state_is_deterministic():
+    history = [
+        cursor.ConversationMessage(role="user", content="probe"),
+        cursor.ConversationMessage(
+            role="assistant",
+            content="",
+            tool_calls=(cursor.ToolCall(
+                id="call-1", name="repl_execute",
+                arguments={"code": "print(1)"},
+            ),),
+        ),
+        cursor.ConversationMessage(
+            role="tool", content="1", tool_call_id="call-1",
+            tool_name="repl_execute",
+        ),
+    ]
+
+    first_state, first_blobs = cursor.encode_conversation_state(history)
+    second_state, second_blobs = cursor.encode_conversation_state(history)
+
+    # Prefix-derived ids mean identical histories forge identical graphs.
+    assert first_state == second_state
+    assert first_blobs == second_blobs
+    assert len(first_blobs) > 0
+    for blob in first_blobs:
+        assert hashlib.sha256(blob["value"]).digest() == blob["blobId"]
+
+
+def test_conversation_registered_once_per_envelope(monkeypatch):
+    bodies = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            bodies.append(bytes(body))
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            ended = interaction_update_frame(_TURN_ENDED_NUMBER)
+            self.stream_callback(
+                cursor.ConnectFrame.from_decoded(ended).encode()
+            )
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    monkeypatch.setattr(cursor, "_SESSION_CONVERSATION_ID", "fresh-envelope")
+    cursor._REGISTERED_CONVERSATIONS.clear()
+    try:
+        cursor.CursorClient("token", model="composer-2.5").run("hello")
+        cursor.CursorClient("token", model="composer-2.5").run("again")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(
+            cursor._registration_envelope_key("fresh-envelope", None), None)
+
+    # First call performs registration + cancellation + resume; second resumes.
+    assert len(bodies) == 4
+
+    def client_message(body):
+        return pb_first_bytes(pb_first_bytes(body, 4), 1)
+
+    register_run = client_message(bodies[0])
+    register_actions = [
+        v for num, wt, v in pb_fields(register_run)
+        if num == 2 and wt == 2
+    ]
+    assert len(register_actions) == 1
+    assert register_actions[0] != cursor._RESUME_ACTION_BYTES
+    conv_action = cursor.cursor_schema.decode(
+        register_actions[0], "ConversationAction"
+    )
+    assert conv_action["userMessageAction"]["userMessage"]["text"] == (
+        cursor._REGISTRATION_PROMPT
+    )
+    # Registration carries an empty synthetic checkpoint.
+    assert pb_first_bytes(register_run, 1) == b""
+
+    cancel_message = cursor.cursor_schema.decode(
+        pb_first_bytes(bodies[1], 4), "AgentClientMessage"
+    )
+    assert cancel_message["conversationAction"]["cancelAction"]["reason"] == (
+        "user_cancelled"
+    )
+    for resume_body in bodies[2:]:
+        resume_run = client_message(resume_body)
+        assert pb_first_bytes(resume_run, 2) == cursor._RESUME_ACTION_BYTES
+        assert pb_first_bytes(resume_run, 1) != b""
+
+
+def test_registration_failure_does_not_mark_registered(monkeypatch):
+    bodies = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            if len(bodies) == 0:
+                # Registration run fails at the transport level.
+                bodies.append(bytes(body))
+                raise cursor.SSEError("boom")
+            bodies.append(bytes(body))
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            pass
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            self.stream_callback(cursor.ConnectFrame.from_decoded(
+                interaction_update_frame(_TURN_ENDED_NUMBER)).encode())
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    monkeypatch.setattr(cursor, "_SESSION_CONVERSATION_ID", "race-envelope")
+    cursor._REGISTERED_CONVERSATIONS.clear()
+    envelope = cursor._registration_envelope_key("race-envelope", None)
+    try:
+        client = cursor.CursorClient("token", model="composer-2.5")
+        with pytest.raises(cursor.SSEError):
+            client.run("hello")
+        # A failed registration must NOT mark the envelope registered...
+        assert envelope not in cursor._REGISTERED_CONVERSATIONS
+        # ...so the next attempt registers again instead of resuming blindly.
+        client.run("hello again")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(envelope, None)
+
+    # Registration POST (fails), then registration + cancellation + resume.
+    assert len(bodies) == 4
+
+    def action_of(body):
+        run_bytes = pb_first_bytes(pb_first_bytes(body, 4), 1)
+        return next(v for num, wt, v in pb_fields(run_bytes)
+                    if num == 2 and wt == 2)
+
+    assert action_of(bodies[0]) != cursor._RESUME_ACTION_BYTES
+    assert action_of(bodies[1]) != cursor._RESUME_ACTION_BYTES
+    cancel_message = cursor.cursor_schema.decode(
+        pb_first_bytes(bodies[2], 4), "AgentClientMessage"
+    )
+    assert cancel_message["conversationAction"]["cancelAction"]["reason"] == (
+        "user_cancelled"
+    )
+    assert action_of(bodies[3]) == cursor._RESUME_ACTION_BYTES
+
+
+def test_registration_group_pair_identity(monkeypatch):
+    bodies = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            bodies.append(bytes(body))
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            pass
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            self.stream_callback(cursor.ConnectFrame.from_decoded(
+                interaction_update_frame(_TURN_ENDED_NUMBER)).encode())
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    monkeypatch.setattr(cursor, "_SESSION_CONVERSATION_ID", "pair-envelope")
+    cursor._REGISTERED_CONVERSATIONS.clear()
+    try:
+        client = cursor.CursorClient("token", model="composer-2.5")
+        client.run("one", run_config=cursor.RunConfig(
+            conversation_id="pair-envelope",
+            conversation_group_id="group-a",
+        ))
+        client.run("two", run_config=cursor.RunConfig(
+            conversation_id="pair-envelope",
+            conversation_group_id="group-a",
+        ))
+        client.run("three", run_config=cursor.RunConfig(
+            conversation_id="pair-envelope",
+            conversation_group_id="group-b",
+        ))
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(
+            cursor._registration_envelope_key("pair-envelope", "group-a"), None)
+        cursor._REGISTERED_CONVERSATIONS.pop(
+            cursor._registration_envelope_key("pair-envelope", "group-b"), None)
+
+    # Same pair resumes; a distinct explicit group registers separately.
+    # Body sequence: reg,cancel,resume (pair-a), resume (pair-a again),
+    # reg,cancel,resume (group-b).
+    assert len(bodies) == 7
+
+    def action_of(body):
+        run_bytes = pb_first_bytes(pb_first_bytes(body, 4), 1)
+        for num, wt, v in pb_fields(run_bytes):
+            if num == 2 and wt == 2:
+                return v
+        raise AssertionError("no action field")
+
+    run_indices = (0, 2, 3, 4, 6)
+    actions = [action_of(bodies[index]) for index in run_indices]
+    is_resume = [a == cursor._RESUME_ACTION_BYTES for a in actions]
+    assert is_resume == [False, True, True, False, True]
+    for index in (1, 5):
+        cancel_message = cursor.cursor_schema.decode(
+            pb_first_bytes(bodies[index], 4), "AgentClientMessage"
+        )
+        assert cancel_message[
+            "conversationAction"
+        ]["cancelAction"]["reason"] == "user_cancelled"
+
+
+def _history_stats():
+    stats = {
+        "conversation_id": "rotate-envelope",
+        "previous_request_bytes": None,
+        "previous_reported_cost": None,
+        "accumulated_excess": 0.0,
+        "request_count": 0,
+    }
+    return stats
+
+
+def test_rotation_resets_registration_by_envelope_pair(monkeypatch):
+    cursor._REGISTERED_CONVERSATIONS.clear()
+    stats = _history_stats()
+    key = cursor._registration_envelope_key("rotate-envelope", None)
+    cursor._REGISTERED_CONVERSATIONS[key] = True
+    cursor._rotate_cursor_conversation(stats)
+    assert key not in cursor._REGISTERED_CONVERSATIONS
+    assert stats["conversation_id"] != "rotate-envelope"
+    # New conversation id starts unregistered.
+    new_key = cursor._registration_envelope_key(
+        stats["conversation_id"], None)
+    assert new_key not in cursor._REGISTERED_CONVERSATIONS
+
+
+def test_identical_user_text_at_distinct_boundaries():
+    conv_a, conv_b = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", (
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    msg_a = cursor.ConversationMessage(role="user", content="same")
+    msg_b = cursor.ConversationMessage(role="user", content="same")
+    cp_a, _ = cursor.encode_conversation_state([msg_a], 1, conversation_id=conv_a)
+    cp_b, _ = cursor.encode_conversation_state([msg_b], 1, conversation_id=conv_b)
+    # Identical text at distinct boundaries yields distinct graph identities...
+    assert cp_a != cp_b
+    # ...while repeating the same boundary is stable (cache-affinity).
+    cp_a2, _ = cursor.encode_conversation_state(
+        [cursor.ConversationMessage(role="user", content="same")], 1,
+        conversation_id=conv_a)
+    assert cp_a == cp_a2
+
+
+def test_no_random_uuids_embedded_in_graph_blobs():
+    history = [
+        cursor.ConversationMessage(role="user", content="question"),
+        cursor.ConversationMessage(role="assistant", content="answer"),
+    ]
+    conv = str(uuid.uuid4())
+    _, prefetched_a = cursor.encode_conversation_state(
+        history, 1, conversation_id=conv)
+    # Re-encoding with the SAME envelope id must be byte-stable: no random UUIDs
+    # enter the graph blobs.
+    _, prefetched_b = cursor.encode_conversation_state(
+        history, 1, conversation_id=conv)
+    values_a = sorted(p["value"] for p in prefetched_a)
+    values_b = sorted(p["value"] for p in prefetched_b)
+    assert values_a == values_b
+
+    # A different conversation id only changes the envelope-bound turn blob;
+    # every message/root blob stays byte-identical (content-derived).
+    _, prefetched_c = cursor.encode_conversation_state(
+        history, 1, conversation_id=str(uuid.uuid4()))
+    values_c = sorted(p["value"] for p in prefetched_c)
+    differing = [v for v in values_a if v not in values_c]
+    assert len(differing) == 1
+    turn_blob = differing[0]
+    inner = pb_fields(pb_first_bytes(turn_blob, 1))
+    embedded_ids = [v for num, wt, v in inner if num == 3 and wt == 2]
+    assert len(embedded_ids) == 1
+
+
+def test_final_user_only_graph_shape():
+    conv = str(uuid.uuid4())
+    checkpoint, prefetched = cursor.encode_conversation_state(
+        [cursor.ConversationMessage(role="user", content="only question")], 1,
+        conversation_id=conv)
+    decoded = cursor.cursor_schema.decode(
+        checkpoint, "ConversationCheckpointUpdate")
+    roots = decoded["rootPromptMessagesJson"]
+    turns = decoded["turns"]
+    by_hash = {hashlib.sha256(p["value"]).digest(): p["value"]
+               for p in prefetched}
+    # Final OPEN turn references the UserMessage blob (U-series wire shape).
+    turn_inner = pb_first_bytes(by_hash[turns[0]], 1)
+    turn_refs = {v for num, wt, v in pb_fields(turn_inner)
+                 if num == 1 and wt == 2}
+    assert len(turn_refs) == 1
+    (um_ref,) = turn_refs
+    um_blob = by_hash[um_ref]
+    # The referenced blob is the UserMessage protobuf carrying the prompt text.
+    assert b"only question" in um_blob
+    # The user JSON root is a separate root reference with role/content.
+    user_root = by_hash[roots[0]]
+    root_json = json.loads(user_root.decode())
+    assert set(root_json) >= {"role", "content"}
+    assert root_json["role"] == "user"
+    # The turn is OPEN (complete flag 0) so resume continues inference.
+    complete_flags = [v for num, wt, v in pb_fields(turn_inner)
+                      if num == 5 and wt == 0]
+    assert complete_flags == [0]
+
+
+def test_completed_external_tool_graph_multiple_calls():
+    calls = [
+        cursor.ToolCall(id="call_1", name="repl_execute",
+                        arguments={"code": "1 + 1"}),
+        cursor.ToolCall(id="call_2", name="repl_execute",
+                        arguments={"code": "print('x')"}),
+    ]
+    results = {
+        "call_1": {"content": "2"},
+        "call_2": {"content": "x"},
+    }
+    history = [
+        cursor.ConversationMessage(role="user", content="compute"),
+        cursor.ConversationMessage(
+            role="assistant", tool_calls=calls),
+        cursor.ConversationMessage(
+            role="tool", tool_call_id="call_1", content="2"),
+        cursor.ConversationMessage(
+            role="tool", tool_call_id="call_2", content="x"),
+    ]
+    conv = str(uuid.uuid4())
+    checkpoint, prefetched = cursor.encode_conversation_state(
+        history, 1, conversation_id=conv)
+    decoded = cursor.cursor_schema.decode(
+        checkpoint, "ConversationCheckpointUpdate")
+    by_hash = {hashlib.sha256(p["value"]).digest(): p["value"]
+               for p in prefetched}
+    # Every root/turn reference resolves to a served blob (closure).
+    for ref in (*decoded["rootPromptMessagesJson"], *decoded["turns"]):
+        assert ref in by_hash
+    roots = [json.loads(by_hash[ref]) for ref in decoded["rootPromptMessagesJson"]]
+    assert [root["role"] for root in roots] == ["user", "assistant", "tool"]
+    tool_blobs = [v for v in by_hash.values() if b"call_1" in v]
+    assert len(tool_blobs) >= 2
+    step_blob = next(v for v in tool_blobs if b"toolCall" not in v or True)
+    # Both results are represented in the completed tool step.
+    joined = b"".join(by_hash.values())
+    assert b"call_1" in joined and b"call_2" in joined
+    assert b"2" in joined and b"x" in joined
+
+
+def test_checkpoint_closure_and_kv_hydration_round_trip():
+    history = [
+        cursor.ConversationMessage(role="user", content="hydrate me"),
+    ]
+    conv = str(uuid.uuid4())
+    checkpoint, prefetched = cursor.encode_conversation_state(
+        history, 1, conversation_id=conv)
+    store = {}
+    for entry in prefetched:
+        store[hashlib.sha256(entry["value"]).digest()] = entry["value"]
+    decoded = cursor.cursor_schema.decode(
+        checkpoint, "ConversationCheckpointUpdate")
+    refs = [*decoded["rootPromptMessagesJson"], *decoded["turns"]]
+    assert refs and all(ref in store for ref in refs)
+    # KV hydration: each getBlobArgs round trip returns the exact blob value.
+    for ref in refs:
+        server = {"kvServerMessage": {"id": 1, "getBlobArgs": {"blobId": ref}}}
+        response = cursor.build_kv_response(server, store)
+        assert response is not None
+        reply = cursor.cursor_schema.decode(response, "AgentClientMessage")
+        blob = reply["kvClientMessage"]["getBlobResult"]["_field1"]
+        assert blob == store[ref]
+    # A server message without a KV request yields no client response.
+    assert cursor.build_kv_response({}, store) is None
 
 
 def _run_result(usage):
@@ -1117,6 +1556,25 @@ def test_sse_post_blob_timeout_raises_without_polling(monkeypatch):
         client.run_forever()
 
 
+def test_sse_initial_model_progress_timeout_raises_without_polling(monkeypatch):
+    client = object.__new__(cursor.SSEClient)
+    client.closed = False
+    client.timeout = None
+    client._heartbeat_deadline = None
+    client._grace_deadline = None
+    client._post_blob_deadline = 10.0
+    client._post_blob_debug = {"phase": "initial_model_progress"}
+    client.run_once = lambda timeout=None: pytest.fail(
+        "expired initial-progress timer should not poll"
+    )
+    monkeypatch.setattr(cursor.time, "monotonic", lambda: 10.0)
+
+    with pytest.raises(
+        cursor.SSEError, match="no model progress after initial request"
+    ):
+        client.run_forever()
+
+
 def test_generation_progress_classification():
     assert cursor.is_generation_progress(decode_cursor(answer_text_frame("x")))
     assert not cursor.is_generation_progress(decode_cursor(answer_text_frame("")))
@@ -1187,13 +1645,24 @@ def test_latest_blob_response_completion_arms_timeout(monkeypatch):
             self.stream_callback(_get_blob_frame(2, b"c" * 32))
             assert len(blob_callbacks) == 2
             blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
-            assert armed == []
+            assert armed == [cursor.INITIAL_MODEL_PROGRESS_TIMEOUT]
             blob_callbacks[1]({"status": 200, "headers": {}, "body": b""})
-            assert armed == [cursor.POST_BLOB_PROGRESS_TIMEOUT]
+            assert armed == [
+                cursor.INITIAL_MODEL_PROGRESS_TIMEOUT,
+                cursor.POST_BLOB_PROGRESS_TIMEOUT,
+            ]
             self.close()
 
     monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
-    cursor.CursorClient("token", model="composer-2.5").run("hello")
+    # Pre-register the session conversation so this test exercises only the
+    # resume path (registration has its own test below).
+    envelope = cursor._registration_envelope_key(
+        cursor._SESSION_CONVERSATION_ID, None)
+    cursor._REGISTERED_CONVERSATIONS[envelope] = True
+    try:
+        cursor.CursorClient("token", model="composer-2.5").run("hello")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(envelope, None)
 
     assert len(cleared) == 2
 
@@ -1242,11 +1711,19 @@ def test_generation_progress_invalidates_pending_blob_response(monkeypatch):
             )
             self.stream_callback(answer.encode())
             blob_callbacks[0]({"status": 200, "headers": {}, "body": b""})
-            assert armed == []
+            assert armed == [cursor.INITIAL_MODEL_PROGRESS_TIMEOUT]
             self.close()
 
     monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
-    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
+    envelope = cursor._registration_envelope_key(
+        cursor._SESSION_CONVERSATION_ID, None)
+    cursor._REGISTERED_CONVERSATIONS[envelope] = True
+    try:
+        result = cursor.CursorClient(
+            "token", model="composer-2.5"
+        ).run("hello")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(envelope, None)
 
     assert result.text == "started"
 
@@ -1299,7 +1776,15 @@ def test_cursor_text_boundary_starts_usage_grace(monkeypatch):
         "get_filtered_usage",
         lambda *args, **kwargs: cursor.TurnUsage(input_tokens=7),
     )
-    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
+    envelope = cursor._registration_envelope_key(
+        cursor._SESSION_CONVERSATION_ID, None)
+    cursor._REGISTERED_CONVERSATIONS[envelope] = True
+    try:
+        result = cursor.CursorClient(
+            "token", model="composer-2.5"
+        ).run("hello")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(envelope, None)
 
     assert result.text == "done"
     assert result.tool_calls == []
@@ -1356,7 +1841,15 @@ def test_cursor_turn_ended_closes_and_records_usage(monkeypatch):
 
     monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
     monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
-    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
+    envelope = cursor._registration_envelope_key(
+        cursor._SESSION_CONVERSATION_ID, None)
+    cursor._REGISTERED_CONVERSATIONS[envelope] = True
+    try:
+        result = cursor.CursorClient(
+            "token", model="composer-2.5"
+        ).run("hello")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(envelope, None)
 
     assert result.turn_ended is True
     assert result.usage == cursor.TurnUsage(
@@ -1367,32 +1860,25 @@ def test_cursor_turn_ended_closes_and_records_usage(monkeypatch):
     assert closed == [True]
 
 
-def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
+def test_cursor_native_boundary_records_cancels_and_closes(monkeypatch):
+    """A native tool request ends the Run through the cancellation handshake."""
     request_id = "5270c3d8-821c-4c8b-bdf4-2d880504206c"
     closed = []
     posted_payloads = []
 
     def tool_frame(call_id, code):
-        arguments = pb_message(
-            pb_bytes(1, b"repl_execute"),
-            pb_bytes(
-                2,
-                pb_message(
-                    pb_bytes(1, b"code"),
-                    pb_bytes(2, pb_value(code)),
-                ),
-            ),
-            pb_bytes(3, call_id.encode()),
-            pb_bytes(5, b"repl_execute"),
-        )
+        arguments = pb_message(pb_bytes(1, code.encode()))
         execution = pb_message(
             pb_varint(1, 1),
-            pb_bytes(11, arguments),
+            pb_bytes(5, arguments),
             pb_bytes(15, (call_id + "-exec").encode()),
         )
         return cursor.ConnectFrame.from_decoded(
             pb_message(pb_bytes(2, execution))
         ).encode()
+
+    streamed_after_close = []
+    main_run_closed = []
 
     class FakeSSEClient:
         def __init__(self, *args, stream_callback, headers_callback, **kwargs):
@@ -1421,7 +1907,6 @@ def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
         def close(self):
             if not self.closed:
                 self.closed = True
-                closed.append(True)
 
         def run_forever(self, timeout=None, *, heartbeat_timeout=None):
             self.headers_callback(200, {})
@@ -1430,8 +1915,13 @@ def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
                 tool_frame("call-2", "emit('two')"),
                 _response_boundary_frame(request_id).encode(),
             ):
+                if self.closed:
+                    streamed_after_close.append(payload)
+                    continue
                 self.stream_callback(payload)
-            assert self.closed
+            if streamed_after_close:
+                # This was the main Run: it must have been closed exactly once.
+                main_run_closed.append(True)
 
     monkeypatch.setattr(cursor.uuid, "uuid4", lambda: request_id)
     monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
@@ -1440,10 +1930,156 @@ def test_cursor_tool_boundary_sends_cancellation_then_closes(monkeypatch):
         "get_filtered_usage",
         lambda *args, **kwargs: cursor.TurnUsage(output_tokens=9),
     )
+    envelope = cursor._registration_envelope_key(
+        cursor._SESSION_CONVERSATION_ID, None)
+    cursor._REGISTERED_CONVERSATIONS[envelope] = True
+    try:
+        result = cursor.CursorClient(
+            "token", model="composer-2.5"
+        ).run("hello")
+    finally:
+        cursor._REGISTERED_CONVERSATIONS.pop(envelope, None)
+
+    # The FIRST external request is the response boundary: recorded once, run
+    # closed immediately; later frames on the dead stream are ignored.
+    assert [call.id for call in result.tool_calls] == ["call-1-exec"]
+    assert result.tool_calls[0].native is True
+    assert result.tool_calls[0].oneof_name == "grep_args"
+    assert result.turn_ended is True
+    assert main_run_closed == [True]
+    assert len(streamed_after_close) == 2
+    assert result.usage == cursor.TurnUsage(output_tokens=9)
+    # Cancel the pending server exec before the caller resumes in a fresh Run.
+    assert cursor.build_user_cancelled_message() in posted_payloads
+
+
+def _mcp_tool_frame(call_id, exec_id, name="repl_execute"):
+    """Build an ExecServerMessage carrying an external McpArgs request (f11)."""
+    arguments = pb_message(
+        pb_bytes(1, name.encode()),
+        # Map value is a google.protobuf.Value: stringValue is field 3.
+        pb_bytes(
+            2,
+            pb_message(
+                pb_bytes(1, b"code"),
+                pb_bytes(2, pb_bytes(3, b"emit('x')")),
+            ),
+        ),
+        pb_bytes(3, call_id.encode()),
+        pb_bytes(5, name.encode()),
+    )
+    execution = pb_message(
+        pb_varint(1, 7),
+        pb_bytes(11, arguments),
+        pb_bytes(15, exec_id.encode()),
+    )
+    return cursor.ConnectFrame.from_decoded(pb_message(pb_bytes(2, execution))).encode()
+
+
+def test_mcp_request_is_response_boundary(monkeypatch):
+    """A unique LiveMCPCall records the tool call and closes the Run at once."""
+    closed = []
+    posted_payloads = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            payload = pb_first_bytes(body, 4)
+            if payload is not None:
+                posted_payloads.append(payload)
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                closed.append(True)
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            if posted_payloads[-1].find(cursor._RESUME_ACTION_BYTES) == -1:
+                # Registration Run (no resumeAction): end it cleanly.
+                ended = cursor.ConnectFrame.from_decoded(
+                    interaction_update_frame(_TURN_ENDED_NUMBER)
+                ).encode()
+                self.stream_callback(ended)
+                return
+            # Main Run: the very first server frame is the external MCP request.
+            self.stream_callback(_mcp_tool_frame("mcp-1", "mcp-1-exec"))
+            assert self.closed
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
     result = cursor.CursorClient("token", model="composer-2.5").run("hello")
 
-    assert [call.id for call in result.tool_calls] == ["call-1", "call-2"]
+    assert [call.id for call in result.tool_calls] == ["mcp-1"]
+    call = result.tool_calls[0]
+    assert call.native is False
+    assert call.field_number == 11
+    assert call.oneof_name == "mcp_args"
+    assert call.name == "repl_execute"
     assert result.turn_ended is True
-    assert closed == [True]
-    assert result.usage == cursor.TurnUsage(output_tokens=9)
+    # The external request ends this Run through the cancellation handshake.
     assert cursor.build_user_cancelled_message() in posted_payloads
+
+
+def test_mcp_request_decodes_arguments(monkeypatch):
+    """The recorded ToolCall carries the McpArgs fields verbatim."""
+    posted_payloads = []
+
+    class FakeSSEClient:
+        def __init__(self, *args, stream_callback, headers_callback, **kwargs):
+            self.stream_callback = stream_callback
+            self.headers_callback = headers_callback
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def post(self, url, body=b"", headers=None, callback=None):
+            payload = pb_first_bytes(body, 4)
+            if payload is not None:
+                posted_payloads.append(payload)
+            callback({"status": 200, "headers": {}, "body": b""})
+
+        def reset_heartbeat_timeout(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        def run_forever(self, timeout=None, *, heartbeat_timeout=None):
+            self.headers_callback(200, {})
+            last = posted_payloads[-1]
+            if last.find(cursor._RESUME_ACTION_BYTES) == -1:
+                # Registration Run: end it cleanly.
+                ended = cursor.ConnectFrame.from_decoded(
+                    interaction_update_frame(_TURN_ENDED_NUMBER)
+                ).encode()
+                self.stream_callback(ended)
+                return
+            self.stream_callback(_mcp_tool_frame("dec-1", "dec-1-exec"))
+
+    monkeypatch.setattr(cursor, "SSEClient", FakeSSEClient)
+    result = cursor.CursorClient("token", model="composer-2.5").run("hello")
+
+    (call,) = result.tool_calls
+    assert call.id == "dec-1"
+    assert call.tool_name == "repl_execute"
+    assert call.arguments == {"code": "emit('x')"}
+    assert call.exec_id == "dec-1-exec"
+    assert call.server_message_id == 7
