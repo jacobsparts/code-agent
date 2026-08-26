@@ -1,6 +1,9 @@
 import warnings
 from pathlib import Path
 
+import pytest
+
+from code_agent.conversation import Convo
 from code_agent.repl_agent import REPLMixin, ToolREPL
 from code_agent.repl_events import (
     ReplEvent,
@@ -85,6 +88,73 @@ def test_execute_publishes_statement_boundaries_in_order():
     assert len(completed_statements) == 2
     assert completed_statements[0][0].data["direct_call"] is None
     assert completed_statements[1][0].data["direct_call"] == "print"
+
+
+class _CanonicalClient:
+    def call(self, messages, **kwargs):
+        raise AssertionError("not called")
+
+
+class _CanonicalAgent(REPLMixin):
+    system = "system"
+
+    def __init__(self):
+        self._llm_client = _CanonicalClient()
+
+    @property
+    def llm_client(self):
+        return self._llm_client
+
+    def _build_system_prompt(self):
+        return self.system
+
+
+def test_repl_conversation_is_canonical_and_user_messages_are_append_only():
+    agent = _CanonicalAgent()
+
+    assert isinstance(agent.conversation, Convo)
+    first = agent.usermsg("REPL output", _repl_output=True)
+    second = agent.usermsg("human input", _user_content="human input")
+
+    assert agent.conversation.stored_messages()[1:] == [first, second]
+    assert first["content"] == [{"type": "text", "text": "REPL output"}]
+    assert first["_render_segments"] == [
+        {"type": "stdout", "content": "REPL output"}
+    ]
+    assert second["content"] == [{"type": "text", "text": "human input"}]
+    assert second["_render_segments"] == [
+        {"type": "input", "content": "human input"}
+    ]
+
+
+def test_assistant_code_preserves_block_order_and_ignores_reasoning():
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "reasoning", "text": "private"},
+            {"type": "commentary", "text": "first\nsecond"},
+            {"type": "text", "text": "emit('done', release=True)"},
+        ],
+    }
+
+    assert REPLMixin._assistant_code(message) == (
+        "# first\n# second\nemit('done', release=True)"
+    )
+
+
+@pytest.mark.parametrize("kind", ["tool_call", "attachment", "unknown"])
+def test_assistant_code_fails_closed_for_non_executable_blocks(kind):
+    block = {"type": kind}
+    if kind == "tool_call":
+        block.update(id="call", name="other", args={})
+    elif kind == "attachment":
+        block.update(media_type="image/png", data_type="bytes", data=b"x")
+
+    with pytest.raises(NotImplementedError):
+        REPLMixin._assistant_code({
+            "role": "assistant",
+            "content": [block],
+        })
 
 
 def test_dead_tool_repl_worker_restart_is_normal_repl_output():

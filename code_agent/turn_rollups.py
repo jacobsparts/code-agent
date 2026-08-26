@@ -15,6 +15,25 @@ from code_agent.persisted_preview_state import PersistedPreviewState
 from code_agent.session_message_state import reduce_canonical_message_events
 
 
+def _content_text(message: dict) -> str:
+    content = message.get("content") or ""
+    if isinstance(content, str):
+        return content
+    return "\n".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _replace_text_content(message: dict, text: str) -> None:
+    content = message.get("content")
+    if isinstance(content, list):
+        message["content"] = [{"type": "text", "text": text}]
+    else:
+        message["content"] = text
+
+
 @dataclass(frozen=True)
 class CompletedTurn:
     turn_id: int
@@ -79,7 +98,7 @@ def render_semantic_labels(messages: list[dict]) -> list[dict]:
         if checkpoint is not None:
             out.append({
                 "role": "user",
-                "content": f"# Checkpoint {checkpoint}",
+                "content": [{"type": "text", "text": f"# Checkpoint {checkpoint}"}],
                 "_synthetic": True,
                 "_provider_checkpoint": True,
             })
@@ -90,7 +109,7 @@ def render_turn_labels(message: dict) -> dict:
     out = copy.deepcopy(message)
     if out.get("role") != "user" or out.get("_synthetic"):
         return out
-    content = out.get("content") or ""
+    content = _content_text(out)
     render_segments = out.get("_render_segments") or []
     located_inputs = []
     cursor = 0
@@ -127,7 +146,7 @@ def render_turn_labels(message: dict) -> dict:
             inserts.append((index, marker))
     for index, marker in reversed(inserts):
         content = content[:index] + marker + content[index:]
-    out["content"] = content
+    _replace_text_content(out, content)
     return out
 
 

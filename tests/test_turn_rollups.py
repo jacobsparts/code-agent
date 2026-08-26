@@ -186,8 +186,9 @@ def test_transition_marker_is_provider_only_exactly_once_on_first_following_call
     first = conversation.projected_messages()
     second = conversation.projected_messages()
 
-    assert [message["content"] for message in first].count("# Checkpoint 7") == 1
-    assert first[-1]["content"] == "# Checkpoint 7"
+    checkpoint = [{"type": "text", "text": "# Checkpoint 7"}]
+    assert [message["content"] for message in first].count(checkpoint) == 1
+    assert first[-1]["content"] == checkpoint
     assert second == first
     assert conversation.stored_messages() == original
 
@@ -293,8 +294,10 @@ def test_persisted_child_preserves_later_canonical_checkpoint_marker():
         message["content"]
         for message in rendered
         if message.get("_provider_checkpoint")
-    ] == ["# Checkpoint 4"]
-    assert "# Checkpoint 2" not in [message.get("content") for message in rendered]
+    ] == [[{"type": "text", "text": "# Checkpoint 4"}]]
+    assert [{"type": "text", "text": "# Checkpoint 2"}] not in [
+        message.get("content") for message in rendered
+    ]
 
 
 def test_transition_output_mismatch_missing_and_ambiguity_are_non_authoritative():
@@ -400,10 +403,18 @@ def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
 
     rendered = conversation.projected_messages()
 
-    assert rendered[-1]["content"] == "# Checkpoint 2"
-    assert rendered[-2]["content"].startswith("EPHEMERAL CONTEXT\n\n")
-    assert "body" in rendered[-2]["content"]
-    assert "[PreviewRef: session://preview/child]" in rendered[-2]["content"]
+    assert rendered[-1]["content"] == [
+        {"type": "text", "text": "# Checkpoint 2"}
+    ]
+    rendered_content = rendered[-2]["content"]
+    rendered_text = (
+        rendered_content
+        if isinstance(rendered_content, str)
+        else rendered_content[0]["text"]
+    )
+    assert rendered_text.startswith("EPHEMERAL CONTEXT\n\n")
+    assert "body" in rendered_text
+    assert "[PreviewRef: session://preview/child]" in rendered_text
     assert conversation.stored_messages() == original
 
 
@@ -1203,7 +1214,6 @@ def test_code_agent_usermsg_persists_before_context_projection():
     agent._conversation = Conversation(None, "system")
     agent._expanded_preview_refs = {}
     agent._configure_conversation(agent._conversation)
-    agent._last_was_repl_output = False
     agent._pending_explicit_attachment_refs = {}
     agent._read_attachments = {}
     seen = []
@@ -1357,7 +1367,7 @@ def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_
     ]
     assert resumed.conversation.projected_messages() == forked.conversation.projected_messages()
     assert sum(
-        message.get("content") == "# Checkpoint 2"
+        message.get("content") == [{"type": "text", "text": "# Checkpoint 2"}]
         for message in resumed.conversation.projected_messages()
     ) == 1
 

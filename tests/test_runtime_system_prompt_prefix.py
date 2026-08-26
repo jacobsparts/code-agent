@@ -110,9 +110,11 @@ def test_production_code_agent_conversation_has_one_runtime_prefix():
         outgoing_system = conversation.projected_messages()[0]["content"]
 
         assert "Respond with raw Python only." not in persisted_system
-        assert outgoing_system.count("You are in a Python REPL.") == 1
-        assert outgoing_system.count("Respond with raw Python only.") == 1
-        assert outgoing_system.endswith(persisted_system)
+        outgoing_text = "\n".join(block["text"] for block in outgoing_system)
+        persisted_text = "\n".join(block["text"] for block in persisted_system)
+        assert outgoing_text.count("You are in a Python REPL.") == 1
+        assert outgoing_text.count("Respond with raw Python only.") == 1
+        assert outgoing_text.endswith(persisted_text)
         assert conversation.stored_messages()[0]["content"] == persisted_system
         assert conversation.system_prompt_prefix_provider.__self__ is agent
     finally:
@@ -188,7 +190,7 @@ def test_production_replay_reinstalls_runtime_prefix_provider():
         assert conversation.stored_messages()[0]["content"] == persisted_system
         assert "Every response must include a repl_execute tool call." not in persisted_system
         outgoing_system = conversation.projected_messages()[0]["content"]
-        assert outgoing_system.count(
+        assert outgoing_system[0]["text"].count(
             "Every response must include a repl_execute tool call."
         ) == 1
     finally:

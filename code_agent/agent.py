@@ -716,24 +716,6 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             self.conversation.update_message(message, _event_seq=seq)
             self._tag_latest_segment_seq(message, seq)
 
-    def _persist_append_to_last_user_message(self, target_message: dict, content: str, kwargs: dict):
-        user_content = target_message.get('_user_content', content)
-        latest_segment = (target_message.get("_render_segments") or [None])[-1]
-        new_msg = {"role": "user", "content": content, "_user_content": user_content}
-        if kwargs.get('_stdout') is not None:
-            new_msg["_stdout"] = kwargs['_stdout']
-        if kwargs.get('_attachment_refs'):
-            new_msg["_attachment_refs"] = copy.deepcopy(kwargs['_attachment_refs'])
-        if latest_segment is not None:
-            new_msg["_render_segments"] = [{k: v for k, v in latest_segment.items() if k != "_event_seq"}]
-        seq = self._append_session_event("message_added", {"message": self._sanitize_message_for_persistence(new_msg)})
-        if seq is not None:
-            target_message["_event_seq"] = seq
-            self._tag_latest_segment_seq(target_message, seq)
-
-    def _on_append_last_user_message(self, target_message: dict, content, kwargs):
-        self._persist_append_to_last_user_message(target_message, content, kwargs)
-
     _worker_attachment_helpers = r"""
 import json as _code_agent_json
 import os as _code_agent_os
@@ -1025,6 +1007,12 @@ def _code_agent_send_rg_available():
         rendered = []
         for msg in self.conversation.stored_messages():
             content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
             for name, attachment in (msg.get("_attachments") or {}).items():
                 if isinstance(attachment, TextAttachment):
                     content = content.replace(
@@ -2939,8 +2927,6 @@ Return only the replacement user prompt text.
             _stdout=user_emit_output,
             _render_segments=[{"type": "stdout", "content": user_emit_output}],
         )
-        self._last_was_repl_output = True
-
     def _reset_interaction_state(self) -> None:
         self._repl_printed_header = False
         self._repl_has_output = False
@@ -3168,8 +3154,6 @@ Return only the replacement user prompt text.
                         self._quiet_replay_session()
                         self._replay_display_output()
                         self._display_text(f"{DIM}Conversation rewound.{RESET}", kind="status")
-                        last = self.conversation.stored_messages()[-1]
-                        self._last_was_repl_output = bool(last and last.get('role') == 'user')
                         preload_input = rewind_result.get("preload_input", "") or ""
                     elif rewind_shortcut:
                         sys.stdout.write("\x1b[1A\r\x1b[K")
@@ -3195,7 +3179,6 @@ Return only the replacement user prompt text.
                     preload_input = continuation_prompt
                     synth = False
                     user_header_pending = False
-                    self._last_was_repl_output = False
                     continue
 
                 if user_input.strip().startswith("/resume"):

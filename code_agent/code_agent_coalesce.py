@@ -17,6 +17,17 @@ from code_agent.session_replay import _parse_silently
 
 OMITTED_ECHO_MARKER = "[content omitted from echo]"
 _DETERMINISTIC_IDENTITY_FIELD = "_deterministic_preview_identity"
+
+
+def _content_text(message: dict) -> str:
+    content = message.get("content") or ""
+    if isinstance(content, str):
+        return content
+    return "\n".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") in ("text", "commentary")
+    )
 _DETERMINISTIC_IDENTITY_KEY = secrets.token_bytes(32)
 
 
@@ -317,7 +328,7 @@ def is_release_assistant_message(msg: dict) -> bool:
     if msg.get("_final_result") is not None or msg.get("_emit_value") is not None:
         return True
 
-    content = msg.get("content") or ""
+    content = _content_text(msg)
     try:
         tree = _parse_silently(content)
     except SyntaxError:
@@ -348,7 +359,7 @@ def released_assistant_text(msg: dict) -> str:
     if value is not None:
         return str(value)
 
-    content = msg.get("content") or ""
+    content = _content_text(msg)
     try:
         tree = _parse_silently(content)
     except SyntaxError:
@@ -379,7 +390,7 @@ def released_assistant_text(msg: dict) -> str:
 
 
 def message_stdout(msg: dict) -> str:
-    content = msg.get("content") or ""
+    content = _content_text(msg)
     if _content_preserves_context_refs(content):
         return content
     return msg.get("_stdout") or content
@@ -398,7 +409,7 @@ def is_repl_output_message(msg: dict) -> bool:
     segments = _structured_render_segments(msg)
     if segments is not None:
         return any(seg.get("type") == "stdout" for seg in segments)
-    content = msg.get("content") or ""
+    content = _content_text(msg)
     return content.lstrip().startswith(">>>") or OMITTED_ECHO_MARKER in content
 
 
@@ -416,7 +427,7 @@ def human_inputs(msg: dict) -> list[str]:
         return [str(msg.get("_user_content"))]
     if is_repl_output_message(msg):
         return []
-    content = msg.get("content") or ""
+    content = _content_text(msg)
     return [content] if content else []
 
 
@@ -592,7 +603,7 @@ def normalize_repl_messages(messages: list[dict]) -> list[dict]:
 
         if msg.get("role") == "user" and is_repl_output_message(msg) and msg.get("_user_content") is not None:
             copied = copy.deepcopy(msg)
-            text, appended = split_appended_user_content(copied, copied.get("content") or "")
+            text, appended = split_appended_user_content(copied, _content_text(copied))
             stdout = None
             if copied.get("_stdout") is not None:
                 stdout, _ = split_appended_user_content(copied, copied.get("_stdout") or "")
@@ -809,7 +820,7 @@ def semantic_segments(messages: list[dict]) -> list[SemanticSegment]:
                 start,
                 end,
                 message.get("role"),
-                message.get("content"),
+                repr(message.get("content")),
                 repr(message.get("_render_segments")),
             )
             if structural in seen_nodes:
@@ -960,7 +971,7 @@ def _attachment_placeholders(messages: list[dict]) -> list[str]:
     seen = set()
     placeholders = []
     for msg in messages:
-        content = msg.get("content") or ""
+        content = _content_text(msg)
         for match, parsed in iter_placeholders(content):
             name = parsed["name"]
             if name not in seen:
@@ -993,7 +1004,7 @@ def _preserved_preview_ref_blocks(messages: list[dict], preserved_preview_refs) 
     seen = set()
     blocks = []
     for msg in messages:
-        for match in _PREVIEW_REF_BLOCK_RE.finditer(msg.get("content") or ""):
+        for match in _PREVIEW_REF_BLOCK_RE.finditer(_content_text(msg)):
             uri = match.group("uri")
             if uri in uris and uri not in seen:
                 seen.add(uri)
@@ -1027,12 +1038,12 @@ def _preview_content(range_messages: list[dict], release_msg: dict | None, relea
     for msg in range_messages:
         role = msg.get("role")
         if role == "assistant":
-            _append_block(parts, msg.get("content") or "")
+            _append_block(parts, _content_text(msg))
             prev_assistant = msg
         elif role == "user" and is_repl_output_message(msg):
             text = message_stdout(msg)
             if prev_assistant is not None:
-                text = reconstruct_omitted_echo(prev_assistant.get("content") or "", text)
+                text = reconstruct_omitted_echo(_content_text(prev_assistant), text)
             _append_block(parts, text)
             prev_assistant = None
         elif role == "user":
@@ -1666,8 +1677,8 @@ def coalesce_repl_messages(
                 else None
             ),
         )
-        original_chars = sum(len(m.get("content") or "") for m in range_messages)
-        replacement_chars = len(projected_replacement.get("content") or "")
+        original_chars = sum(len(_content_text(m)) for m in range_messages)
+        replacement_chars = len(_content_text(projected_replacement))
         if original_chars - replacement_chars < min_savings_chars:
             continue
 

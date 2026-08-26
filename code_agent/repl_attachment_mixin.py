@@ -374,9 +374,6 @@ class REPLAttachmentMixin:
 
     def usermsg(self, content, **kwargs):
         if self._pending_attachments:
-            # Force new message — don't append to previous REPL output
-            self._last_was_repl_output = False
-
             placeholders = "\n\n".join(
                 self._render_placeholder(name, value)
                 for name, value in self._pending_attachments.items()

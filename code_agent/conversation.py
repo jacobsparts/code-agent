@@ -185,9 +185,8 @@ class Conversation:
                 continue
             elif kind == "attachment":
                 if response:
-                    raise NotImplementedError(
-                        "Legacy Conversation cannot store attachment responses"
-                    )
+                    print(f"Legacy Conversation cannot store attachment responses, ignoring")
+                    continue
                 data_type = block["data_type"]
                 if data_type == "provider_id":
                     legacy_blocks.append({
@@ -401,8 +400,6 @@ class Conversation:
         return self._with_cache_breakpoints(result)
 
     def call(self, messages=None, additional_messages=(), **kwargs):
-        from .client import EmptyResponseError
-
         if messages is None:
             messages = self.projected_messages()
         else:
@@ -412,14 +409,7 @@ class Conversation:
             self._to_canonical(message)
             for message in messages
         ], **kwargs)
-        result = self._to_legacy(response, response=True)
-        content = result.get("content")
-        if (
-            not isinstance(content, str)
-            or not content.strip() and not result.get("tool_calls")
-        ):
-            raise EmptyResponseError("LLM returned an empty response")
-        return result
+        return self._to_legacy(response, response=True)
 
     def add_assistant_response(self):
         return self.append_message(self.call())

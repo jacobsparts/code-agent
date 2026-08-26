@@ -363,7 +363,7 @@ def test_replay_reconstructs_ordinary_output_association_without_stdout():
         message["content"]
         for message in render_semantic_labels(messages)
         if message.get("_provider_checkpoint")
-    ] == ["# Checkpoint 2"]
+    ] == [[{"type": "text", "text": "# Checkpoint 2"}]]
     assert "_repl_output_for" not in events[2]["payload"]["message"]
 
 
@@ -1175,15 +1175,18 @@ def test_view_detects_images_by_magic_bytes(
 
     agent._suspend_persistence = True
     agent.usermsg(llm_output, _user_content=llm_output)
-    projected = agent.conversation.projected_messages()[-1]
-    assert expected in projected["content"]
-    assert projected[MEDIA_ATTACHMENTS_FIELD] == [{
-        "name": str(path),
+    projected = agent._projected_messages()[-1]
+    assert expected in "\n".join(
+        block["text"]
+        for block in projected["content"]
+        if block["type"] == "text"
+    )
+    assert projected["content"][-1] == {
+        "type": "attachment",
         "media_type": media_type,
-        "content": data,
-        "width": width,
-        "height": height,
-    }]
+        "data_type": "bytes",
+        "data": data,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1211,11 +1214,12 @@ def test_view_detects_audio_and_projects_attachment(tmp_path, data, media_type):
 
     agent._suspend_persistence = True
     agent.usermsg(llm_output, _user_content=llm_output)
-    assert agent.conversation.projected_messages()[-1][MEDIA_ATTACHMENTS_FIELD] == [{
-        "name": str(path),
+    assert agent._projected_messages()[-1]["content"][-1] == {
+        "type": "attachment",
         "media_type": media_type,
-        "content": data,
-    }]
+        "data_type": "bytes",
+        "data": data,
+    }
 
 
 class _RejectAudioClient:

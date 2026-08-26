@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 import warnings
 from multiprocessing import Queue
 
@@ -68,6 +69,8 @@ def _emit_event(event_type: str, **payload) -> None:
 
 from code_agent.base_agent import BaseAgent, _CompleteException
 from code_agent.client import BadRequestError, ContextOverflowError
+from code_agent.conversation import Convo, materialize_attachments
+from code_agent.preview_refs import render_preview_refs
 from code_agent.repl_tool_adapter import ReplExecuteResponseError, repl_protocol_prompt, repl_retry_hint
 from code_agent.repl_events import (
     ReplEvent,
@@ -514,16 +517,21 @@ class ToolREPL(SubREPL):
 
     def _inject_code(self, code: str, timeout: float = 10.0) -> None:
         """Override to use queue directly and handle tool worker."""
-        # Note: timeout parameter accepted for interface compatibility but
-        # we use a fixed 5.0s poll timeout internally
         self._ensure_session()
         self._running = True
         self._cmd_queue.put(code)  # Plain string, worker uses seq_id=None
 
+        deadline = time.monotonic() + timeout
         error_output = []
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._running = False
+                raise RuntimeError(
+                    f"Timeout injecting code into REPL after {timeout:.1f}s"
+                )
             try:
-                msg_type, msg_data = self._output_queue.get(timeout=5.0)
+                msg_type, msg_data = self._output_queue.get(timeout=remaining)
                 if msg_type == "done":
                     # Injection uses seq_id=None and cannot be user-interrupted.
                     seq_id, had_error, _ = msg_data
@@ -536,7 +544,10 @@ class ToolREPL(SubREPL):
                     error_output.append(msg_data.rstrip())
                     logger.debug("[ToolREPL inject] %s", msg_data.rstrip())
             except Empty:
-                raise RuntimeError("Timeout injecting code into REPL")
+                self._running = False
+                raise RuntimeError(
+                    f"Timeout injecting code into REPL after {timeout:.1f}s"
+                ) from None
 
     def poll_tool_request(self, timeout: float = 0.0) -> Optional[dict]:
         """
@@ -823,66 +834,119 @@ Important:
     def _publish_tool_event(self, kind: str, name: str, **data) -> None:
         self._publish_repl_event(ReplEvent(kind=kind, data={"name": name, **data}))
 
-    def usermsg(self, content, **kwargs):
-        """
-        Add a user message, appending to REPL output if continuing a session.
+    @property
+    def conversation(self) -> Convo:
+        """Return the canonical ordered-block conversation owned by this REPL."""
+        try:
+            return self._conversation
+        except AttributeError:
+            system = self._build_system_prompt()
+            assert system, "system must be defined"
+            self._conversation = Convo(self.llm_client, system)
+            if hasattr(self, "_configure_conversation"):
+                self._configure_conversation(self._conversation)
+            return self._conversation
 
-        When the last message was REPL output (from a previous turn), new user
-        messages are appended to maintain the illusion of a continuous REPL
-        session. The message appears as if emitted via emit().
-        """
-        # Check if we should append to last REPL output
-        if getattr(self, '_last_was_repl_output', False):
-            last_msg = self.conversation.stored_messages()[-1]
-            if last_msg and last_msg.get("role") == "user":
-                # Append as output of the previous emit() call.
-                prev = last_msg["content"]
-                sep = "" if prev.endswith("\n") else "\n"
-                changes = {
-                    "content": prev + sep + content + "\n",
-                    "_user_content": content,
-                    "_render_segments": [
-                        *last_msg.get("_render_segments", []),
-                        {"type": "input", "content": content},
-                    ],
-                }
+    @staticmethod
+    def _message_blocks(content: Any) -> list[dict]:
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        if isinstance(content, list):
+            return list(content)
+        return [{"type": "text", "text": json.dumps(content)}]
 
-                if '_stdout' in last_msg:
-                    prev_stdout = last_msg['_stdout']
-                    sep_stdout = "" if prev_stdout.endswith("\n") else "\n"
-                    changes['_stdout'] = prev_stdout + sep_stdout + content + "\n"
+    def _projected_messages(self) -> list[dict]:
+        """Project memory attachments and preview references for the provider."""
+        projected = self.conversation.projected_messages()
+        expanded = getattr(self.conversation, "expanded_preview_refs", {})
+        loader = getattr(self.conversation, "preview_loader", None)
+        rendered = []
+        result = []
+        for message in projected:
+            out = dict(message)
+            blocks = []
+            attachments = out.pop("_attachments", None) or {}
+            content = out.get("content", [])
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            for block in content:
+                if block.get("type") != "text":
+                    blocks.append(block)
+                    continue
+                text, media = materialize_attachments(block.get("text", ""), attachments)
+                if loader is not None:
+                    text = render_preview_refs(text, expanded, loader, rendered)
+                blocks.append({**block, "text": text})
+                for item in media:
+                    blocks.append({
+                        "type": "attachment",
+                        "media_type": item.get("media_type"),
+                        "data_type": "bytes",
+                        "data": item["content"],
+                    })
+            out["content"] = blocks
+            result.append(out)
+        self.conversation.rendered_preview_refs = rendered
+        return result
 
-                if '_attachments' in kwargs:
-                    changes['_attachments'] = {
-                        **last_msg.get('_attachments', {}),
-                        **kwargs['_attachments'],
-                    }
-                if '_attachment_refs' in kwargs:
-                    changes['_attachment_refs'] = {
-                        **last_msg.get('_attachment_refs', {}),
-                        **kwargs['_attachment_refs'],
-                    }
-
-                self.conversation.update_message(last_msg, **changes)
-
-                if hasattr(self, '_on_append_last_user_message'):
-                    self._on_append_last_user_message(last_msg, content, kwargs)
-
-                self._last_was_repl_output = False
-                return
-
-        # Fall back to normal message append
-        self._last_was_repl_output = False
-        new_msg = super().usermsg(content, **kwargs)
-        if new_msg and new_msg.get("role") == "user":
-            if kwargs.get('_user_content') is not None:
-                seg = {"type": "input", "content": kwargs['_user_content']}
+    @staticmethod
+    def _assistant_code(message: dict) -> str:
+        """Project executable assistant blocks to Python in source order."""
+        source = []
+        content = message.get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for block in content:
+            kind = block.get("type")
+            if kind == "text":
+                source.append(block.get("text", ""))
+            elif kind == "commentary":
+                text = block.get("text", "")
+                source.append("# " + text.replace("\n", "\n# "))
+            elif kind == "reasoning":
+                continue
+            elif kind in ("tool_call", "attachment"):
+                raise NotImplementedError(
+                    f"REPLAgent cannot execute assistant {kind!r} blocks"
+                )
             else:
-                # Prefer _stdout (unfiltered REPL output) over content (which may
-                # have emit chunks filtered out for the LLM).
-                seg = {"type": "stdout", "content": kwargs.get('_stdout') or content}
-            self.conversation.update_message(new_msg, _render_segments=[seg])
-        return new_msg
+                raise NotImplementedError(
+                    f"Unknown assistant content block type: {kind!r}"
+                )
+        return "\n".join(part for part in source if part).strip()
+
+    @staticmethod
+    def _with_corrected_code(message: dict, code: str) -> dict:
+        corrected = dict(message)
+        content = message.get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        corrected["content"] = [
+            *(
+                block
+                for block in content
+                if block.get("type") == "reasoning"
+            ),
+            {"type": "text", "text": code},
+        ]
+        return corrected
+
+    def usermsg(self, content, **kwargs):
+        """Append a canonical user message without mutating prior history."""
+        message = {
+            "role": "user",
+            "content": self._message_blocks(content),
+            **kwargs,
+        }
+        if kwargs.get("_user_content") is not None:
+            segment = {"type": "input", "content": kwargs["_user_content"]}
+        else:
+            segment = {
+                "type": "stdout",
+                "content": kwargs.get("_stdout") or content,
+            }
+        message["_render_segments"] = [segment]
+        return self.conversation.append_message(message)
 
     def _ensure_setup(self) -> None:
         """Initialize the ToolREPL."""
@@ -1004,9 +1068,14 @@ Call help(function_name) for parameter descriptions.
         except ContextOverflowError:
             if not hasattr(self, "_coalesce_context"):
                 raise
+            boundary_content = (
+                [{"type": "text", "text": "emit(None, release=True)"}]
+                if isinstance(self.conversation, Convo)
+                else "emit(None, release=True)"
+            )
             boundary = self.conversation.append_message({
                 "role": "assistant",
-                "content": "emit(None, release=True)",
+                "content": boundary_content,
                 "_synthetic": True,
                 "_virtual_interaction_boundary": True,
             })
@@ -1034,7 +1103,7 @@ Call help(function_name) for parameter descriptions.
         for turn in range(max_turns):
             # Get REPL each turn to handle session restart (re-injects tools if needed)
             repl = self._get_tool_repl()
-            messages = self.conversation.projected_messages()
+            messages = self._projected_messages()
 
             # Fire execute hook once at start of turn (before any attempts)
             if hasattr(self, 'on_repl_execute'):
@@ -1063,12 +1132,15 @@ Call help(function_name) for parameter descriptions.
                             if hasattr(self, 'on_retry'):
                                 self.on_retry("native_repl", native_retry)
                             _emit_event("native_repl_retry", attempt=native_retry)
-                            messages = self.conversation.projected_messages() + [{
+                            messages = self._projected_messages() + [{
                                     "role": "user",
-                                    "content": repl_retry_hint(
-                                        getattr(self.llm_client, "tool_mode", None),
-                                        exc,
-                                    ),
+                                    "content": [{
+                                        "type": "text",
+                                        "text": repl_retry_hint(
+                                            getattr(self.llm_client, "tool_mode", None),
+                                            exc,
+                                        ),
+                                    }],
                                 }]
                             continue
                     except KeyboardInterrupt:
@@ -1086,14 +1158,13 @@ Call help(function_name) for parameter descriptions.
                     except BadRequestError:
                         raise
 
-                    content = resp['content'].strip()
-                    resp['content'] = content
+                    content = self._assistant_code(resp)
 
                     output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)
 
                     # Apply silent corrections to conversation (both sides see corrected code)
                     if corrected_code != content:
-                        resp['content'] = corrected_code
+                        resp = self._with_corrected_code(resp, corrected_code)
                         content = corrected_code
 
                     if not pure_syntax_error:
@@ -1120,9 +1191,14 @@ Call help(function_name) for parameter descriptions.
                         "If you need to communicate text, do it from Python, for example with print(...) or the appropriate provided Python function.\n\n"
                         "Return only valid Python code."
                     )
-                    messages = self.conversation.projected_messages() + [
-                            {"role": "assistant", "content": content},
-                            {"role": "user", "content": f"{output}\n{hint}"}
+                    messages = self._projected_messages() + [
+                            resp,
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": f"{output}\n{hint}"}
+                                ],
+                            },
                         ]
                 else:
                     # All retries exhausted
@@ -1170,16 +1246,11 @@ Call help(function_name) for parameter descriptions.
                 kwargs['_stdout'] = output
 
             if output_for_llm.strip():
-                self._last_was_repl_output = False  # Clear before usermsg check
                 self.usermsg(output_for_llm, **kwargs)
             else:
-                self._last_was_repl_output = False
-                kwargs.pop("_repl_output", None)
                 self.usermsg("# [no output]", **kwargs)
 
             if self.complete:
-                # Mark that last message is REPL output - next user message appends
-                self._last_was_repl_output = True
                 if hasattr(self, '_complete_value'):
                     value = self._complete_value
                     del self._complete_value
