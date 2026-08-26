@@ -48,14 +48,16 @@ def repl_response_to_text(message):
         kind = block["type"]
         if kind == "tool_call":
             calls.append(block)
-        elif kind not in ("text", "commentary"):
+        elif kind not in ("text", "commentary", "reasoning"):
             raise NotImplementedError(
                 f"Unknown REPL response content type: {kind!r}"
             )
 
     if not calls:
         text = _join_python(
-            block["text"] for block in blocks
+            block["text"]
+            for block in blocks
+            if block["type"] in ("text", "commentary")
         )
         if not text:
             raise ReplExecuteResponseError(
@@ -77,6 +79,8 @@ def repl_response_to_text(message):
         elif kind == "commentary":
             if block["text"]:
                 parts.append("# " + "\n# ".join(block["text"].split("\n")))
+        elif kind == "reasoning":
+            continue
         elif kind == "tool_call":
             if block["name"] != "repl_execute":
                 raise ReplExecuteResponseError(
