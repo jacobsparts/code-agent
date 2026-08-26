@@ -69,7 +69,7 @@ def _emit_event(event_type: str, **payload) -> None:
 
 from code_agent.base_agent import BaseAgent, _CompleteException
 from code_agent.client import BadRequestError, ContextOverflowError
-from code_agent.convo import Convo, MEDIA_ATTACHMENTS_FIELD
+from code_agent.convo import Convo, MEDIA_ATTACHMENTS_FIELD, content_blocks
 from code_agent.preview_refs import render_preview_refs
 from code_agent.repl_tool_adapter import ReplExecuteResponseError, repl_protocol_prompt, repl_retry_hint
 from code_agent.repl_events import (
@@ -849,11 +849,7 @@ Important:
 
     @staticmethod
     def _message_blocks(content: Any) -> list[dict]:
-        if isinstance(content, str):
-            return [{"type": "text", "text": content}]
-        if isinstance(content, list):
-            return list(content)
-        return [{"type": "text", "text": json.dumps(content)}]
+        return content_blocks(content)
 
     def _projected_messages(self) -> list[dict]:
         """Project memory attachments and preview references for the provider."""

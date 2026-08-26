@@ -10,6 +10,27 @@ from .repl_attachment_mixin import (
 )
 
 
+def content_blocks(content):
+    """Normalize a value to canonical content blocks.
+
+    A non-empty list is already canonical only when every item is a mapping
+    with a string ``type``. Ordinary list payloads are JSON text, just like
+    other structured values.
+    """
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if (
+        isinstance(content, list)
+        and content
+        and all(
+            isinstance(block, dict) and isinstance(block.get("type"), str)
+            for block in content
+        )
+    ):
+        return content
+    return [{"type": "text", "text": json.dumps(content)}]
+
+
 def _blocks_text(blocks):
     return "".join(
         block.get("text", "")
@@ -61,11 +82,7 @@ def materialize_attachments(content: str, attachments: dict) -> tuple[str, list[
 class Convo:
     def __init__(self, llm_client, system_prompt):
         self.llm_client = llm_client
-        content = (
-            system_prompt
-            if isinstance(system_prompt, list)
-            else [{"type": "text", "text": system_prompt}]
-        )
+        content = content_blocks(system_prompt)
         self._messages = [{"role": "system", "content": content}]
         self.ephemeral = ""
         self._prompt_cache = []
@@ -156,11 +173,7 @@ class Convo:
         # are materialized per text block exactly once. Stored messages are
         # never mutated.
         for index, message in enumerate(result):
-            content = message.get("content")
-            if isinstance(content, str):
-                content = [{"type": "text", "text": content}]
-            else:
-                content = list(content)
+            content = content_blocks(message.get("content"))
             attachments = message.pop("_attachments", None)
             if attachments:
                 normalized_attachments = normalize_attachments(attachments)
@@ -230,16 +243,22 @@ class Convo:
         if messages is None:
             messages = self.projected_messages()
         else:
-            messages = list(messages)
-        messages.extend(additional_messages)
+            messages = [
+                {**message, "content": content_blocks(message.get("content"))}
+                for message in messages
+            ]
+        messages.extend(
+            {**message, "content": content_blocks(message.get("content"))}
+            for message in additional_messages
+        )
         return self.llm_client.call(messages, **kwargs)
 
     def add_assistant_response(self):
         return self.append_message(self.call())
 
     def usermsg(self, content, **kwargs):
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        elif not isinstance(content, list):
-            content = [{"type": "text", "text": json.dumps(content)}]
-        return self.append_message({"role": "user", "content": content, **kwargs})
+        return self.append_message({
+            "role": "user",
+            "content": content_blocks(content),
+            **kwargs,
+        })

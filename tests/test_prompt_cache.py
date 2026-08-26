@@ -26,6 +26,43 @@ class CanonicalClient:
         return self.response
 
 
+def test_convo_serializes_ordinary_list_payloads_as_text_blocks():
+    client = CanonicalClient()
+    rows = [{"ticketid": 123, "title": "Yanwen pricing"}]
+
+    convo = Convo(client, rows)
+    user = convo.usermsg(rows)
+
+    expected = [{"type": "text", "text": json.dumps(rows)}]
+    assert convo.stored_messages()[0]["content"] == expected
+    assert user["content"] == expected
+    assert convo.projected_messages()[1]["content"] == expected
+
+
+def test_convo_preserves_explicit_canonical_block_lists():
+    client = CanonicalClient()
+    blocks = [{"type": "text", "text": "hello"}]
+
+    convo = Convo(client, blocks)
+    user = convo.usermsg(blocks)
+
+    assert convo.stored_messages()[0]["content"] is blocks
+    assert user["content"] is blocks
+
+
+def test_convo_projection_repairs_raw_list_payloads():
+    client = CanonicalClient()
+    convo = Convo(client, "system")
+    rows = [{"ticketid": 123}]
+    convo.append_message({"role": "user", "content": rows})
+
+    projected = convo.projected_messages()
+
+    assert projected[-1]["content"] == [
+        {"type": "text", "text": json.dumps(rows)}
+    ]
+
+
 def test_convo_stores_and_calls_canonical_messages_without_projection():
     client = CanonicalClient()
     convo = Convo(client, [{"type": "text", "text": "system"}])
@@ -54,6 +91,28 @@ def test_convo_stores_and_calls_canonical_messages_without_projection():
     )]
     assert response is client.response
     assert convo.stored_messages()[-1] is response
+
+
+def test_convo_call_normalizes_explicit_list_payloads():
+    client = CanonicalClient()
+    convo = Convo(client, "system")
+    rows = [{"ticketid": 123}]
+
+    convo.call(
+        [{"role": "user", "content": rows}],
+        additional_messages=[{"role": "user", "content": []}],
+    )
+
+    assert client.calls[0][0] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": json.dumps(rows)}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "[]"}],
+        },
+    ]
 
 
 def test_convo_call_accepts_explicit_canonical_messages():
