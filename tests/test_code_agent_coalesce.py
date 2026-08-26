@@ -1,6 +1,16 @@
 import copy
 import re
 
+
+def _blocks_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
 import pytest
 
 import code_agent.code_agent_coalesce as coalesce_module
@@ -134,9 +144,9 @@ def test_shared_derivation_matches_pinned_attachments_observations_and_nested_re
     assert set(keys) == set(materialized)
     assert derived["_attachments"] == {"a.py": "body"}
     assert derived["_attachment_refs"] == {"b.py": "session://preview/blob"}
-    assert nested in derived["content"]
-    assert "Normal observation." in derived["content"]
-    assert "Pinned observation." in derived["content"]
+    assert nested in _blocks_text(derived["content"])
+    assert "Normal observation." in _blocks_text(derived["content"])
+    assert "Pinned observation." in _blocks_text(derived["content"])
 
 
 def test_render_preview_ref_uses_observations_instead_of_excerpt():
@@ -219,8 +229,8 @@ def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
     )
 
     coalesced = next(msg for msg in projected if msg.get("_coalesced"))
-    assert "Observations:\n- First.\n- Second." in coalesced["content"]
-    assert "x" * 500 not in coalesced["content"]
+    assert "Observations:\n- First.\n- Second." in _blocks_text(coalesced["content"])
+    assert "x" * 500 not in _blocks_text(coalesced["content"])
     canonical = next(iter(saved.values()))
     assert canonical.startswith("observe(value)")
     assert ">>> observe(value)\n'[Continuing...]'" in canonical
@@ -254,7 +264,7 @@ def test_transition_boundary_observation_is_used_without_changing_preview_blob()
     )
 
     coalesced = next(message for message in projected if message.get("_coalesced"))
-    assert "Observations:\n- stage summary" in coalesced["content"]
+    assert "Observations:\n- stage summary" in _blocks_text(coalesced["content"])
     canonical = next(iter(saved.values()))
     assert "stage summary" not in canonical
     assert transition not in canonical
@@ -283,7 +293,7 @@ def test_pinned_and_normal_sections_keep_their_own_observations():
         min_savings_chars=1,
     )
     coalesced = next(msg for msg in projected if msg.get("_coalesced"))
-    blocks = re.findall(r"\[PreviewRef: .*?\[/PreviewRef\]", coalesced["content"], re.DOTALL)
+    blocks = re.findall(r"\[PreviewRef: .*?\[/PreviewRef\]", _blocks_text(coalesced["content"]), re.DOTALL)
 
     assert len(blocks) == 2
     assert "Normal only." in blocks[0] and "Pinned only." not in blocks[0]
@@ -315,7 +325,7 @@ def test_preserves_real_user_inputs_and_release_assistant_messages():
 
     assert any(m["role"] == "user" and m.get("_user_content") == "Task 0" for m in projected)
     assert any(m["role"] == "assistant" and m["content"] == "emit('Done 0', release=True)" for m in projected)
-    visible = "\n".join(m.get("content") or "" for m in projected)
+    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
     assert "x" * 600 not in visible
     assert list(saved.values())[0].startswith("print(0)")
 
@@ -331,7 +341,7 @@ def test_saves_preview_blob_deterministically():
     assert saved1 == saved2
     assert projected1 == projected2
     key = next(iter(saved1))
-    assert f"session://preview/{key}" in projected1[2]["content"]
+    assert f"session://preview/{key}" in _blocks_text(projected1[2]["content"])
 
 
 def test_skips_small_interactions():
@@ -384,7 +394,7 @@ def test_attachment_placeholders_and_payloads_survive():
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     coalesced = next(m for m in projected if m.get("_coalesced"))
 
-    assert "[Attachment: src/foo.py]" in coalesced["content"]
+    assert "[Attachment: src/foo.py]" in _blocks_text(coalesced["content"])
     assert coalesced["_attachments"] == {"src/foo.py": "    1→print('hi')"}
     assert coalesced["_attachment_refs"] == {"src/foo.py": "src/foo.py"}
 
@@ -439,7 +449,7 @@ def test_release_output_is_preserved_live_not_saved_to_preview():
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
-    visible = "\n".join(m.get("content") or "" for m in projected)
+    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
 
     assert any(m["role"] == "assistant" and m["content"] == "emit('Done', release=True)" for m in projected)
     assert ">>> emit('Done', release=True)" in visible
@@ -560,7 +570,7 @@ def test_attachment_placeholder_order_is_first_seen_and_deduplicated():
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     coalesced = next(m for m in projected if m.get("_coalesced"))
-    lines = coalesced["content"].splitlines()
+    lines = _blocks_text(coalesced["content"]).splitlines()
 
     assert lines[1:5] == ["[Attachment: b.py]", "[Attachment: a.py]", "[Attachment: c.py]", "[Attachment: d.py]"]
 
@@ -684,7 +694,7 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
         save_preview_blob=lambda key, content: store.save_preview_blob(session_id, key, content),
     )
     coalesced = next(m for m in projected if m.get("_coalesced"))
-    uri = coalesced["content"].split("[PreviewRef: ", 1)[1].split("]", 1)[0]
+    uri = _blocks_text(coalesced["content"]).split("[PreviewRef: ", 1)[1].split("]", 1)[0]
     key = uri.rsplit("/", 1)[1]
     assert store.get_preview_blob(session_id, key)
 
@@ -701,7 +711,7 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
         min_savings_chars=1,
         save_preview_blob=lambda key, content: store.save_preview_blob(session_id, key, content),
     )
-    assert any(uri in (m.get("content") or "") for m in projected_after_resume if m.get("_coalesced"))
+    assert any(uri in _blocks_text(m.get("content") or "") for m in projected_after_resume if m.get("_coalesced"))
     assert resumed._expanded_preview_refs == {uri: {"numbered": True}}
 
 
@@ -732,7 +742,7 @@ def test_coalesce_preserves_expanded_preview_ref_placeholder():
     )
 
     coalesced = next(m for m in projected if m.get("_coalesced"))
-    assert "[PreviewRef: session://preview/keep]" in coalesced["content"]
+    assert "[PreviewRef: session://preview/keep]" in _blocks_text(coalesced["content"])
 
 
 def test_actual_expanded_preview_refs_include_replayed_expanded_state(tmp_path):
@@ -839,7 +849,7 @@ def test_pinned_turn_creates_auto_expanded_preview_ref():
     )
     coalesced = next(m for m in projected if m.get("_coalesced"))
 
-    assert coalesced["content"].count("[PreviewRef: session://preview/") == 2
+    assert _blocks_text(coalesced["content"]).count("[PreviewRef: session://preview/") == 2
     assert len(auto_expand) == 1
     pinned_key = auto_expand[0].rsplit("/", 1)[1]
     assert "important" in saved[pinned_key]
@@ -897,7 +907,7 @@ def test_multiple_pinned_turns_keep_ordered_preview_sections():
     )
 
     coalesced = next(m for m in projected if m.get("_coalesced"))
-    uris = re.findall(r"session://preview/[0-9a-f]{16}", coalesced["content"])
+    uris = re.findall(r"session://preview/[0-9a-f]{16}", _blocks_text(coalesced["content"]))
     unique_uris = list(dict.fromkeys(uris))
     assert len(unique_uris) == 4
     assert len(auto_expand) == 2
@@ -928,7 +938,7 @@ def test_default_keeps_most_recent_execution_interaction_even_past_last_three():
     projected = coalesce_repl_messages(messages, min_savings_chars=1)
 
     assert sum(1 for m in projected if m.get("_coalesced")) == 1
-    visible = "\n".join(m.get("content") or "" for m in projected)
+    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
     assert "Task 1" in visible
     assert "print(1)" in visible
     assert "x" * 600 in visible
@@ -946,7 +956,7 @@ def test_release_output_is_not_treated_as_next_interaction_start_for_execution_p
 
     projected = coalesce_repl_messages(messages, min_savings_chars=1)
 
-    visible = "\n".join(m.get("content") or "" for m in projected)
+    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
     assert sum(1 for m in projected if m.get("_coalesced")) == 1
     assert "Task 1" in visible
     assert "print(1)" in visible
@@ -981,7 +991,7 @@ def test_virtual_interaction_boundary_counts_as_completed_interaction_on_both_si
     )
 
     assert sum(1 for m in projected if m.get("_coalesced")) == 4
-    visible = "\n".join(m.get("content") or "" for m in projected)
+    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
     assert "Long task" in visible
     assert "Task 1" in visible
     assert "Task 2" in visible
@@ -1053,7 +1063,7 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
 
     assert sum(1 for m in projected if m.get("_coalesced")) == 2
     assert any(m.get("_virtual_interaction_boundary") for m in projected)
-    visible = "\n".join(m.get("content") or "" for m in projected)
+    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
     assert "a" * 600 not in visible
     assert "b" * 600 not in visible
 
@@ -1125,7 +1135,7 @@ def test_place_preview_uses_explicit_content_and_does_not_mutate_input():
     assert replacement["_source_end_seq"] == 11
     assert replacement["_attachments"] == {"a.py": "body"}
     assert replacement["_attachment_refs"] == {"a.py": "a.py"}
-    assert "custom summary" in replacement["content"]
+    assert "custom summary" in _blocks_text(replacement["content"])
 
 
 def test_place_preview_derives_content_from_current_projection():
@@ -1168,8 +1178,8 @@ def test_preview_summary_does_not_affect_blob_key():
     )
 
     assert first_key == second_key
-    assert "first" in first[0]["content"]
-    assert "second" in second[0]["content"]
+    assert "first" in _blocks_text(first[0]["content"])
+    assert "second" in _blocks_text(second[0]["content"])
     assert saved == {first_key: "same"}
 
 
@@ -1214,7 +1224,7 @@ def test_recursive_parent_preview_preserves_child_ref_verbatim():
         source_end_seq=2,
         save_preview_blob=saved.setdefault,
     )
-    child_ref = with_child[0]["content"].split("\n\n", 1)[1]
+    child_ref = _blocks_text(with_child[0]["content"]).split("\n\n", 1)[1]
     with_parent, parent_key = place_preview(
         with_child,
         Preview("parent summary"),
@@ -1272,7 +1282,8 @@ def test_place_preview_supports_multiple_ordered_previews_in_one_replacement():
     assert keys == [preview_key("first content"), preview_key("second content")]
     assert list(saved) == keys
     content = projected[0]["content"]
-    assert content.index("first") < content.index("second")
+    text = _blocks_text(content)
+    assert text.index("first") < text.index("second")
     assert message_source_range(projected[0]) == (1, 2)
 
 
@@ -1429,7 +1440,7 @@ def test_production_normal_pinned_normal_reuses_one_semantic_partition(monkeypat
 
     assert len(completed_calls) == 1
     coalesced = next(message for message in projected if message.get("_coalesced"))
-    refs = re.findall(r"session://preview/[0-9a-f]{16}", coalesced["content"])
+    refs = re.findall(r"session://preview/[0-9a-f]{16}", _blocks_text(coalesced["content"]))
     expected_contents = [
         coalesce_module._preview_content(messages[2:4], None, None),
         coalesce_module._preview_content(messages[4:6], None, None),
@@ -1633,7 +1644,7 @@ def test_create_persisted_preview_and_recursive_parent(tmp_path):
     assert f"session://preview/{child_key}" in store.get_preview_blob(session_id, parent_key)
     assert child_projection[1]["_preview_event_seq"] == child_seq
     assert parent_projection[1]["_preview_event_seq"] == parent_seq
-    assert f"session://preview/{parent_key}" in parent_projection[1]["content"]
+    assert f"session://preview/{parent_key}" in _blocks_text(parent_projection[1]["content"])
     events = store.get_events(session_id)
     assert events[2]["payload"] == {"preview_key": child_key, "summary": "child summary"}
     assert events[3]["payload"] == {
@@ -1675,7 +1686,7 @@ def test_same_blob_can_have_distinct_persisted_summaries(tmp_path):
 def test_code_agent_base_create_persisted_preview_installs_only_committed_state(tmp_path):
     from code_agent.agent import CodeAgentBase
     from code_agent.code_agent_coalesce import Preview, PersistedPreviewState
-    from code_agent.conversation import Conversation
+    from code_agent.convo import Convo
     from code_agent.session_store import SessionStore
 
     class Client:
@@ -1693,7 +1704,7 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
     agent._persisted_preview_state = PersistedPreviewState.empty()
     agent._pending_session_events = []
     agent._suspend_persistence = False
-    agent._conversation = Conversation(Client(), "system")
+    agent._conversation = Convo(Client(), "system")
     agent.conversation.extend_messages([
         {"role": "assistant", "content": "one", "_event_seq": 1},
         {"role": "assistant", "content": "two", "_event_seq": 2},
@@ -1709,7 +1720,7 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
     assert agent._next_event_seq == 5
     assert agent._persisted_preview_state.active_placements == {(1, 1): 3}
     assert agent.conversation.stored_messages()[1]["_preview_event_seq"] == 3
-    assert f"session://preview/{key}" in agent.conversation.stored_messages()[1]["content"]
+    assert f"session://preview/{key}" in _blocks_text(agent.conversation.stored_messages()[1]["content"])
 
     before_messages = list(agent.conversation.stored_messages())
     before_state = dict(agent._persisted_preview_state.active_placements)
@@ -1728,7 +1739,7 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
 def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_atomic(tmp_path):
     from code_agent.agent import CodeAgentBase
     from code_agent.code_agent_coalesce import Preview, PersistedPreviewState, create_persisted_preview
-    from code_agent.conversation import Conversation
+    from code_agent.convo import Convo
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
@@ -1755,7 +1766,7 @@ def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_
     )
 
     agent = CodeAgentBase.__new__(CodeAgentBase)
-    agent._conversation = Conversation(Client(), "system")
+    agent._conversation = Convo(Client(), "system")
     agent._expanded_preview_refs = {}
     agent._session_store = store
     agent._session_id = session_id
@@ -1769,7 +1780,7 @@ def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_
     assert len(persisted) == 1
     assert persisted[0]["_source_start_seq"] == 2
     assert persisted[0]["_source_end_seq"] == 3
-    assert f"session://preview/{key}" in persisted[0]["content"]
+    assert f"session://preview/{key}" in _blocks_text(persisted[0]["content"])
     assert store.get_events(session_id) == before_events
 
 
@@ -1865,7 +1876,7 @@ def test_module_persistence_requires_complete_authoritative_state(tmp_path):
 def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     from code_agent.agent import CodeAgentBase
     from code_agent.code_agent_coalesce import Preview
-    from code_agent.conversation import Conversation
+    from code_agent.convo import Convo
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
@@ -1884,7 +1895,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     store.append_event(session_id, 4, "rewind", {"target_seq": 1})
 
     agent = CodeAgentBase.__new__(CodeAgentBase)
-    agent._conversation = Conversation(Client(), "system")
+    agent._conversation = Convo(Client(), "system")
     agent._expanded_preview_refs = {}
     agent._session_store = store
     agent._session_id = session_id
@@ -1897,7 +1908,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     replay_session_into_agent(agent, session_id, store)
     assert agent._persisted_preview_state.exec_start_seq == 0
     assert agent.conversation.stored_messages() == [
-        {"role": "system", "content": "system"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
         {"role": "assistant", "content": "pre-exec", "_event_seq": 1},
     ]
 
@@ -1911,7 +1922,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     live_state = agent._persisted_preview_state
 
     resumed = CodeAgentBase.__new__(CodeAgentBase)
-    resumed._conversation = Conversation(Client(), "system")
+    resumed._conversation = Convo(Client(), "system")
     resumed._expanded_preview_refs = {}
     replay_session_into_agent(resumed, session_id, store)
 
@@ -1920,7 +1931,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     assert resumed._persisted_preview_state.exec_start_seq == 0
     assert resumed._persisted_preview_state.active_placements == {(1, 1): 5}
     assert resumed.conversation.stored_messages()[1]["_preview_event_seq"] == 5
-    assert f"session://preview/{key}" in resumed.conversation.stored_messages()[1]["content"]
+    assert f"session://preview/{key}" in resumed.conversation.stored_messages()[1]["content"][0]["text"]
 
     before = store.get_events(session_id)
     with pytest.raises(Exception):

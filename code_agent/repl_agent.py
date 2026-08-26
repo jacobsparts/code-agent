@@ -69,7 +69,7 @@ def _emit_event(event_type: str, **payload) -> None:
 
 from code_agent.base_agent import BaseAgent, _CompleteException
 from code_agent.client import BadRequestError, ContextOverflowError
-from code_agent.conversation import Convo, materialize_attachments
+from code_agent.convo import Convo, MEDIA_ATTACHMENTS_FIELD
 from code_agent.preview_refs import render_preview_refs
 from code_agent.repl_tool_adapter import ReplExecuteResponseError, repl_protocol_prompt, repl_retry_hint
 from code_agent.repl_events import (
@@ -865,25 +865,28 @@ Important:
         for message in projected:
             out = dict(message)
             blocks = []
-            attachments = out.pop("_attachments", None) or {}
             content = out.get("content", [])
             if isinstance(content, str):
                 content = [{"type": "text", "text": content}]
+            media_entries = out.pop(MEDIA_ATTACHMENTS_FIELD, None) or []
+            attachment_blocks = [
+                {
+                    "type": "attachment",
+                    "media_type": item.get("media_type"),
+                    "data_type": "bytes",
+                    "data": item["content"],
+                }
+                for item in media_entries
+            ]
             for block in content:
                 if block.get("type") != "text":
                     blocks.append(block)
                     continue
-                text, media = materialize_attachments(block.get("text", ""), attachments)
+                text = block.get("text", "")
                 if loader is not None:
                     text = render_preview_refs(text, expanded, loader, rendered)
                 blocks.append({**block, "text": text})
-                for item in media:
-                    blocks.append({
-                        "type": "attachment",
-                        "media_type": item.get("media_type"),
-                        "data_type": "bytes",
-                        "data": item["content"],
-                    })
+            blocks.extend(attachment_blocks)
             out["content"] = blocks
             result.append(out)
         self.conversation.rendered_preview_refs = rendered

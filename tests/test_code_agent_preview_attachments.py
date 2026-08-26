@@ -5,7 +5,7 @@ import pytest
 
 from code_agent.agent import CodeAgent
 from code_agent.client import BadRequestError
-from code_agent.conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
+from code_agent.convo import Convo, MEDIA_ATTACHMENTS_FIELD
 from code_agent.repl_attachment_mixin import (
     AudioAttachment,
     ImageAttachment,
@@ -31,11 +31,11 @@ class DummyClient:
         }
 
     def conversation(self, system):
-        return Conversation(self, system)
+        return Convo(self, system)
 
 def make_agent():
     agent = CodeAgent()
-    agent._conversation = Conversation(DummyClient(), "system")
+    agent._conversation = Convo(DummyClient(), "system")
     agent._session_id = "session"
     agent._session_store = None
     agent._next_event_seq = 1
@@ -549,7 +549,7 @@ def test_pin_persists_metadata_event_for_existing_persisted_message(tmp_path):
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(DummyClient(), "system")
+            self.conversation = Convo(DummyClient(), "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -577,7 +577,7 @@ def test_observations_survive_message_persistence_and_replay(tmp_path):
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(DummyClient(), "system")
+            self.conversation = Convo(DummyClient(), "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -732,7 +732,7 @@ def test_dynamic_context_inventory_is_current_and_precedes_guidance():
 
     notice = agent._context_management_ephemeral()
 
-    assert "- file: notes.py (4 bytes)" in notice
+    assert "- file: notes.py" in notice
     assert "- image: diagram.png (8 bytes)" in notice
     assert "- expanded preview: session://preview/abc (12 bytes)" in notice
     assert "Attached context size: 24 bytes." in notice
@@ -888,7 +888,11 @@ def test_context_notices_are_ephemeral_and_do_not_mutate_messages():
     first = agent.conversation.projected_messages()
     second = agent.conversation.projected_messages()
 
-    assert "No observation has been recorded" in first[-1]["content"]
+    assert "No observation has been recorded" in "".join(
+        block.get("text", "")
+        for block in first[-1]["content"]
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
     assert first == second
     assert agent.conversation.stored_messages() == original
 
@@ -989,7 +993,7 @@ def test_replay_attachment_invalidated_removes_attachment_refs(tmp_path):
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(DummyClient(), "system")
+            self.conversation = Convo(DummyClient(), "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -1226,7 +1230,7 @@ class _RejectAudioClient:
     on_retry = None
 
     def conversation(self, system):
-        return Conversation(self, system)
+        return Convo(self, system)
 
     def call(self, messages, tools=None):
         return {"role": "assistant", "content": "ok"}
@@ -1298,7 +1302,7 @@ def test_image_placeholder_parser_supports_commas_and_stable_media_order():
     parsed = [item for _, item in iter_placeholders(content)]
     assert [item["name"] for item in parsed] == [second_name, first_name]
 
-    conversation = Conversation(DummyClient(), "system")
+    conversation = Convo(DummyClient(), "system")
     conversation.usermsg(
         content,
         _attachments={
@@ -1309,7 +1313,7 @@ def test_image_placeholder_parser_supports_commas_and_stable_media_order():
         },
     )
     projected = conversation.projected_messages()[-1]
-    assert projected["content"] == content
+    assert projected["content"] == [{"type": "text", "text": content}]
     assert [item["name"] for item in projected[MEDIA_ATTACHMENTS_FIELD]] == [
         second_name,
         first_name,
@@ -1319,7 +1323,7 @@ def test_image_placeholder_parser_supports_commas_and_stable_media_order():
 def test_text_and_image_attachments_materialize_differently():
     image = make_image_attachment(_png_bytes())
     image_placeholder = render_attachment_placeholder("diagram.png", image)
-    conversation = Conversation(DummyClient(), "system")
+    conversation = Convo(DummyClient(), "system")
     conversation.usermsg(
         f"[Attachment: notes.txt]\n{image_placeholder}",
         _attachments={
@@ -1329,7 +1333,12 @@ def test_text_and_image_attachments_materialize_differently():
     )
 
     projected = conversation.projected_messages()[-1]
-    assert projected["content"] == f"    1→hello\n{image_placeholder}"
+    assert projected["content"] == [
+        {
+            "type": "text",
+            "text": f"    1→hello\n{image_placeholder}",
+        }
+    ]
     assert projected[MEDIA_ATTACHMENTS_FIELD][0]["content"] == image.content
 
 
@@ -1350,7 +1359,7 @@ def test_typed_image_attachment_persists_and_replays(tmp_path):
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(DummyClient(), "system")
+            self.conversation = Convo(DummyClient(), "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):

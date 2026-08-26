@@ -1,7 +1,7 @@
 """Code-agent transcript viewer."""
 
 from .pager import pager_ui
-from code_agent.conversation import materialize_attachments
+from code_agent.convo import materialize_attachments
 
 
 def _llm_visible_message(msg: dict) -> dict:

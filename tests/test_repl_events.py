@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from code_agent.conversation import Convo
+from code_agent.convo import Convo
 from code_agent.repl_agent import REPLMixin, ToolREPL
 from code_agent.repl_events import (
     ReplEvent,

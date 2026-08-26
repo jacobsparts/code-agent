@@ -1,5 +1,5 @@
 from code_agent.client import ContextOverflowError
-from code_agent.conversation import Conversation
+from code_agent.convo import Convo
 from code_agent.repl_agent import REPLAgent
 
 
@@ -27,7 +27,7 @@ class RecoveringAgent(REPLAgent):
         super().__init__()
         self._llm_client = OverflowThenSuccessClient()
         self._session_id = "test-session"
-        self._conversation = Conversation(self._llm_client, self.system)
+        self._conversation = Convo(self._llm_client, self.system)
         self._configure_conversation(self._conversation)
         self.coalesced = []
         self.committed = []
@@ -50,7 +50,9 @@ def test_conversation_call_coalesces_open_interaction_and_retries_after_context_
     result = agent._conversation_call_with_context_recovery(agent.conversation.projected_messages())
 
 
-    assert result["content"] == "emit('ok', release=True)"
+    assert result["content"] == [
+        {"type": "text", "text": "emit('ok', release=True)"}
+    ]
     assert agent.llm_client.calls == 2
     assert agent.coalesced == [{}]
     assert agent.conversation.stored_messages()[-1].get("_virtual_interaction_boundary") is True
@@ -61,6 +63,7 @@ def test_conversation_call_coalesces_open_interaction_and_retries_after_context_
         )
         for request in agent.llm_client.requests
     ] == [1, 1]
-    assert "Every response must include a repl_execute tool call." not in (
-        agent.conversation.stored_messages()[0]["content"]
+    assert all(
+        "Every response must include a repl_execute tool call." not in block["text"]
+        for block in agent.conversation.stored_messages()[0]["content"]
     )

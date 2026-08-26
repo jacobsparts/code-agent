@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from code_agent.client import LLMClient
-from code_agent.conversation import Convo
+from code_agent.convo import Convo
 from code_agent.repl_attachment_mixin import AudioAttachment, ImageAttachment
 
 

@@ -1,6 +1,6 @@
 from code_agent.agent import CodeAgent
 from code_agent.base_agent import BaseAgent
-from code_agent.conversation import Conversation
+from code_agent.convo import Convo
 from code_agent.repl_agent import REPLMixin
 from code_agent.repl_tool_adapter import repl_protocol_prompt
 from code_agent.session_replay import replay_session_into_agent
@@ -15,7 +15,7 @@ class Client:
         self.calls = []
 
     def conversation(self, system_prompt):
-        return Conversation(self, system_prompt)
+        return Convo(self, system_prompt)
 
     def call(self, messages, **kwargs):
         self.calls.append(messages)
@@ -36,7 +36,7 @@ class PromptAgent(REPLMixin, BaseAgent):
 
 
 def test_conversation_prefix_is_request_time_only():
-    conversation = Conversation(None, "persisted system")
+    conversation = Convo(None, "persisted system")
     prefixes = iter(["first prefix", "second prefix"])
     conversation.system_prompt_prefix_provider = lambda: next(prefixes)
     persisted = [dict(message) for message in conversation.stored_messages()]
@@ -46,11 +46,17 @@ def test_conversation_prefix_is_request_time_only():
 
     assert first[0] == {
         "role": "system",
-        "content": "first prefix\n\npersisted system",
+        "content": [
+            {"type": "text", "text": "first prefix"},
+            {"type": "text", "text": "persisted system"},
+        ],
     }
     assert second[0] == {
         "role": "system",
-        "content": "second prefix\n\npersisted system",
+        "content": [
+            {"type": "text", "text": "second prefix"},
+            {"type": "text", "text": "persisted system"},
+        ],
     }
     assert conversation.stored_messages() == persisted
     assert first[0] is not conversation.stored_messages()[0]
@@ -58,34 +64,44 @@ def test_conversation_prefix_is_request_time_only():
 
 
 def test_conversation_ignores_empty_prefix():
-    conversation = Conversation(None, "persisted system")
+    conversation = Convo(None, "persisted system")
     conversation.system_prompt_prefix_provider = lambda: ""
 
     outgoing = conversation.projected_messages()
 
-    assert outgoing == [{"role": "system", "content": "persisted system"}]
-    assert conversation.stored_messages() == [{"role": "system", "content": "persisted system"}]
+    assert outgoing == [{
+        "role": "system",
+        "content": [{"type": "text", "text": "persisted system"}],
+    }]
+    assert conversation.stored_messages() == [{
+        "role": "system",
+        "content": [{"type": "text", "text": "persisted system"}],
+    }]
 
 
 def test_repl_direct_mode_uses_existing_direct_python_preamble():
     agent = PromptAgent(Client())
-    conversation = Conversation(agent.llm_client, agent._build_system_prompt())
+    conversation = Convo(agent.llm_client, agent._build_system_prompt())
     agent._configure_conversation(conversation)
 
     outgoing = conversation.projected_messages()
 
-    assert outgoing[0]["content"].startswith(
+    outgoing_text = "\n".join(block["text"] for block in outgoing[0]["content"])
+    persisted_text = "\n".join(
+        block["text"] for block in conversation.stored_messages()[0]["content"]
+    )
+    assert outgoing_text.startswith(
         "You are in a Python REPL. Your response body is executed directly as Python source code.\n\n"
         "Respond with raw Python only."
     )
-    assert "There is no separate tool-calling layer for your response" in outgoing[0]["content"]
-    assert conversation.stored_messages()[0]["content"].startswith("stable base")
-    assert "Respond with raw Python only." not in conversation.stored_messages()[0]["content"]
+    assert "There is no separate tool-calling layer for your response" in outgoing_text
+    assert persisted_text.startswith("stable base")
+    assert "Respond with raw Python only." not in persisted_text
 
 
 def test_repl_execute_mode_uses_native_preamble():
     agent = PromptAgent(Client("repl_execute"))
-    conversation = Conversation(agent.llm_client, agent._build_system_prompt())
+    conversation = Convo(agent.llm_client, agent._build_system_prompt())
     agent._configure_conversation(conversation)
 
     outgoing = conversation.projected_messages()
@@ -94,10 +110,14 @@ def test_repl_execute_mode_uses_native_preamble():
         "You are operating Code Agent through a provider-native execution tool.\n\n"
         + repl_protocol_prompt("repl_execute")
     )
-    assert outgoing[0]["content"].startswith(expected + "\n\n")
-    assert "Respond with raw Python only." not in outgoing[0]["content"]
-    assert conversation.stored_messages()[0]["content"].startswith("stable base")
-    assert "Every response must include a repl_execute tool call." not in conversation.stored_messages()[0]["content"]
+    outgoing_text = "\n".join(block["text"] for block in outgoing[0]["content"])
+    persisted_text = "\n".join(
+        block["text"] for block in conversation.stored_messages()[0]["content"]
+    )
+    assert outgoing_text.startswith(expected + "\n")
+    assert "Respond with raw Python only." not in outgoing_text
+    assert persisted_text.startswith("stable base")
+    assert "Every response must include a repl_execute tool call." not in persisted_text
 
 
 def test_production_code_agent_conversation_has_one_runtime_prefix():
@@ -206,7 +226,7 @@ def test_repl_configure_conversation_chains_cooperatively():
         _llm_client = Client()
 
     agent = ChainedAgent()
-    conversation = Conversation(agent._llm_client, "system")
+    conversation = Convo(agent._llm_client, "system")
 
     agent._configure_conversation(conversation)
 

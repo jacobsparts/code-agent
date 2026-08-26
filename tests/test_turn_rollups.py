@@ -11,7 +11,7 @@ from code_agent.code_agent_coalesce import normalize_repl_messages
 from code_agent.code_agent_coalesce import replace_projected_span
 from code_agent.code_agent_coalesce import select_projected_span
 from code_agent.code_agent_coalesce import semantic_segments
-from code_agent.conversation import Conversation
+from code_agent.convo import Convo
 from code_agent.session_replay import replay_session_into_agent
 from code_agent.persisted_preview_state import PersistedPreviewState
 from code_agent.session_store import SessionStore, utc_now_iso
@@ -156,19 +156,20 @@ def test_turn_label_handles_appended_input_segment_and_excludes_non_turns():
 
 
 def test_conversation_labels_active_turn_on_first_call_without_mutation():
-    conversation = Conversation(None, "system")
+    conversation = Convo(None, "system")
     message = input_message("active")
     message["_event_seq"] = 23
     message["_render_segments"][0]["_event_seq"] = 23
     conversation.append_message(message)
     conversation.message_projector = render_turn_labels
 
-    assert conversation.projected_messages()[-1]["content"] == "# Turn 23\n\nactive"
+    projected = [{"type": "text", "text": "# Turn 23\n\nactive"}]
+    assert conversation.projected_messages()[-1]["content"] == projected
     assert conversation.stored_messages()[-1]["content"] == "active"
-    assert conversation.projected_messages()[-1]["content"] == "# Turn 23\n\nactive"
+    assert conversation.projected_messages()[-1]["content"] == projected
 
 def test_transition_marker_is_provider_only_exactly_once_on_first_following_call():
-    conversation = Conversation(None, "system")
+    conversation = Convo(None, "system")
     transition = {
         "role": "assistant",
         "content": "observe('stage done', transition=True)",
@@ -376,7 +377,7 @@ def test_duplicate_and_colliding_transition_identity_is_non_authoritative():
 
 
 def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
-    conversation = Conversation(None, "system")
+    conversation = Convo(None, "system")
     conversation.extend_messages([
         {"role": "user", "content": "task", "_event_seq": 1},
         {
@@ -406,13 +407,14 @@ def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
     assert rendered[-1]["content"] == [
         {"type": "text", "text": "# Checkpoint 2"}
     ]
-    rendered_content = rendered[-2]["content"]
-    rendered_text = (
-        rendered_content
-        if isinstance(rendered_content, str)
-        else rendered_content[0]["text"]
+    rendered_blocks = rendered[-2]["content"]
+    assert all(isinstance(block, dict) for block in rendered_blocks)
+    assert rendered_blocks[0]["text"] == "EPHEMERAL CONTEXT"
+    rendered_text = "\n".join(
+        block["text"]
+        for block in rendered_blocks[1:]
+        if block.get("type") == "text"
     )
-    assert rendered_text.startswith("EPHEMERAL CONTEXT\n\n")
     assert "body" in rendered_text
     assert "[PreviewRef: session://preview/child]" in rendered_text
     assert conversation.stored_messages() == original
@@ -650,7 +652,7 @@ def test_materialized_attachment_identity_is_trusted_but_canonical_structure_is_
 def test_replay_materializes_attachments_then_coalesces_with_valid_identity(tmp_path):
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -744,8 +746,13 @@ def test_message_pinned_transition_reconstructs_exact_eligible_sections():
         min_savings_chars=0,
     )
     node = next(message for message in projection if message.get("_coalesced"))
+    node_text = "".join(
+        block.get("text", "")
+        for block in node["content"]
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
 
-    assert node["content"].count("[PreviewRef:") == 3
+    assert node_text.count("[PreviewRef:") == 3
     assert ids[0] in derive_rollup_candidate_turns(
         events,
         projection,
@@ -756,7 +763,7 @@ def test_message_pinned_transition_reconstructs_exact_eligible_sections():
 def test_replay_message_pinned_sections_remain_eligible(tmp_path):
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -819,7 +826,7 @@ def test_attachment_invalidation_reducer_and_replay_equivalence(tmp_path):
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -884,7 +891,7 @@ def test_attachment_invalidation_rewind_snapshots(tmp_path):
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -913,7 +920,7 @@ def test_attachment_invalidation_rewind_snapshots(tmp_path):
 def test_attachment_invalidation_resume_and_fork_reconstruction(tmp_path):
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -981,7 +988,7 @@ def test_malformed_attachment_invalidation_is_conservative_and_equivalent(tmp_pa
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -1069,7 +1076,7 @@ def test_malformed_event_snapshots_match_reducer_replay_resume_and_fork(tmp_path
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -1129,7 +1136,7 @@ def test_malformed_events_preserve_exec_boundary_and_targetable_snapshots(tmp_pa
 
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -1184,7 +1191,7 @@ def test_message_pin_rewind_snapshots_match_replay_semantics():
 
 
 def test_ephemeral_provider_adds_exactly_one_line_and_preserves_existing_context():
-    conversation = Conversation(None, "system")
+    conversation = Convo(None, "system")
     conversation.append_message({"role": "user", "content": "request"})
     conversation.ephemeral = (
         "Current attached context:\n"
@@ -1198,8 +1205,17 @@ def test_ephemeral_provider_adds_exactly_one_line_and_preserves_existing_context
         "Detach attachments or expanded previews that are no longer needed with unview(...)."
     )
 
-    content = conversation.projected_messages()[-1]["content"]
-    assert content.count("Eligible rollup turns:") == 1
+    content_blocks = conversation.projected_messages()[-1]["content"]
+    content = "\n".join(
+        block.get("text", "")
+        for block in content_blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    assert "\n".join(
+        block.get("text", "")
+        for block in content_blocks[:3]
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).count("Eligible rollup turns:") == 1
     assert "Current attached context:" in content
     assert "Context usage is 82%." in content
     assert content.index("Current attached context:") < content.index("Eligible rollup turns:")
@@ -1211,7 +1227,7 @@ def test_code_agent_usermsg_persists_before_context_projection():
     from code_agent.agent import CodeAgent
 
     agent = CodeAgent()
-    agent._conversation = Conversation(None, "system")
+    agent._conversation = Convo(None, "system")
     agent._expanded_preview_refs = {}
     agent._configure_conversation(agent._conversation)
     agent._pending_explicit_attachment_refs = {}
@@ -1240,7 +1256,9 @@ def test_code_agent_usermsg_persists_before_context_projection():
 
     assert seen == []
     assert agent.ephemeral == ""
-    assert agent.conversation.stored_messages()[-1]["content"] == "active"
+    assert agent.conversation.stored_messages()[-1]["content"] == [
+        {"type": "text", "text": "active"}
+    ]
 
 
 def test_registry_normalizes_context_accounting_limits(monkeypatch):
@@ -1300,7 +1318,7 @@ def test_shared_message_reducer_rewind_and_exec_equivalence():
 def test_replay_resume_rewind_and_fork_keep_canonical_turn_labels(tmp_path):
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -1315,19 +1333,23 @@ def test_replay_resume_rewind_and_fork_keep_canonical_turn_labels(tmp_path):
 
     resumed = ReplayAgent()
     replay_session_into_agent(resumed, session_id, store)
-    assert resumed.conversation.projected_messages()[-1]["content"] == "# Turn 4\n\nreplacement"
+    assert resumed.conversation.projected_messages()[-1]["content"] == [
+        {"type": "text", "text": "# Turn 4\n\nreplacement"}
+    ]
 
     fork_id = store.fork_session(session_id)
     forked = ReplayAgent()
     replay_session_into_agent(forked, fork_id, store)
-    assert forked.conversation.projected_messages()[-1]["content"] == "# Turn 4\n\nreplacement"
+    assert forked.conversation.projected_messages()[-1]["content"] == [
+        {"type": "text", "text": "# Turn 4\n\nreplacement"}
+    ]
     assert store.get_events(session_id)[-1]["payload"]["message"]["content"] == "replacement"
     assert store.get_events(fork_id)[-1]["payload"]["message"]["content"] == "replacement"
 
 def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_path):
     class ReplayAgent:
         def __init__(self):
-            self.conversation = Conversation(None, "system")
+            self.conversation = Convo(None, "system")
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -1403,7 +1425,7 @@ def _rollup_test_agent(events, tmp_path):
     agent._persisted_preview_state = PersistedPreviewState.empty()
     agent._pending_session_events = []
     agent._suspend_persistence = False
-    agent._conversation = Conversation(Client(), "system")
+    agent._conversation = Convo(Client(), "system")
     agent.conversation.replace_messages(copy.deepcopy(projected_messages(events)))
     agent._ensure_live_session = lambda: None
     agent._flush_pending_session_events = lambda: None

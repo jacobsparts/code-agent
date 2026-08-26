@@ -97,7 +97,7 @@ from .provider_admission import ProviderAdmission
 
 from .utils import UsageTracker
 from .llm_registry import get_model_config
-from .conversation import Conversation
+from .convo import Convo
 from .transports import codex, cursor
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, repl_response_to_text, project_repl_tool_history
@@ -1343,4 +1343,4 @@ class LLMClient:
 
 
     def conversation(self, system_prompt):
-        return Conversation(self, system_prompt)
+        return Convo(self, system_prompt)

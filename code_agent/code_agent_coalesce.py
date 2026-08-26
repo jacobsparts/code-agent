@@ -1083,7 +1083,7 @@ def _coalesced_message_from_refs(
     visible = "\n".join(visible_parts).rstrip("\n")
     msg = {
         "role": "user",
-        "content": visible,
+        "content": [{"type": "text", "text": visible}],
         "_render_segments": [{"type": "stdout", "content": visible}],
         "_synthetic": True,
         "_coalesced": True,

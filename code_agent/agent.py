@@ -319,14 +319,14 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
 
     def _authoritative_persisted_projection(self, *, coalesce=True):
         from code_agent.code_agent_coalesce import coalesce_repl_messages, message_source_range
-        from code_agent.conversation import Conversation
+        from code_agent.convo import Convo
 
         if not self._session_id:
             raise RuntimeError("persisted projection requires a live session")
 
         system_message = self.conversation.stored_messages()[0]
         target = SimpleNamespace(
-            conversation=Conversation(None, system_message.get("content", "")),
+            conversation=Convo(None, system_message.get("content", [])),
             _expanded_preview_refs={},
         )
         target.conversation.replace_messages([system_message])
@@ -1623,7 +1623,9 @@ def _code_agent_send_rg_available():
         if isinstance(content, (ImageAttachment, AudioAttachment)):
             return len(content.content)
         if isinstance(content, TextAttachment):
-            return len(content.content.encode("utf-8"))
+            content = content.content
+        if isinstance(content, str):
+            return len(content.encode("utf-8"))
         return None
 
     @classmethod
