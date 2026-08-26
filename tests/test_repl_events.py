@@ -3,6 +3,11 @@ from pathlib import Path
 
 import pytest
 
+from code_agent.cli.rewind import (
+    _extract_released_assistant_text,
+    _find_last_assistant_text,
+    build_exchanges_from_events,
+)
 from code_agent.convo import Convo
 from code_agent.repl_agent import REPLMixin, ToolREPL
 from code_agent.repl_events import (
@@ -11,6 +16,52 @@ from code_agent.repl_events import (
     events_output_text,
     normalize_worker_message,
 )
+
+
+def test_rewind_extracts_released_text_from_canonical_blocks():
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "reasoning", "text": "private"},
+            {"type": "text", "text": "emit('done', release=True)"},
+        ],
+    }
+
+    assert _extract_released_assistant_text(message) == "done"
+    assert _find_last_assistant_text([message]) == "emit('done', release=True)"
+
+
+def test_rewind_builds_exchange_from_canonical_assistant_blocks():
+    events = [
+        {
+            "seq": 1,
+            "event_type": "message_added",
+            "payload": {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "request"}],
+                    "_render_segments": [{"type": "input", "content": "request"}],
+                }
+            },
+        },
+        {
+            "seq": 2,
+            "event_type": "message_added",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "emit('finished', release=True)"}
+                    ],
+                }
+            },
+        },
+    ]
+
+    exchanges = build_exchanges_from_events(events)
+
+    assert len(exchanges) == 1
+    assert exchanges[0].assistant_preview == "finished"
 
 
 def test_normalize_worker_message_maps_known_and_unknown_types():

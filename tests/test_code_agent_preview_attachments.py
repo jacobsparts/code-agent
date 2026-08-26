@@ -3,12 +3,13 @@ import re
 
 import pytest
 
-from code_agent.agent import CodeAgent
+from code_agent.agent import CodeAgent, _crash_dump_json_default
 from code_agent.client import BadRequestError
 from code_agent.convo import Convo, MEDIA_ATTACHMENTS_FIELD
 from code_agent.repl_attachment_mixin import (
     AudioAttachment,
     ImageAttachment,
+    MemoryAttachment,
     TextAttachment,
     iter_placeholders,
     make_audio_attachment,
@@ -48,6 +49,20 @@ def make_agent():
     agent._auto_context_attachment_names = set()
     agent._pending_attachments = {}
     return agent
+
+
+def test_crash_dump_serializes_typed_attachment_refs_and_media_bytes():
+    payload = {
+        "memory": MemoryAttachment("context"),
+        "media": b"\x00\xff",
+    }
+
+    restored = json.loads(json.dumps(payload, default=_crash_dump_json_default))
+
+    assert restored == {
+        "memory": {"__memory_attachment__": True, "content": "context"},
+        "media": {"__bytes__": True, "hex": "00ff"},
+    }
 
 
 def test_grep_rejects_output_over_two_mib(monkeypatch):

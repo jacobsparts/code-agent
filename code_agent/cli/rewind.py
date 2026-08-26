@@ -90,6 +90,14 @@ def _extract_released_assistant_text(msg: dict) -> str:
         return str(value)
 
     content = msg.get('content') or ''
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    elif not isinstance(content, str):
+        return ''
     try:
         tree = ast.parse(content)
     except SyntaxError:
@@ -151,7 +159,17 @@ def _find_assistant_after(events: list[dict], after_seq: int) -> str:
         has_input = any(seg.get('type') == 'input' for seg in (msg.get('_render_segments') or []))
         if has_input:
             return ''
-        stdout = msg.get('_stdout') or msg.get('content', '')
+        stdout = msg.get('_stdout')
+        if stdout is None:
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                stdout = "\n".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                stdout = content
         stripped = _strip_repl_echo(stdout).strip()
         if stripped:
             return stripped
@@ -162,7 +180,15 @@ def _find_last_assistant_text(messages: list[dict]) -> str:
     """Find the last assistant message with text content."""
     for msg in reversed(messages):
         if msg['role'] == 'assistant':
-            text = msg.get('content', '')
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                text = "\n".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                text = content
             if text:
                 return text
     return ''

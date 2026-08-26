@@ -37,6 +37,7 @@ from code_agent.repl_attachment_mixin import (
     ImageAttachment,
     MemoryAttachment,
     TextAttachment,
+    encode_attachment_ref,
     encode_attachment_refs,
     make_media_attachment,
     render_attachment_placeholder,
@@ -87,6 +88,15 @@ def _skill_description(path: Path) -> str:
     except Exception:
         pass
     return ""
+
+
+def _crash_dump_json_default(value):
+    encoded = encode_attachment_ref(value)
+    if encoded is not value:
+        return encoded
+    if isinstance(value, (bytes, bytearray)):
+        return {"__bytes__": True, "hex": bytes(value).hex()}
+    return repr(value)
 
 
 class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
@@ -3413,7 +3423,12 @@ Return only the replacement user prompt text.
                 crash_file = tempfile.NamedTemporaryFile(
                     mode='w', suffix='.json', prefix='repl_crash_', delete=False
                 )
-                json.dump(self.conversation.projected_messages(), crash_file, indent=2)
+                json.dump(
+                    self.conversation.projected_messages(),
+                    crash_file,
+                    indent=2,
+                    default=_crash_dump_json_default,
+                )
                 crash_file.close()
                 print(f"\n*** Conversation saved to: {crash_file.name} ***", file=sys.stderr)
             # Clean up temp files from truncated output
