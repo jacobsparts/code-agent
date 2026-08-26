@@ -6,9 +6,9 @@ import sys
 import pytest
 
 from code_agent.client import LLMClient
-from code_agent.conversation import Conversation, MEDIA_ATTACHMENTS_FIELD
 from code_agent.conversation import Convo
 from code_agent.repl_attachment_mixin import AudioAttachment, ImageAttachment
+
 
 class CanonicalClient:
     model_name = "test/canonical"
@@ -86,143 +86,10 @@ def test_convo_call_accepts_explicit_canonical_messages():
         {"retry": 1},
     )]
 
-def test_conversation_wraps_supplied_convo_as_canonical_backing_store():
-    client = CanonicalClient()
-    convo = Convo(client, "canonical system")
-    convo.usermsg("existing")
-    conversation = Conversation(client, "ignored system", convo=convo)
-
-    assert conversation.stored_messages() == [
-        {"role": "system", "content": "canonical system"},
-        {"role": "user", "content": "existing"},
-    ]
-
-    user = conversation.append_message({
-        "role": "user",
-        "content": "legacy input",
-        "_synthetic": True,
-    })
-    conversation.update_message(user, _event_seq=7)
-
-    assert convo.stored_messages()[-1] == {
-        "role": "user",
-        "content": [{"type": "text", "text": "legacy input"}],
-        "_synthetic": True,
-        "_event_seq": 7,
-    }
-
-    removed = conversation.pop_message()
-    assert removed == user
-    assert convo.stored_messages() == [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": "canonical system"}],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": "existing"}],
-        },
-    ]
 
 
-def test_conversation_reflects_direct_convo_mutations_without_sync():
-    client = CanonicalClient()
-    convo = Convo(client, "system")
-    conversation = Conversation(client, "ignored", convo=convo)
 
-    canonical = convo.usermsg("from canonical")
-    assert conversation.stored_messages()[-1] == {
-        "role": "user",
-        "content": "from canonical",
-    }
-
-    convo.update_message(canonical, _event_seq=4)
-    assert conversation.stored_messages()[-1]["_event_seq"] == 4
-
-    convo.pop_message()
-    assert conversation.stored_messages() == [{
-        "role": "system",
-        "content": "system",
-    }]
-
-
-def legacy_to_transport(messages):
-    client = object.__new__(LLMClient)
-    captured = {}
-
-    def call(projected, **kwargs):
-        captured["messages"] = projected
-        return {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
-
-    client.call = call
-    Conversation(client, "").call(messages)
-    return captured["messages"]
-
-
-def transport_to_legacy(message):
-    client = object.__new__(LLMClient)
-    client.call = lambda messages, **kwargs: message
-    return Conversation(client, "").call([])
-
-
-def test_mixed_legacy_attachments_preserve_order_into_completions(monkeypatch):
-    config = {
-        "model": "media-model",
-        "api_type": "completions",
-        "concurrency": 1,
-        "timeout": 20,
-    }
-    monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
-    client = LLMClient("test/media-model")
-    messages = legacy_to_transport([{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "first"},
-            {"type": "input_file", "file_id": "file_123"},
-            {
-                "type": "image_url",
-                "media_type": "image/png",
-                "image_url": {"url": "https://example.test/image.png"},
-            },
-            {
-                "type": "input_audio",
-                "input_audio": {"data": "YXVkaW8=", "format": "wav"},
-            },
-            {"type": "text", "text": "last"},
-        ],
-        MEDIA_ATTACHMENTS_FIELD: [{
-            "media_type": "image/png",
-            "content": b"binary-image",
-        }],
-    }])
-
-    assert [
-        (block["type"], block.get("data_type"))
-        for block in messages[0]["content"]
-    ] == [
-        ("text", None),
-        ("attachment", "provider_id"),
-        ("attachment", "url"),
-        ("attachment", "bytes"),
-        ("text", None),
-        ("attachment", "bytes"),
-    ]
-    assert messages[0]["content"][3]["data"] == b"audio"
-    assert messages[0]["content"][-1]["data"] == b"binary-image"
-
-    projected = client._completions_messages(messages)[0]["content"]
-    assert [block["type"] for block in projected] == [
-        "text", "input_file", "image_url", "input_audio", "text", "image_url",
-    ]
-
-
-def test_unknown_legacy_and_transport_types_raise(monkeypatch):
-    with pytest.raises(NotImplementedError, match="Unknown legacy content type"):
-        legacy_to_transport([{
-            "role": "user",
-            "content": [{"type": "future_media"}],
-        }])
-
+def test_unknown_transport_types_raise(monkeypatch):
     config = {
         "model": "media-model",
         "api_type": "completions",
@@ -344,14 +211,20 @@ def test_responses_request_projects_private_image_attachment(monkeypatch):
     client = LLMClient("openai/gpt-image-capable")
     image = ImageAttachment(b"png-bytes", "image/png", 2, 3)
 
-    conversation = Conversation(client, "system")
-    conversation.usermsg(
-        "[Attachment: diagram.png, 2×3, image/png]",
-        _attachments={"diagram.png": image},
-    )
-    request = client._responses_request(
-        legacy_to_transport(conversation.projected_messages()), None
-    )
+    convo = Convo(client, "system")
+    convo.usermsg([
+        {
+            "type": "text",
+            "text": "[Attachment: diagram.png, 2×3, image/png]",
+        },
+        {
+            "type": "attachment",
+            "media_type": image.media_type,
+            "data_type": "bytes",
+            "data": image.content,
+        },
+    ])
+    request = client._responses_request(convo.projected_messages(), None)
 
     user = request["input"][1]
     assert user["content"][0] == {
@@ -400,7 +273,6 @@ class _Connection:
 
     def close(self):
         pass
-
 
 @pytest.mark.parametrize(
     ("api_type", "response_payload", "expected"),
@@ -457,10 +329,17 @@ def test_audio_attachment_transport_payload(
         "content": b"RIFF\x04\x00\x00\x00WAVEdata",
     }
 
-    Conversation(client, "").call([{
+    Convo(client, "").call([{
         "role": "user",
-        "content": "listen",
-        MEDIA_ATTACHMENTS_FIELD: [media],
+        "content": [
+            {"type": "text", "text": "listen"},
+            {
+                "type": "attachment",
+                "media_type": media["media_type"],
+                "data_type": "bytes",
+                "data": media["content"],
+            },
+        ],
     }])
 
     request = _Connection.requests[0]
@@ -468,7 +347,6 @@ def test_audio_attachment_transport_payload(
         assert request["messages"][0]["content"][1] == expected
     else:
         assert request["contents"][0]["parts"][1] == expected
-
 
 @pytest.mark.parametrize(
     ("api_type", "projector"),
@@ -501,7 +379,7 @@ def test_transport_rejects_unsupported_audio_generically(
         getattr(client, projector)(attachment)
 
 
-def test_openai_response_image_decodes_then_legacy_projection_raises():
+def test_openai_response_image_decodes_to_canonical_attachment():
     from code_agent.client import (
         _openai_compatible_message_to_transport_blocks,
     )
@@ -521,11 +399,6 @@ def test_openai_response_image_decodes_then_legacy_projection_raises():
         "data_type": "url",
         "data": "https://example.test/result.png",
     }
-    with pytest.raises(NotImplementedError, match="cannot store attachment"):
-        transport_to_legacy({
-            "role": "assistant",
-            "content": blocks,
-        })
 
 
 def test_responses_request_skips_explicit_cache_when_not_opted_in(monkeypatch):
@@ -565,25 +438,25 @@ def test_responses_request_skips_explicit_cache_when_not_opted_in(monkeypatch):
     assert "prompt_cache_breakpoint" not in request["input"][1]["content"][0]
 
 
-def test_conversation_skips_cache_breakpoints_when_not_opted_in():
+def test_convo_skips_cache_breakpoints_when_not_opted_in():
     class Client:
         model_name = "openai/gpt-5.5"
         model_config = {"explicit_prompt_cache": False}
 
-    conversation = Conversation(Client(), "system")
-    conversation.usermsg("hello")
-    messages = conversation.projected_messages()
+    convo = Convo(Client(), "system")
+    convo.usermsg("hello")
+    messages = convo.projected_messages()
     assert all("_prompt_cache_breakpoint" not in message for message in messages)
 
 
-def test_conversation_adds_cache_breakpoints_when_opted_in():
+def test_convo_adds_cache_breakpoints_when_opted_in():
     class Client:
         model_name = "openai/gpt-5.6-luna-high"
         model_config = {"explicit_prompt_cache": True}
 
-    conversation = Conversation(Client(), "system")
-    conversation.usermsg("hello")
-    messages = conversation.projected_messages()
+    convo = Convo(Client(), "system")
+    convo.usermsg("hello")
+    messages = convo.projected_messages()
     assert messages[0].get("_prompt_cache_breakpoint") is True
     assert messages[1].get("_prompt_cache_breakpoint") is True
 
