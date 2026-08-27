@@ -83,6 +83,7 @@ The following functions are injected into the config's namespace before it runs:
 | `rpm` | Host-wide requests-per-minute limit |
 | `concurrency` | Strict host-wide active-request limit; enables admission when configured |
 | `tools` | Whether this provider supports native tool calls |
+| `headers` | Extra HTTP headers for completions and responses requests |
 
 ### `register_model` parameters
 
@@ -100,6 +101,7 @@ The following functions are injected into the config's namespace before it runs:
 | `reasoning_cost` | Cost per million reasoning tokens (USD) |
 | `config` | Extra body parameters merged into every request (e.g. `{"temperature": 0.7}`) |
 | `timeout` | Per-model timeout override |
+| `headers` | Extra HTTP headers; merged over the provider headers |
 
 ### Examples
 
@@ -127,13 +129,19 @@ register_provider("corp",
     path="/openai/v1/chat/completions",
     api_type="completions",
     timeout=120,
+    headers={"X-Proxy-Token": "..."},
 )
 register_model("corp", "fast",
     model="your-model-name",
+    headers={"X-Route": "fast"},
     input_cost=5.0,
     output_cost=15.0,
 )
 ```
+
+Provider headers apply to all of its models. Model headers are merged on top,
+overriding provider values with the same name. Custom headers are currently
+sent only by the `completions` and `responses` transports.
 
 **Set environment variables:**
 
