@@ -1980,6 +1980,7 @@ def test_mcp_request_is_response_boundary(monkeypatch):
     """A unique LiveMCPCall records the tool call and closes the Run at once."""
     closed = []
     posted_payloads = []
+    monkeypatch.setattr(cursor, "get_filtered_usage", lambda *args, **kwargs: {"prompt_tokens": 1, "completion_tokens": 1})
 
     class FakeSSEClient:
         def __init__(self, *args, stream_callback, headers_callback, **kwargs):
@@ -2037,6 +2038,7 @@ def test_mcp_request_is_response_boundary(monkeypatch):
 def test_mcp_request_decodes_arguments(monkeypatch):
     """The recorded ToolCall carries the McpArgs fields verbatim."""
     posted_payloads = []
+    monkeypatch.setattr(cursor, "get_filtered_usage", lambda *args, **kwargs: {"prompt_tokens": 1, "completion_tokens": 1})
 
     class FakeSSEClient:
         def __init__(self, *args, stream_callback, headers_callback, **kwargs):
