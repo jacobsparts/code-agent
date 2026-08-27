@@ -45,9 +45,12 @@ class UsageTracker:
             ('prompt_tokens_details', 'cached_tokens'),
             ('input_tokens_details', 'cached_tokens'),
         ])
-        # Anthropic-style: cache tokens are separate from input_tokens (already excluded)
-        anthropic_cached_tokens = usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
-        cached_tokens = openai_cached_tokens + anthropic_cached_tokens
+        # Some proxies emit Anthropic-style cache fields describing the same cache as
+        # OpenAI-style details; adding both double-counts, so OpenAI-style wins.
+        if openai_cached_tokens:
+            cached_tokens = openai_cached_tokens
+        else:
+            cached_tokens = (usage.get('cache_read_input_tokens') or 0) + (usage.get('cache_creation_input_tokens') or 0)
         prompt_tokens = self._coalesce_paths(usage, [
             'native_tokens_prompt',
             'prompt_tokens',
