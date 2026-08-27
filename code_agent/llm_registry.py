@@ -23,6 +23,7 @@ class ProviderConfig:
     requires_api_key: bool = True
     cost_transform: object = None     # callable(prompt, cached, completion, reasoning, in_cost, cached_cost, out_cost, rsn_cost) -> (in_cost, cached_cost, out_cost, rsn_cost)
     response_parser: object = None    # callable(response_json) -> (message, stop_reason, usage)
+    headers: dict = field(default_factory=dict)
 
 @dataclass
 class ModelConfig:
@@ -41,6 +42,7 @@ class ModelConfig:
     tools: bool = None
     tool_mode: str = None
     explicit_prompt_cache: bool = False
+    headers: dict = field(default_factory=dict)
 
     @property
     def request_path(self):
@@ -107,6 +109,7 @@ class EndpointRegistry:
         _provider = _model.pop('provider').__dict__
         keys = _model.keys() | _provider.keys()
         model_config = { k: v if (v := _model.get(k)) is not None else _provider.get(k) for k in keys }
+        model_config['headers'] = {**_provider['headers'], **_model['headers']}
         model_config['path'] = _provider['path']
         model_config['request_path'] = model_obj.request_path
         env_var = f"{model_config['provider'].upper()}_API_KEY"
