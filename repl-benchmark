@@ -1,5 +1,0 @@
-#!/usr/bin/env python3
-from code_agent.repl_benchmark.cli import main
-
-if __name__ == "__main__":
-    raise SystemExit(main())

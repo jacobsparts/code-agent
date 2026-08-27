@@ -223,14 +223,3 @@ def test_statement_echo_interleaving():
         assert cap_str.find(">>> print(x)") < cap_str.find("1"), "echo not before output"
     finally:
         builtins.print = orig_print
-
-def test_benchmark_metrics_ignore_display():
-    from code_agent.repl_benchmark.core import InstrumentedREPLBenchmarkMixin
-    mixin = InstrumentedREPLBenchmarkMixin()
-    mixin._benchmark_reset_metrics()
-    mixin.on_repl_event(ReplEvent(kind="display", text="hi\n", data={"display_kind":"output"}))
-    assert mixin._benchmark_metrics["chunk_counts"] == {}
-    mixin.on_repl_event(ReplEvent(kind="output", text="hi\n"))
-    assert mixin._benchmark_metrics["chunk_counts"].get("output") == 1
-    mixin.on_repl_event(ReplEvent(kind="print", text="hi\n"))
-    assert mixin._benchmark_metrics["chunk_counts"].get("print") == 1
