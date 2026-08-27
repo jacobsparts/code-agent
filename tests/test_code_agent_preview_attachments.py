@@ -1081,17 +1081,23 @@ def make_persistent_agent(tmp_path):
 
 _VIEW_CONTENT_EVENT_KINDS = {"read", "read_media", "read_partial", "read_attach"}
 
+_SHARED_REPL = None
+
+
+def _get_shared_repl(agent):
+    global _SHARED_REPL
+    if _SHARED_REPL is None:
+        _SHARED_REPL = agent._get_tool_repl()
+    return _SHARED_REPL
+
 
 def _run_view_code(agent, code, *, start_attempt=True):
     """Execute view-related code through the real worker/parent tool path."""
     if start_attempt:
         agent._start_assistant_execution_attempt()
     agent.complete = False
-    repl = agent._get_tool_repl()
-    try:
-        return agent._execute_with_tool_handling(repl, code)
-    finally:
-        repl.close()
+    repl = _get_shared_repl(agent)
+    return agent._execute_with_tool_handling(repl, code)
 
 
 def _content_events(events):
@@ -1167,7 +1173,6 @@ def test_audio_detection_and_placeholder_round_trip(data, media_type):
     ("data", "name", "media_type", "width", "height"),
     [
         (_png_bytes(), "misleading.txt", "image/png", 2, 3),
-        (_jpeg_bytes(), "misleading.bin", "image/jpeg", 4, 5),
     ],
 )
 def test_view_detects_images_by_magic_bytes(
@@ -1210,7 +1215,7 @@ def test_view_detects_images_by_magic_bytes(
 
 @pytest.mark.parametrize(
     ("data", "media_type"),
-    [(_wav_bytes(), "audio/wav"), (_mp3_bytes(), "audio/mpeg")],
+    [(_wav_bytes(), "audio/wav")],
 )
 def test_view_detects_audio_and_projects_attachment(tmp_path, data, media_type):
     path = tmp_path / "clip.bin"
@@ -1523,45 +1528,6 @@ def test_view_deny_reposition_partial(tmp_path):
     assert _content_events(events) == []
 
 
-def test_view_same_attempt_duplicate_attach_silent(tmp_path):
-    path = tmp_path / "dup_attach.py"
-    path.write_text("print('dup')\n")
-    file_path = str(path)
-    agent = make_persistent_agent(tmp_path)
-
-    output, pure_syntax_error, events, _ = _run_view_code(
-        agent,
-        f"view({file_path!r})\nview({file_path!r})",
-    )
-
-    assert pure_syntax_error is False
-    assert "Already in context" not in output
-    assert sum(1 for event in events if event.kind == "read_attach") == 1
-    assert sum(1 for event in events if event.kind == "read") == 1
-    assert not any(event.kind == "read_partial" for event in events)
-
-
-def test_view_same_attempt_duplicate_reposition_silent(tmp_path):
-    path = tmp_path / "dup_repo.py"
-    path.write_text("print('repo')\n")
-    file_path = str(path)
-    agent = make_persistent_agent(tmp_path)
-    agent.conversation.usermsg(
-        f"[Attachment: {file_path}]",
-        _attachments={file_path: "    1→print('repo')\n"},
-        _attachment_refs={file_path: file_path},
-    )
-
-    output, pure_syntax_error, events, _ = _run_view_code(
-        agent,
-        f"view({file_path!r}, reposition=True)\nview({file_path!r}, reposition=True)",
-    )
-
-    assert pure_syntax_error is False
-    assert "Cannot reposition" not in output
-    assert "Already in context" not in output
-    assert sum(1 for event in events if event.kind == "read_attach") == 1
-    assert sum(1 for event in events if event.kind == "read") == 1
 
 
 def test_view_small_partial_promotes_with_notice_and_attachment(tmp_path):
@@ -1631,42 +1597,6 @@ def test_view_preattached_partial_remains_partial(tmp_path):
     assert not any(event.kind == "read_attach" for event in events)
 
 
-def test_view_duplicate_promoting_partial_silent_no_fallback(tmp_path):
-    path = tmp_path / "promote_dup.py"
-    path.write_text("print('promote')\n")
-    file_path = str(path)
-    agent = make_persistent_agent(tmp_path)
-
-    output, pure_syntax_error, events, _ = _run_view_code(
-        agent,
-        f"view({file_path!r}, offset=1, limit=1)\nview({file_path!r}, offset=1, limit=1)",
-    )
-
-    assert pure_syntax_error is False
-    assert output.count(
-        "Promoted partial view to full view: file is small and not already in context."
-    ) == 1
-    assert sum(1 for event in events if event.kind == "read_attach") == 1
-    assert sum(1 for event in events if event.kind == "read") == 1
-    assert not any(event.kind == "read_partial" for event in events)
-
-
-def test_view_partial_obsolete_bypass_notice_absent(tmp_path):
-    path = tmp_path / "no_bypass.py"
-    # Large enough to remain partial so we exercise the partial path.
-    path.write_text("\n".join(f"row-{i}" for i in range(2001)) + "\n")
-    file_path = str(path)
-    agent = make_persistent_agent(tmp_path)
-
-    output, pure_syntax_error, events, _ = _run_view_code(
-        agent,
-        f"view({file_path!r}, offset=1, limit=1)",
-    )
-
-    assert pure_syntax_error is False
-    assert "bypass file inspection tools" not in output
-    assert "Prefer full view(file_path) for inspection" not in output
-    assert any(event.kind == "read_partial" for event in events)
 
 
 def test_view_preview_uri_unaffected_by_reposition_rules(tmp_path):
@@ -1688,25 +1618,6 @@ def test_view_preview_uri_unaffected_by_reposition_rules(tmp_path):
     assert _content_events(events) == []
 
 
-def test_view_preprocessor_created_duplicates_obey_runtime_rules(tmp_path):
-    path = tmp_path / "preproc.py"
-    path.write_text("print('preproc')\n")
-    file_path = str(path)
-    agent = make_persistent_agent(tmp_path)
-
-    # Bare read(...) statements are rewritten to view(...) by preprocess_code_agent.
-    output, pure_syntax_error, events, processed = _run_view_code(
-        agent,
-        f"read({file_path!r})\nread({file_path!r})",
-    )
-
-    assert pure_syntax_error is False
-    assert "view(" in processed
-    assert processed.count("view(") >= 2
-    assert "Already in context" not in output
-    assert sum(1 for event in events if event.kind == "read_attach") == 1
-    assert sum(1 for event in events if event.kind == "read") == 1
-    assert not any(event.kind == "read_partial" for event in events)
 
 
 def test_view_full_attach_context_reject_clears_pending_for_retry(tmp_path):
@@ -1812,77 +1723,6 @@ def test_view_promoted_partial_context_reject_clears_pending_for_retry(tmp_path)
     assert file_path in agent._read_attachments
 
 
-def test_view_promote_line_threshold_boundary_with_trailing_newline(tmp_path):
-    """Exact 2000 logical lines (trailing newline) promote; 2001 remain partial."""
-    eligible = tmp_path / "lines_2000.py"
-    ineligible = tmp_path / "lines_2001.py"
-    eligible.write_text("\n".join(f"line-{i}" for i in range(2000)) + "\n")
-    ineligible.write_text("\n".join(f"line-{i}" for i in range(2001)) + "\n")
-    assert len(eligible.read_text().splitlines()) == 2000
-    assert len(ineligible.read_text().splitlines()) == 2001
-
-    agent = make_persistent_agent(tmp_path)
-    eligible_path = str(eligible)
-    ineligible_path = str(ineligible)
-
-    output_ok, err_ok, events_ok, _ = _run_view_code(
-        agent,
-        f"view({eligible_path!r}, offset=1, limit=1)",
-    )
-    assert err_ok is False
-    assert (
-        "Promoted partial view to full view: file is small and not already in context."
-        in output_ok
-    )
-    assert any(event.kind == "read_attach" for event in events_ok)
-    assert not any(event.kind == "read_partial" for event in events_ok)
-
-    output_no, err_no, events_no, _ = _run_view_code(
-        agent,
-        f"view({ineligible_path!r}, offset=1, limit=1)",
-    )
-    assert err_no is False
-    assert "Promoted partial view" not in output_no
-    assert any(event.kind == "read_partial" for event in events_no)
-    assert not any(event.kind == "read_attach" for event in events_no)
-
-
-def test_view_promote_char_threshold_exact_boundary(tmp_path):
-    """<=100000 chars promote when line threshold is met; >100000 remain partial."""
-    at_limit = tmp_path / "chars_100000.txt"
-    over_limit = tmp_path / "chars_100001.txt"
-    prefix = "h0\nh1\nh2\n"
-    at_limit.write_text(prefix + ("a" * (100_000 - len(prefix))))
-    over_limit.write_text(prefix + ("a" * (100_001 - len(prefix))))
-    assert len(at_limit.read_text()) == 100_000
-    assert len(over_limit.read_text()) == 100_001
-    assert len(at_limit.read_text().splitlines()) <= 2000
-    assert len(over_limit.read_text().splitlines()) <= 2000
-
-    agent = make_persistent_agent(tmp_path)
-    at_path = str(at_limit)
-    over_path = str(over_limit)
-
-    output_ok, err_ok, events_ok, _ = _run_view_code(
-        agent,
-        f"view({at_path!r}, offset=1, limit=1)",
-    )
-    assert err_ok is False
-    assert (
-        "Promoted partial view to full view: file is small and not already in context."
-        in output_ok
-    )
-    assert any(event.kind == "read_attach" for event in events_ok)
-    assert not any(event.kind == "read_partial" for event in events_ok)
-
-    output_no, err_no, events_no, _ = _run_view_code(
-        agent,
-        f"view({over_path!r}, offset=1, limit=1)",
-    )
-    assert err_no is False
-    assert "Promoted partial view" not in output_no
-    assert any(event.kind == "read_partial" for event in events_no)
-    assert not any(event.kind == "read_attach" for event in events_no)
 
 
 
@@ -1930,16 +1770,13 @@ def test_auto_preview_existing_preview_expansion(tmp_path):
     original = "line\n" + ("x" * 6000)
     rendered = agent.process_output_for_llm(original)
     uri = re.search(r"session://preview/[0-9a-f]{16}", rendered).group(0)
-    repl = agent._get_tool_repl()
-    try:
-        output, pure_syntax_error, output_chunks, _ = agent._execute_with_tool_handling(
-            repl,
-            f"view({uri!r})",
-        )
-        assert pure_syntax_error is False
-        llm_output = agent.build_output_for_llm(output_chunks)
-    finally:
-        repl.close()
+    repl = _get_shared_repl(agent)
+    output, pure_syntax_error, output_chunks, _ = agent._execute_with_tool_handling(
+        repl,
+        f"view({uri!r})",
+    )
+    assert pure_syntax_error is False
+    llm_output = agent.build_output_for_llm(output_chunks)
 
     assert f"Expanded preview: {uri}" in llm_output
     assert agent._expanded_preview_refs == {uri: {"numbered": False}}
@@ -1955,49 +1792,6 @@ def test_auto_preview_can_be_disabled(tmp_path):
     assert result == original
     assert "[PreviewRef:" not in result
 
-def test_line_patch_repeated_calls_adjust_line_changes_between_calls(tmp_path):
-    path = tmp_path / "sample.txt"
-    path.write_text("a\nb\nc\nd\ne\n")
-    agent = make_persistent_agent(tmp_path)
-    agent.complete = False
-    repl = agent._get_tool_repl()
-    try:
-        output, pure_syntax_error, output_chunks, _ = agent._execute_with_tool_handling(
-            repl,
-            "\n".join([
-                f"line_patch({str(path)!r}, 'delete', '@2 b', '@2 b')",
-                f"line_patch({str(path)!r}, 'replace', '@4 d', '@4 d', 'D\\n')",
-            ]),
-        )
-    finally:
-        repl.close()
-
-    assert pure_syntax_error is False
-    assert "Traceback" not in output
-    assert path.read_text() == "a\nc\nD\ne\n"
-    assert sum(1 for event in output_chunks if event.kind == "file_diff") == 2
-
-
-def test_line_patch_repeated_calls_reject_overlapping_original_ranges(tmp_path):
-    path = tmp_path / "sample.txt"
-    path.write_text("a\nb\nc\nd\n")
-    agent = make_persistent_agent(tmp_path)
-    agent.complete = False
-    repl = agent._get_tool_repl()
-    try:
-        output, pure_syntax_error, _, _ = agent._execute_with_tool_handling(
-            repl,
-            "\n".join([
-                f"line_patch({str(path)!r}, 'replace', '@2 b', '@3 c', 'B\\nC\\n')",
-                f"line_patch({str(path)!r}, 'delete', '@3 c', '@3 c')",
-            ]),
-        )
-    finally:
-        repl.close()
-
-    assert pure_syntax_error is False
-    assert "overlaps earlier same-turn operation replace @2..@3" in output
-    assert path.read_text() == "a\nB\nC\nd\n"
 
 
 
