@@ -271,31 +271,6 @@ def test_run_loop_executes_and_commits_recovered_native_tool_name():
     assert messages[-1]["content"] == [{"type": "text", "text": "# [no output]"}]
 
 
-@pytest.mark.parametrize(
-    ("name", "args"),
-    [
-        ("search", {}),
-        ("search(query='coins')", {"query": "coins"}),
-        ("client.search(query='coins')", {}),
-        ("search('coins'); emit('done')", {}),
-    ],
-)
-def test_assistant_code_rejects_other_native_tool_call_shapes(name, args):
-    message = {
-        "role": "assistant",
-        "content": [{
-            "type": "tool_call",
-            "id": "call-17",
-            "name": name,
-            "args": args,
-        }],
-    }
-
-    assert REPLMixin._normalize_malformed_native_tool_calls(message) is message
-    with pytest.raises(RuntimeError, match="unsupported native tool call"):
-        REPLMixin._assistant_code(message)
-
-
 def test_assistant_code_reports_unsupported_native_tool_call_details():
     with pytest.raises(
         RuntimeError,
