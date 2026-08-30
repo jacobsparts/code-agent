@@ -448,8 +448,7 @@ class LLMClient:
     def _update_input_tokens_per_byte(self, input_bytes, usage):
         if not usage or not input_bytes:
             return
-        normalized = self.usage_tracker._normalize(self.model_name, usage)
-        input_tokens = normalized['prompt_tokens'] + normalized['cached_tokens']
+        input_tokens = usage['prompt_tokens'] + usage['cached_tokens']
         if input_tokens <= 0:
             return
         ratios = getattr(self.usage_tracker, "input_tokens_per_byte", None)
@@ -645,8 +644,8 @@ class LLMClient:
                 if self.tool_mode == "repl_execute":
                     message = repl_response_to_text(message)
                 if usage:
-                    self.usage_tracker.log(self.model_name, usage)
-                    self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+                    normalized_usage = self.usage_tracker.log(self.model_name, usage)
+                    self._update_input_tokens_per_byte(self._current_input_bytes, normalized_usage)
 
                 # Truncated response: feed it back and retry with doubled max_tokens.
                 # Keeps doubling until prompt + output would exceed context_window.
@@ -870,8 +869,8 @@ class LLMClient:
         if not blocks and isinstance(response_json.get('output_text'), str):
             blocks.append({'type': 'text', 'text': response_json['output_text']})
         if usage := response_json.get('usage'):
-            self.usage_tracker.log(self.model_name, usage)
-            self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+            normalized_usage = self.usage_tracker.log(self.model_name, usage)
+            self._update_input_tokens_per_byte(self._current_input_bytes, normalized_usage)
         incomplete = response_json.get('incomplete_details') or {}
         stop_reason = incomplete.get('reason')
         if stop_reason is None:
@@ -945,8 +944,8 @@ class LLMClient:
         }
         message = repl_response_to_text(message)
         if usage:
-            self.usage_tracker.log(self.model_name, usage)
-            self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+            normalized_usage = self.usage_tracker.log(self.model_name, usage)
+            self._update_input_tokens_per_byte(self._current_input_bytes, normalized_usage)
         return message
 
     def _call_codex(self, messages, tools):
@@ -1052,8 +1051,8 @@ class LLMClient:
                 raise APIError(f"{response.status}: {response_data}")
             response_json = json.loads(response_data)
             if usage := response_json.get('usage'):
-                self.usage_tracker.log(self.model_name, usage)
-                self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+                normalized_usage = self.usage_tracker.log(self.model_name, usage)
+                self._update_input_tokens_per_byte(self._current_input_bytes, normalized_usage)
             blocks = []
             for block in response_json['content']:
                 kind = block['type']
@@ -1237,8 +1236,8 @@ class LLMClient:
                 raise APIError(f"{response.status}: {response_data}")
             response_json = json.loads(response_data)
             if usage := response_json.get('usageMetadata'):
-                self.usage_tracker.log(self.model_name, usage)
-                self._update_input_tokens_per_byte(self._current_input_bytes, usage)
+                normalized_usage = self.usage_tracker.log(self.model_name, usage)
+                self._update_input_tokens_per_byte(self._current_input_bytes, normalized_usage)
             if not response_json.get('candidates'):
                 raise Exception(f"candidates missing from response: {response_json}")
             candidate = response_json['candidates'][0]

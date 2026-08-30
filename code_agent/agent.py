@@ -3327,7 +3327,7 @@ Return only the replacement user prompt text.
                     if not tracker.history:
                         self._display_text(f"{DIM}No API calls yet{RESET}", kind="status")
                     else:
-                        n = tracker._normalize(*tracker.history[-1])
+                        _, n = tracker.history[-1]
                         total = n['prompt_tokens'] + n['cached_tokens'] + n['completion_tokens'] + n['reasoning_tokens']
                         parts = [p for p in [
                             f"{n['prompt_tokens']:,} in" if n['prompt_tokens'] else None,

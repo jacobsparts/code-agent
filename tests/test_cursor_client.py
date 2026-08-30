@@ -324,22 +324,13 @@ def test_cursor_client_adapter(monkeypatch):
     assert client.usage_tracker.history[history_length:] == [(
         "cursor/composer-2.5",
         {
-            "prompt_tokens": 120,
+            "prompt_tokens": 100,
+            "cached_tokens": 20,
             "completion_tokens": 30,
-            "total_tokens": 157,
-            "prompt_tokens_details": {"cached_tokens": 20},
-            "completion_tokens_details": {"reasoning_tokens": 7},
+            "reasoning_tokens": 7,
+            "cost": 0.0,
         },
     )]
-    assert client.usage_tracker._normalize(
-        "cursor/composer-2.5", client.usage_tracker.history[-1][1]
-    ) == {
-        "prompt_tokens": 100,
-        "cached_tokens": 20,
-        "completion_tokens": 30,
-        "reasoning_tokens": 7,
-        "cost": 0.0,
-    }
     assert client._input_tokens_per_byte() is not None
     del client.usage_tracker.history[history_length:]
 
