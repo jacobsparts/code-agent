@@ -60,17 +60,94 @@ text, for example: `<SubagentResponse status='running', turns=3, progress_update
 Keep every agent in `agents` until its task is complete. Close each agent
 explicitly when it is no longer needed.
 
-## Session Continuity
+## Providing Context
+
+A subagent starts with no knowledge of your conversation, your findings, your
+files, or your goals.  It has only the Code Agent system prompt and the prompt
+you send.
+
+Every task prompt must be self-contained:
+
+- state the goal and what "done" means;
+- name the files and directories to read;
+- include constraints, prior findings, and anything already ruled out;
+- say what must not be touched.
+
+The subagent runs its own Python instance, so parent objects are not shared.
+To pass data, serialize it into the prompt, or write it to a temporary file and
+tell the subagent to read that path:
+
+    import json
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+        json.dump(findings, fh)
+        path = fh.name
+    agent.send(f"Read {path} for the confirmed findings, then ...")
+
+## Reuse Subagents
+
+Subagents are persistent and reusable.  A subagent keeps its conversation and
+its Python REPL state between tasks.
 
     agent = Subagent()
-    agent.send("Read main.py and understand the structure")
+    agent.send("Read main.py and map the parse path")
     agent.send("Now add error handling to the parse function")  # Follows up
     agent.close()
+
+Prefer following up with an existing subagent over spawning a new one.  Create
+a new subagent only when moving to a genuinely different task, or when running
+several tasks in parallel.
 
 Keep an explicit reference to each subagent for its whole lifetime. Call
 `close()` as soon as its work and any follow-ups are complete. `__del__`
 provides best-effort cleanup if a reference is accidentally lost, but should
 not be used as the normal lifecycle mechanism.
+
+## Steering an Active Subagent
+
+A subagent runs one task at a time.  If you learn something that changes the
+task, redirect it instead of starting over:
+
+    response = agent.send(
+        "Stop working on 159.index.js. The real target is index.js. Continue "
+        "the same extraction there.",
+        interrupt=True,
+    )
+
+`interrupt=True` stops the current task and sends yours as the next task on the
+same subagent.  Conversation and REPL state are kept.  The previous response
+ends as an interrupted error and is still readable.
+
+Use `agent.interrupt()` to stop the current task without sending new work.
+Use `agent.kill()` only to discard the subagent entirely.
+
+## Turn Limits
+
+`max_turns` bounds a single task.  It defaults to 100, and can be set per
+subagent or per task:
+
+    agent = Subagent(max_turns=150)
+    agent.send("Small, well-scoped fix", max_turns=20)
+
+Raise it for genuinely complex work.  Lower it for simple tasks, or for
+delicate work you want to review early.
+
+Reaching the limit ends the task with an error, but the subagent stays alive
+and reusable.  The work is not lost.  Find out where it got to:
+
+    status = agent.send("Stop and summarize what you have done and what remains.")
+
+From the subagent's perspective the work is still in progress, so it can report
+state and then be told to continue:
+
+    agent.send("Good. Continue with the remaining steps.")
+
+Continuing starts a fresh task, so the turn budget resets.  If the subagent has
+gone far in the wrong direction, kill it and start again with better
+instructions rather than correcting a long bad trajectory.
+
+Check on a running subagent the same way, with
+`send("Stop and report progress", interrupt=True)`.
 
 ## Model Configuration
 
@@ -87,7 +164,7 @@ are serialized into the response text when available.
 
 ## Attributes
 
-    Subagent: .id, .cwd, .model, .done, .result, .send(), .wait(), .kill(), .close()
+    Subagent: .id, .cwd, .model, .done, .result, .send(), .interrupt(), .wait(), .kill(), .close()
     SubagentResponse: .done, .result, .progress, .turns, .is_error, .error, .wait()
 """
 
@@ -246,8 +323,12 @@ except ImportError:
 
 
 def _send_msg(sock, data):
-    payload = pickle.dumps(data)
-    sock.sendall(struct.pack('!I', len(payload)) + payload)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        payload = pickle.dumps(data)
+        sock.sendall(struct.pack('!I', len(payload)) + payload)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def _recv_msg(sock, timeout=None):
@@ -309,6 +390,7 @@ def worker_main(port, authkey, model, max_turns):
             self.model = model_name
             self.max_turns = default_max_turns
             self._turn_count = 0
+            self._task_interruptible = False
             super().__init__()
             self.output_hook = self._subagent_output_hook
 
@@ -329,6 +411,8 @@ def worker_main(port, authkey, model, max_turns):
 
         def _subagent_output_hook(self, value, release):
             message = str(value) if value is not None else ""
+            if release:
+                self._task_interruptible = False
             _send_msg(
                 self._host_sock,
                 ("result" if release else "progress", message),
@@ -336,6 +420,13 @@ def worker_main(port, authkey, model, max_turns):
 
     # Create agent
     agent = SubagentWorker(sock, model, max_turns)
+
+    def _handle_sigint(signum, frame):
+        if agent._task_interruptible:
+            raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
     # Main loop - receive tasks
     while True:
         try:
@@ -352,13 +443,17 @@ def worker_main(port, authkey, model, max_turns):
                 agent._turn_count = 0
 
                 try:
+                    agent._task_interruptible = True
                     agent.run_interaction(prompt, max_turns=task_max_turns)
                 except KeyboardInterrupt:
+                    agent._task_interruptible = False
                     _send_msg(sock, ("error", "Task interrupted"))
                 except Exception as e:
+                    agent._task_interruptible = False
                     import traceback
                     _send_msg(sock, ("error", f"{type(e).__name__}: {e}\\n{traceback.format_exc()}"))
                 finally:
+                    agent._task_interruptible = False
                     agent.complete = False
                     agent._final_result = None
 
@@ -515,7 +610,7 @@ class Subagent:
     Args:
         cwd: Working directory for the agent. Defaults to current directory.
         model: LLM model to use.
-        max_turns: Maximum turns per task. Default 50.
+        max_turns: Maximum turns per task. Default 100.
 
     Example:
         agent = Subagent(cwd="/path/to/project")
@@ -535,7 +630,7 @@ class Subagent:
         self,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
-        max_turns: int = 50
+        max_turns: int = 100
     ):
         self.id = str(uuid.uuid4())[:8]
         self.cwd = cwd or os.getcwd()
@@ -733,7 +828,8 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
         *,
         bg: bool = False,
         max_turns: Optional[int] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        interrupt: bool = False
     ) -> SubagentResponse:
         """Send a task to the subagent.
 
@@ -744,6 +840,7 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
             timeout: Seconds to wait; None waits indefinitely (ignored if bg=True).
                 Ctrl+C interrupts only this foreground wait; the task continues
                 and remains available through ``last`` or ``wait()``.
+            interrupt: Interrupt and wait for an active task before sending.
 
         Returns:
             SubagentResponse object. Its .result is the final text response.
@@ -753,7 +850,9 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
 
         active = self._active_response()
         if active is not None:
-            raise RuntimeError("Subagent already has a running task. Wait for it or kill it before sending another.")
+            if not interrupt:
+                raise RuntimeError("Subagent already has a running task. Wait for it or send with interrupt=True.")
+            self.interrupt()
 
         response = SubagentResponse(self)
         self._current_response = response
@@ -775,6 +874,15 @@ worker_main({port}, bytes.fromhex({repr(authkey.hex())}), {repr(self.model)}, {s
             )
             raise
         return response
+
+    def interrupt(self) -> Optional[SubagentResponse]:
+        """Interrupt an active task without stopping the subagent."""
+        active = self._active_response()
+        if active is None:
+            return None
+        os.killpg(self._proc.pid, signal.SIGINT)
+        active.wait()
+        return active
 
     @property
     def last(self) -> Optional[SubagentResponse]:

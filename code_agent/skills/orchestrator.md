@@ -21,7 +21,18 @@ Use subagents as an implementation and review pipeline, not as a one-shot delega
    - Do not create a subagent as a temporary expression or rely on its response to keep it alive.
    - Treat destructor cleanup as a last resort, not normal orchestration.
 
-4. **Divide work at architectural boundaries.**
+4. **Give every subagent complete context.**
+   - A subagent knows nothing about this conversation, your findings, or your goals.
+   - State the objective, the files to read, the constraints, and what "done" means.
+   - Serialize any data it needs into the prompt or a temp file it can read.
+
+5. **Steer subagents; do not restart them by default.**
+   - Reuse an existing subagent for follow-up work instead of spawning a new one.
+   - Redirect misdirected work with `send(..., interrupt=True)`.
+   - After a turn limit, ask for a progress report, then tell it to continue.
+   - Kill and restart only when a subagent is too far off course.
+
+6. **Divide work at architectural boundaries.**
    Good stage boundaries have independently testable outcomes, such as:
    - refactor shared primitives;
    - add persistence and replay;
@@ -29,7 +40,7 @@ Use subagents as an implementation and review pipeline, not as a one-shot delega
 
    Avoid splitting tightly coupled edits across parallel agents. Parallelism is useful only when tasks truly do not share files, invariants, or sequencing.
 
-5. **Make exclusions explicit.**
+7. **Make exclusions explicit.**
    State what the subagent must not implement or modify. Examples:
    - no schema migration;
    - no agentic policy yet;

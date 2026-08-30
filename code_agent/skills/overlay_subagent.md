@@ -25,6 +25,17 @@ Use ordinary `Subagent` instead when filesystem isolation and artifact submissio
 - Keep an explicit reference to every worker for its full lifetime and call `close()` as soon as it is no longer needed. The destructor is only best-effort cleanup.
 - Set `recursive=True` when a worker may create overlay subagents of its own. This attaches the worker-specific recursive orchestration skill and enables child construction in that worker.
 
+## Providing context
+
+An overlay worker starts with no knowledge of the parent conversation,
+findings, goals, or plan. It has only its system prompt, its filesystem view,
+and the task prompt. Make every task self-contained: state the goal, definition
+of done, files to inspect, constraints, prior findings, and exclusions.
+
+The worker also has its own Python instance, so parent objects are not shared.
+Serialize needed data into the prompt or a temporary file and tell the worker
+which path to read.
+
 ## Quick start
 
 ```python
@@ -273,11 +284,35 @@ Do not poll in noisy waiting loops. `response.progress` is a snapshot list popul
 emit("Focused tests pass; reviewing the diff now.")
 ```
 
-A worker can run only one task at a time. Sending another task while its current response is unfinished raises `RuntimeError`.
+A worker can run only one task at a time. Sending another task while its current response is unfinished raises `RuntimeError` unless you pass `interrupt=True`.
 
-## Session continuity
+## Steering an active worker
 
-An `OverlaySubagent` is persistent. Reuse it for follow-up tasks that should see its prior conversation and private filesystem changes:
+If you learn something that changes the task, redirect the worker instead of starting over:
+
+```python
+response = agent.send(
+    "Stop the current approach. The real target is src/config_parser.py. "
+    "Continue the same fix there and submit the changed files.",
+    interrupt=True,
+)
+```
+
+`interrupt=True` stops the current task and sends yours as the next task on the same worker. The worker's conversation, REPL state, and private overlay changes are kept. The interrupted response ends as an error and remains readable.
+
+To check on a running worker, ask it to stop and report:
+
+```python
+status = agent.send("Stop and summarize what you have done and what remains.", interrupt=True)
+print(status.result)
+agent.send("Good. Continue with the remaining steps and submit the changed files.")
+```
+
+Use `agent.interrupt()` to stop the current task without sending new work. Use `agent.kill()` only to discard the worker entirely.
+
+## Reuse workers
+
+An `OverlaySubagent` is persistent and reusable. It keeps its conversation, REPL state, and private filesystem changes between tasks. Prefer following up with an existing worker over creating a new one. Create a new worker only when moving to a genuinely different task, when running tasks in parallel, or when the worker needs a fresh view of files it has already modified.
 
 ```python
 agent = OverlaySubagent(cwd="/home/me/project")
@@ -486,7 +521,7 @@ Snapshot isolation does not merge overlapping sibling changes. Keep file ownersh
 agent = OverlaySubagent(
     cwd="/home/me/project",
     model="provider/model-name",
-    max_turns=50,
+    max_turns=100,
     recursive=True,
 )
 ```
@@ -504,6 +539,18 @@ response = agent.send(
 ```
 
 The foreground `timeout` controls how long `send()` waits. If it expires, the response may still be running; inspect `response.done` or call `response.wait()` later.
+
+`max_turns` bounds a single task and defaults to 100. Raise it for genuinely complex work; lower it for simple or delicate work you want to review early.
+
+Reaching the turn limit ends the task with an error, but the worker stays alive and reusable and its overlay changes are intact. Ask where it got to, then decide:
+
+```python
+status = agent.send("Stop and summarize what you have done and what remains.")
+print(status.result)
+agent.send("Continue with the remaining steps, then submit the changed files.")
+```
+
+Continuing starts a fresh task, so the turn budget resets. If the worker has gone far in the wrong direction, kill it and start again with better instructions rather than correcting a long bad trajectory.
 
 Snapshot controls are available for child creation:
 
@@ -562,11 +609,12 @@ keep its worker alive. `__del__` attempts best-effort cleanup if the worker
 reference is accidentally lost, but destructor timing is not a lifecycle
 contract.
 
-Use `agent.kill()` to terminate active work and clean up the overlay runtime.
-`close()` is idempotent and recursively closes children. Even though closing a
-parent closes any remaining children, the parent should retain each child in a
-named variable or collection and close it promptly when that child's work is
-finished.
+Use `agent.interrupt()` to stop active work while keeping the worker and its
+overlay usable. Use `agent.kill()` to terminate the worker and clean up the
+overlay runtime. `close()` is idempotent and recursively closes children. Even
+though closing a parent closes any remaining children, the parent should retain
+each child in a named variable or collection and close it promptly when that
+child's work is finished.
 
 ## Prompt pattern
 

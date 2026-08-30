@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import io
 import os
+import signal
 import stat
 import weakref
 from dataclasses import dataclass
@@ -1463,7 +1464,7 @@ class OverlaySubagent:
         self,
         cwd=None,
         model=None,
-        max_turns=50,
+        max_turns=100,
         snapshot_byte_limit=1073741824,
         snapshot_inode_limit=250000,
         snapshot_timeout=120.0,
@@ -1487,7 +1488,7 @@ class OverlaySubagent:
         )
         self._closed = False
 
-    def send(self, prompt, *, bg=False, max_turns=None, timeout=None):
+    def send(self, prompt, *, bg=False, max_turns=None, timeout=None, interrupt=False):
         response = _overlay_request(
             "child_send",
             child=self._handle,
@@ -1495,8 +1496,13 @@ class OverlaySubagent:
             bg=bg,
             max_turns=max_turns,
             timeout=timeout,
+            interrupt=interrupt,
         )
         return OverlayChildResponse(response)
+
+    def interrupt(self):
+        response = _overlay_request("child_interrupt", child=self._handle)
+        return OverlayChildResponse(response) if response is not None else None
 
     def close(self):
         if self._closed:
@@ -1728,6 +1734,7 @@ def _build_overlay_worker_code() -> str:
                 )
                 return
 
+            self._task_interruptible = False
             files = self._overlay_submitted_files
             self._overlay_submitted_files = None
             payload = None
@@ -1797,7 +1804,16 @@ def _build_overlay_worker_code() -> str:
                     bg=bool(args.get("bg", False)),
                     max_turns=args.get("max_turns"),
                     timeout=args.get("timeout"),
+                    interrupt=bool(args.get("interrupt", False)),
                 )
+                handle = self._new_overlay_handle("response")
+                self._overlay_responses[handle] = response
+                return handle
+            if action == "child_interrupt":
+                child = self._overlay_children[args["child"]]
+                response = child.interrupt()
+                if response is None:
+                    return None
                 handle = self._new_overlay_handle("response")
                 self._overlay_responses[handle] = response
                 return handle
@@ -1858,13 +1874,17 @@ def _build_overlay_worker_code() -> str:
                 agent._overlay_submitted_files = None
 
                 try:
+                    agent._task_interruptible = True
                     agent.run_interaction(prompt, max_turns=task_max_turns)
                 except KeyboardInterrupt:
+                    agent._task_interruptible = False
                     _send_msg(sock, ("error", "Task interrupted"))
                 except Exception as e:
+                    agent._task_interruptible = False
                     import traceback
                     _send_msg(sock, ("error", f"{type(e).__name__}: {e}\\n{traceback.format_exc()}"))
                 finally:
+                    agent._task_interruptible = False
                     agent.complete = False
                     agent._final_result = None
 
@@ -2098,7 +2118,7 @@ class OverlaySubagent:
         self,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
-        max_turns: int = 50,
+        max_turns: int = 100,
         _parent_overlay: Optional["OverlaySubagent"] = None,
         snapshot_byte_limit: Optional[int] = DEFAULT_SNAPSHOT_BYTE_LIMIT,
         snapshot_inode_limit: Optional[int] = DEFAULT_SNAPSHOT_INODE_LIMIT,
@@ -2340,12 +2360,18 @@ worker_main(
         bg: bool = False,
         max_turns: Optional[int] = None,
         timeout: Optional[float] = None,
+        interrupt: bool = False,
     ) -> OverlaySubagentResponse:
         from code_agent.subagent import _send_msg, _wrap_subagent_task
 
         self._ensure_started()
         if self._current_response is not None and not self._current_response.done:
-            raise RuntimeError("OverlaySubagent already has a running task")
+            if not interrupt:
+                raise RuntimeError(
+                    "OverlaySubagent already has a running task. "
+                    "Wait for it or send with interrupt=True."
+                )
+            self.interrupt()
 
         response = OverlaySubagentResponse(self)
         self._current_response = response
@@ -2421,6 +2447,15 @@ worker_main(
                 response._done = True
                 return
 
+
+    def interrupt(self) -> Optional[OverlaySubagentResponse]:
+        """Interrupt an active task without stopping the subagent."""
+        response = self._current_response
+        if response is None or response.done:
+            return None
+        os.killpg(self._transport._proc.pid, signal.SIGINT)
+        response.wait()
+        return response
 
     @property
     def last(self) -> Optional[OverlaySubagentResponse]:
