@@ -904,9 +904,16 @@ Important:
                 source.append("# " + text.replace("\n", "\n# "))
             elif kind == "reasoning":
                 continue
-            elif kind in ("tool_call", "attachment"):
+            elif kind == "tool_call":
+                raise RuntimeError(
+                    "Model returned an unsupported native tool call while Code Agent "
+                    "was expecting Python source: "
+                    f"name={block.get('name')!r}, id={block.get('id')!r}, "
+                    f"args={block.get('args')!r}"
+                )
+            elif kind == "attachment":
                 raise NotImplementedError(
-                    f"REPLAgent cannot execute assistant {kind!r} blocks"
+                    "REPLAgent cannot execute assistant 'attachment' blocks"
                 )
             else:
                 raise NotImplementedError(

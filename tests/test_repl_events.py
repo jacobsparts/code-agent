@@ -193,12 +193,29 @@ def test_assistant_code_preserves_block_order_and_ignores_reasoning():
     )
 
 
-@pytest.mark.parametrize("kind", ["tool_call", "attachment", "unknown"])
-def test_assistant_code_fails_closed_for_non_executable_blocks(kind):
+def test_assistant_code_reports_unsupported_native_tool_call_details():
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"unsupported native tool call.*"
+            r"name='search'.*id='call-17'.*args=\{'query': 'coins'\}"
+        ),
+    ):
+        REPLMixin._assistant_code({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_call",
+                "id": "call-17",
+                "name": "search",
+                "args": {"query": "coins"},
+            }],
+        })
+
+
+@pytest.mark.parametrize("kind", ["attachment", "unknown"])
+def test_assistant_code_fails_closed_for_other_non_executable_blocks(kind):
     block = {"type": kind}
-    if kind == "tool_call":
-        block.update(id="call", name="other", args={})
-    elif kind == "attachment":
+    if kind == "attachment":
         block.update(media_type="image/png", data_type="bytes", data=b"x")
 
     with pytest.raises(NotImplementedError):
