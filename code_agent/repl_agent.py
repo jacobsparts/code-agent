@@ -889,6 +889,45 @@ Important:
         return result
 
     @staticmethod
+    def _malformed_native_tool_source(block: dict) -> str | None:
+        """Recover a Python call incorrectly encoded as an empty-args tool name."""
+        name = block.get("name")
+        if not isinstance(name, str) or block.get("args") != {}:
+            return None
+        try:
+            tree = _parse_silently(name)
+        except SyntaxError:
+            return None
+        if (
+            len(tree.body) != 1
+            or not isinstance(tree.body[0], ast.Expr)
+            or not isinstance(tree.body[0].value, ast.Call)
+            or not isinstance(tree.body[0].value.func, ast.Name)
+        ):
+            return None
+        return name
+
+    @staticmethod
+    def _normalize_malformed_native_tool_calls(message: dict) -> dict:
+        """Convert recoverable native-tool envelopes to ordinary Python text."""
+        content = message.get("content", [])
+        if isinstance(content, str):
+            return message
+        normalized = []
+        changed = False
+        for block in content:
+            if block.get("type") == "tool_call":
+                recovered = REPLMixin._malformed_native_tool_source(block)
+                if recovered is not None:
+                    normalized.append({"type": "text", "text": recovered})
+                    changed = True
+                    continue
+            normalized.append(block)
+        if not changed:
+            return message
+        return {**message, "content": normalized}
+
+    @staticmethod
     def _assistant_code(message: dict) -> str:
         """Project executable assistant blocks to Python in source order."""
         source = []
@@ -1164,6 +1203,7 @@ Call help(function_name) for parameter descriptions.
                     except BadRequestError:
                         raise
 
+                    resp = self._normalize_malformed_native_tool_calls(resp)
                     content = self._assistant_code(resp)
 
                     output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)

@@ -193,6 +193,109 @@ def test_assistant_code_preserves_block_order_and_ignores_reasoning():
     )
 
 
+def test_normalize_recovers_python_call_encoded_as_native_tool_name():
+    source = (
+        'edit(file_path="code_agent/transports/cursor.py", '
+        'old_string="before", new_string="after")'
+    )
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "reasoning", "text": "private"},
+            {
+                "type": "tool_call",
+                "id": "call-17",
+                "name": source,
+                "args": {},
+            },
+        ],
+    }
+
+    normalized = REPLMixin._normalize_malformed_native_tool_calls(message)
+
+    assert normalized == {
+        "role": "assistant",
+        "content": [
+            {"type": "reasoning", "text": "private"},
+            {"type": "text", "text": source},
+        ],
+    }
+    assert REPLMixin._assistant_code(normalized) == source
+    assert message["content"][1]["type"] == "tool_call"
+
+
+def test_run_loop_executes_and_commits_recovered_native_tool_name():
+    source = "edit(file_path='a.py', old_string='before', new_string='after')"
+
+    class Agent(REPLMixin):
+        def __init__(self):
+            self._conversation = Convo(_CanonicalClient(), "system")
+            self.executed = []
+
+        def _ensure_setup(self):
+            pass
+
+        def _get_tool_repl(self):
+            return object()
+
+        def _projected_messages(self):
+            return []
+
+        def _conversation_call_with_context_recovery(self, messages):
+            return {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_call",
+                    "id": "call-17",
+                    "name": source,
+                    "args": {},
+                }],
+            }
+
+        def _execute_with_tool_handling(self, repl, code):
+            self.executed.append(code)
+            self.complete = True
+            self._final_result = "done"
+            return "", False, [], code
+
+        def build_output_for_llm(self, events):
+            return ""
+
+    agent = Agent()
+
+    assert agent.run_loop(max_turns=1) == "done"
+    assert agent.executed == [source]
+    messages = agent.conversation.stored_messages()
+    assert messages[-2]["role"] == "assistant"
+    assert messages[-2]["content"] == [{"type": "text", "text": source}]
+    assert messages[-1]["content"] == [{"type": "text", "text": "# [no output]"}]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("search", {}),
+        ("search(query='coins')", {"query": "coins"}),
+        ("client.search(query='coins')", {}),
+        ("search('coins'); emit('done')", {}),
+    ],
+)
+def test_assistant_code_rejects_other_native_tool_call_shapes(name, args):
+    message = {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_call",
+            "id": "call-17",
+            "name": name,
+            "args": args,
+        }],
+    }
+
+    assert REPLMixin._normalize_malformed_native_tool_calls(message) is message
+    with pytest.raises(RuntimeError, match="unsupported native tool call"):
+        REPLMixin._assistant_code(message)
+
+
 def test_assistant_code_reports_unsupported_native_tool_call_details():
     with pytest.raises(
         RuntimeError,
