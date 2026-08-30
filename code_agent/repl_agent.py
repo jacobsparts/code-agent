@@ -939,7 +939,7 @@ Important:
             elif kind == "reasoning":
                 continue
             elif kind == "tool_call":
-                raise RuntimeError(
+                raise SyntaxError(
                     "Model returned an unsupported native tool call while Code Agent "
                     "was expecting Python source: "
                     f"name={block.get('name')!r}, id={block.get('id')!r}, "
@@ -1199,14 +1199,19 @@ Call help(function_name) for parameter descriptions.
                         raise
 
                     resp = self._normalize_malformed_native_tool_calls(resp)
-                    content = self._assistant_code(resp)
+                    try:
+                        content = self._assistant_code(resp)
+                    except SyntaxError as exc:
+                        output = f"SyntaxError: {exc}\n"
+                        pure_syntax_error = True
+                        events = [ReplEvent(kind="error", text=output)]
+                    else:
+                        output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)
 
-                    output, pure_syntax_error, events, corrected_code = self._execute_with_tool_handling(repl, content)
-
-                    # Apply silent corrections to conversation (both sides see corrected code)
-                    if corrected_code != content:
-                        resp = self._with_corrected_code(resp, corrected_code)
-                        content = corrected_code
+                        # Apply silent corrections to conversation (both sides see corrected code)
+                        if corrected_code != content:
+                            resp = self._with_corrected_code(resp, corrected_code)
+                            content = corrected_code
 
                     if not pure_syntax_error:
                         break

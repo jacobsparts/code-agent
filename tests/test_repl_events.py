@@ -193,11 +193,12 @@ def test_assistant_code_preserves_block_order_and_ignores_reasoning():
     )
 
 
-def test_normalize_recovers_python_call_encoded_as_native_tool_name():
-    source = (
+def test_normalize_recovers_python_calls_encoded_as_native_tool_names():
+    edit_source = (
         'edit(file_path="code_agent/transports/cursor.py", '
         'old_string="before", new_string="after")'
     )
+    bash_source = 'bash("pytest -q tests/test_cursor.py", timeout=60, bg=False)'
     message = {
         "role": "assistant",
         "content": [
@@ -205,7 +206,13 @@ def test_normalize_recovers_python_call_encoded_as_native_tool_name():
             {
                 "type": "tool_call",
                 "id": "call-17",
-                "name": source,
+                "name": edit_source,
+                "args": {},
+            },
+            {
+                "type": "tool_call",
+                "id": "call-18",
+                "name": bash_source,
                 "args": {},
             },
         ],
@@ -217,11 +224,13 @@ def test_normalize_recovers_python_call_encoded_as_native_tool_name():
         "role": "assistant",
         "content": [
             {"type": "reasoning", "text": "private"},
-            {"type": "text", "text": source},
+            {"type": "text", "text": edit_source},
+            {"type": "text", "text": bash_source},
         ],
     }
-    assert REPLMixin._assistant_code(normalized) == source
+    assert REPLMixin._assistant_code(normalized) == f"{edit_source}\n{bash_source}"
     assert message["content"][1]["type"] == "tool_call"
+    assert message["content"][2]["type"] == "tool_call"
 
 
 def test_run_loop_executes_and_commits_recovered_native_tool_name():
@@ -271,9 +280,9 @@ def test_run_loop_executes_and_commits_recovered_native_tool_name():
     assert messages[-1]["content"] == [{"type": "text", "text": "# [no output]"}]
 
 
-def test_assistant_code_reports_unsupported_native_tool_call_details():
+def test_assistant_code_reports_unsupported_native_tool_call_as_syntax_error():
     with pytest.raises(
-        RuntimeError,
+        SyntaxError,
         match=(
             r"unsupported native tool call.*"
             r"name='search'.*id='call-17'.*args=\{'query': 'coins'\}"
@@ -288,6 +297,63 @@ def test_assistant_code_reports_unsupported_native_tool_call_details():
                 "args": {"query": "coins"},
             }],
         })
+
+
+def test_run_loop_retries_unsupported_native_tool_call_as_syntax_error():
+    malformed = {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_call",
+            "id": "call-17",
+            "name": "edit(...)</think:id><tool_call:id>bash(...)",
+            "args": {},
+        }],
+    }
+    corrected = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "emit('done', release=True)"}],
+    }
+
+    class Agent(REPLMixin):
+        def __init__(self):
+            self.llm_client = _CanonicalClient()
+            self._conversation = Convo(self.llm_client, "system")
+            self.responses = iter([malformed, corrected])
+            self.call_messages = []
+            self.retries = []
+
+        def _ensure_setup(self):
+            pass
+
+        def _get_tool_repl(self):
+            return object()
+
+        def _projected_messages(self):
+            return []
+
+        def _conversation_call_with_context_recovery(self, messages):
+            self.call_messages.append(messages)
+            return next(self.responses)
+
+        def _execute_with_tool_handling(self, repl, code):
+            self.complete = True
+            self._final_result = "done"
+            return "", False, [], code
+
+        def on_retry(self, kind, attempt):
+            self.retries.append((kind, attempt))
+
+    agent = Agent()
+
+    assert agent.run_loop(max_turns=1) == "done"
+    assert agent.retries == [("syntax", 1)]
+    assert agent.call_messages[0] == []
+    assert agent.call_messages[1][0] == malformed
+    assert "SyntaxError: Model returned an unsupported native tool call" in (
+        agent.call_messages[1][1]["content"][0]["text"]
+    )
+    assert malformed not in agent.conversation.stored_messages()
+    assert corrected in agent.conversation.stored_messages()
 
 
 @pytest.mark.parametrize("kind", ["attachment", "unknown"])
