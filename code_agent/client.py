@@ -98,7 +98,7 @@ from .provider_admission import ProviderAdmission
 from .utils import UsageTracker
 from .llm_registry import get_model_config
 from .convo import Convo
-from .transports import codex, cursor
+from .transports import codex
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, repl_response_to_text, project_repl_tool_history
 
@@ -130,7 +130,6 @@ TRANSPORT_MEDIA_TYPES = {
     "responses": IMAGE_MEDIA_TYPES,
     "messages": IMAGE_MEDIA_TYPES,
     "gemini": IMAGE_MEDIA_TYPES | AUDIO_MEDIA_TYPES,
-    "cursor": set(),
     "codex": IMAGE_MEDIA_TYPES,
 }
 
@@ -326,10 +325,6 @@ class LLMClient:
         return self._attachment_data(block)
 
     def _openai_attachment(self, block):
-        if self.model_config['api_type'] == 'cursor':
-            raise NotImplementedError(
-                "Cursor transport does not support attachments"
-            )
         data_type = block['data_type']
         media_type = block.get('media_type')
         if data_type == 'provider_id':
@@ -922,32 +917,6 @@ class LLMClient:
         finally:
             conn.close()
 
-    def _call_cursor(self, messages, tools):
-        if self.tool_mode != "repl_execute":
-            raise TypeError("Cursor transport requires tool_mode='repl_execute'")
-        messages = self._completions_messages(messages)
-        req = {
-            "model": self.model_config["model"],
-            "messages": messages,
-            "tools": [REPL_EXECUTE_TOOL],
-            **self.model_config.get("config", {}),
-        }
-        response_json = cursor.chat_completions(
-            self.model_config["api_key"],
-            req,
-        )
-        provider_message, stop_reason, usage = _parse_completions_response(response_json)
-        message = {
-            'role': 'assistant',
-            'content': _openai_compatible_message_to_transport_blocks(provider_message),
-            'provider_metadata': {'stop_reason': stop_reason},
-        }
-        message = repl_response_to_text(message)
-        if usage:
-            normalized_usage = self.usage_tracker.log(self.model_name, usage)
-            self._update_input_tokens_per_byte(self._current_input_bytes, normalized_usage)
-        return message
-
     def _call_codex(self, messages, tools):
         req = self._responses_request(messages, tools)
         # Stage idle budgets live in code_agent.transports.codex (60s/30s/30s).
@@ -1302,7 +1271,6 @@ class LLMClient:
             "completions": self._call_completions,
             "responses": self._call_responses,
             "messages": self._call_messages,
-            "cursor": self._call_cursor,
             "codex": self._call_codex,
             "gemini": self._call_gemini,
         }

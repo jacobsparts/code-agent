@@ -376,6 +376,7 @@ def test_audio_attachment_transport_payload(
         "host": "example.test",
         "path": "/v1",
         "config": {},
+        "headers": {},
     }
     monkeypatch.setattr("code_agent.client.get_model_config", lambda name: config)
     monkeypatch.setattr("code_agent.client.DeadlineHTTPSConnection", _Connection)

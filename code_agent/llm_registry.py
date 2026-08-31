@@ -187,44 +187,50 @@ for effort in ('low','medium'):
     )
 
 
-# --- Cursor ---
+# --- Cursor Gateway (local OpenAI-compatible wrapper over Cursor transport) ---
+# The gateway's /v1/code-agent/chat/completions endpoint declares Cursor's
+# native tools on each request and rewrites native tool calls in responses
+# into repl_execute python code, so tool_mode="repl_execute" works unchanged.
 register_provider(
-    "cursor",
-    host=None,
-    path=None,
+    "cursor_gateway",
+    host="127.0.0.1",
+    path="/v1/code-agent/chat/completions",
+    port=8931,
     rpm=60,
     concurrency=5,
+    timeout=1800,
     tools=True,
-    api_type="cursor",
+    api_type="completions",
 )
 register_model(
-    "cursor",
+    "cursor_gateway",
     "composer-2.5",
     model="composer-2.5",
     tool_mode="repl_execute",
     context_window=200_000,
 )
 register_model(
-    "cursor",
-    "grok-4.5",
-    model="cursor-grok-4.5-high",
-    tool_mode="repl_execute",
-    context_window=256_000,
-)
-register_model(
-    "cursor",
+    "cursor_gateway",
     "grok-4.6",
     model="cursor-grok-4.6-high",
     tool_mode="repl_execute",
     context_window=256_000,
 )
 register_model(
-    "cursor",
+    "cursor_gateway",
     "kimi-k3",
     model="kimi-k3-high",
     tool_mode="repl_execute",
     context_window=200_000,
 )
+register_model(
+    "cursor_gateway",
+    "gemini-3.7-flash",
+    model="gemini-3.7-flash-high",
+    tool_mode="repl_execute",
+    context_window=200_000,
+)
+
 
 
 # --- Anthropic ---
