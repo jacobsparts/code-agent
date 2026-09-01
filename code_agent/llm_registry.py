@@ -187,53 +187,8 @@ for effort in ('low','medium'):
     )
 
 
-# --- Cursor Gateway (local OpenAI-compatible wrapper over Cursor transport) ---
-# The gateway's /v1/code-agent/chat/completions endpoint declares Cursor's
-# native tools on each request and rewrites native tool calls in responses
-# into repl_execute python code, so tool_mode="repl_execute" works unchanged.
-register_provider(
-    "cursor_gateway",
-    host="127.0.0.1",
-    path="/v1/code-agent/chat/completions",
-    port=8931,
-    rpm=60,
-    concurrency=5,
-    timeout=1800,
-    tools=True,
-    api_type="completions",
-)
-register_model(
-    "cursor_gateway",
-    "composer-2.5",
-    model="composer-2.5",
-    tool_mode="repl_execute",
-    context_window=200_000,
-)
-register_model(
-    "cursor_gateway",
-    "grok-4.6",
-    model="cursor-grok-4.6-high",
-    tool_mode="repl_execute",
-    context_window=256_000,
-)
-register_model(
-    "cursor_gateway",
-    "kimi-k3",
-    model="kimi-k3-high",
-    tool_mode="repl_execute",
-    context_window=200_000,
-)
-register_model(
-    "cursor_gateway",
-    "gemini-3.7-flash",
-    model="gemini-3.7-flash-high",
-    tool_mode="repl_execute",
-    context_window=200_000,
-)
+### Anthropic ###
 
-
-
-# --- Anthropic ---
 register_provider("anthropic",
     host="api.anthropic.com",
     path="/v1/messages",
@@ -242,13 +197,6 @@ register_provider("anthropic",
     timeout=300,
     tools=True,
     api_type="messages"
-)
-register_model("anthropic","claude-haiku-4-5",
-    model="claude-haiku-4-5",
-    aliases="haiku",
-    input_cost=1.00,
-    cached_cost=0.1,
-    output_cost=5.0,
 )
 register_model("anthropic","claude-sonnet-4-6",
     model="claude-sonnet-4-6",
@@ -265,6 +213,9 @@ register_model("anthropic","claude-opus-5",
     output_cost=25.0,
 )
 
+
+### Google ###
+
 def gemini_token_transform(usage):
     return {
         'prompt_tokens': usage.get('promptTokenCount', 0),
@@ -277,91 +228,24 @@ def gemini_token_transform(usage):
         },
     }
 
-def gemini_cost_transform(prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens,
-                          input_cost, cached_cost, output_cost, reasoning_cost):
-    if prompt_tokens > 200000:
-        input_cost *= 2
-        output_cost *= 1.5
-        reasoning_cost *= 1.5
-    return input_cost, cached_cost, output_cost, reasoning_cost
-
-# --- Google ---
 register_provider("google",
     host="generativelanguage.googleapis.com",
     path="/v1beta",
-    rpm=5,
-    concurrency=3,
+    rpm=60,
+    concurrency=10,
     timeout=None,
     tools=True,
     api_type="gemini",
     token_transform=gemini_token_transform,
-    cost_transform=gemini_cost_transform,
 )
-register_model("google","gemini-3.1-pro",
-    model="gemini-3.1-pro-preview",
+register_model("google","gemini-3.7-flash",
+    model="gemini-3.7-flash",
+    aliases="google/gemini-3.6-flash",
     config={"thinkingLevel": "high"},
-    input_cost=2.00,
-    cached_cost=0.2,
-    output_cost=12.00,
-    reasoning_cost=12.00,
-)
-register_model("google","gemini-3.6-flash",
-    model="gemini-3.6-flash",
-    config={"thinkingLevel": "high"},
-    input_cost=1.5,
+    input_cost=0.75,
     cached_cost=0.15,
-    output_cost=9.00,
-    reasoning_cost=9.00,
+    output_cost=0.075,
 )
-
-# --- X.AI ---
-register_provider("xai",
-    host="api.x.ai",
-    path="/v1/chat/completions",
-    rpm=1000,
-    concurrency=50,
-    timeout=300,
-    tools=False,
-    api_type="completions",
-)
-register_model("xai","grok-4.5",
-    model="grok-4.5",
-    tool_mode="repl_execute",
-    input_cost=2.0,
-    cached_cost=0.5,
-    output_cost=6.0,
-    context_window=500_000,
-    config={"reasoning_effort": "high"},
-)
-
-def cloudflare_response_parser(response_json):
-    result = response_json.get('result', response_json)
-    if 'choices' not in result:
-        raise Exception(f"choices missing from response: {response_json}")
-    choice = result['choices'][0]
-    return choice.get('message', {}), choice.get('finish_reason'), result.get('usage')
-
-register_provider("cloudflare",
-    host="api.cloudflare.com",
-    path=f"/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/ai/run",
-    timeout=900,
-    tools=False,
-    api_type="completions",
-    response_parser=cloudflare_response_parser,
-)
-#register_model("cloudflare","kimi-k2.6",
-#    model="@cf/moonshotai/kimi-k2.6",
-#    path=f"/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/ai/run/@cf/moonshotai/kimi-k2.6",
-#    context_window=262144,
-#    config={
-#        "temperature": 1.0,
-#        "max_tokens": 16384,
-#    },
-#    input_cost=0.95,
-#    cached_cost=0.16,
-#    output_cost=4.0,
-#    tools=False,
-#)
 
 
 # --- User Configuration ---
