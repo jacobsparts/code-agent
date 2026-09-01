@@ -174,6 +174,8 @@ class Convo:
         # never mutated.
         for index, message in enumerate(result):
             content = content_blocks(message.get("content"))
+            if message.get("role") == "assistant":
+                content = [block for block in content if block["type"] != "attachment"]
             attachments = message.pop("_attachments", None)
             if attachments:
                 normalized_attachments = normalize_attachments(attachments)
