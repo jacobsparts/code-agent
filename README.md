@@ -119,8 +119,8 @@ history and bloating the window.
 Code Agent feels like a terminal tool, not a GUI app. Normal scrollback buffer, no
 alternate-screen takeover.
 
-- **`Ctrl+O`** — transcript viewer: inspect the full agent-side conversation, including the
-  Python the model sent and everything it saw
+- **`Ctrl+O`** — transcript viewer: inspect the persisted textual conversation, including
+  attachment placeholders (not attachment payloads)
 - **`/repl`** — drop into the shared REPL yourself, write Python alongside the model,
   inspect state, inject values, then hand back control
 - **`/rewind`**, **`/fork`**, **`/resume`**, **`/subagents`**, **`/skills`**, **`/model`**,

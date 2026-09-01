@@ -18,7 +18,6 @@ dev = [
 
 [project.scripts]
 coda = "code_agent.agent:main"
-repl-benchmark = "code_agent.repl_benchmark.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["code_agent*"]

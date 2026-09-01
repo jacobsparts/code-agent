@@ -44,7 +44,6 @@ Use subagents as an implementation and review pipeline, not as a one-shot delega
    State what the subagent must not implement or modify. Examples:
    - no schema migration;
    - no agentic policy yet;
-   - no unrelated benchmark changes;
    - no commit;
    - preserve an explicit user decision to remove a compatibility API.
 
@@ -110,7 +109,7 @@ Require a real production caller for new abstractions. A helper exercised only b
 Require:
 
 - focused tests;
-- broader non-benchmark suite;
+- broader test suite;
 - syntax compilation;
 - diff validation;
 - final diff inspection;
