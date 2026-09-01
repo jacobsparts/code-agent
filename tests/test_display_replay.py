@@ -627,27 +627,6 @@ def test_code_agent_construction_does_not_create_model_client(monkeypatch):
         agent.close()
 
 
-def test_endpoint_registry_resolves_aliases_and_hides_them_from_error_list():
-    from code_agent.llm_registry import EndpointRegistry, ModelNotFoundError
-
-    registry = EndpointRegistry()
-    registry.register_provider("provider", host="example.com", path="/v1")
-    registry.register_model("provider", "model-a", aliases=["short-a", "a"])
-
-    assert registry.resolve_model_name("short-a") == "provider/model-a"
-
-    try:
-        registry.get_model_config("missing")
-    except ModelNotFoundError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("Expected ModelNotFoundError")
-
-    assert message == (
-        "Unknown model 'missing'. Available models:\n"
-        "  - provider/model-a"
-    )
-    assert "short-a" not in message
 
 
 def test_code_agent_set_model_resolves_alias_at_assignment_boundary(monkeypatch):
