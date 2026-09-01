@@ -42,9 +42,11 @@ class SessionStore:
         with self._connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version == 2:
+                migration_script = (
+                    Path(__file__).resolve().parent / "utility" / "db_migrate_to_v3.py"
+                )
                 raise RuntimeError(
-                    "Database migration required; run "
-                    "./code_agent/utility/db_migrate_to_v3.py"
+                    f"Database migration required; run {migration_script}"
                 )
             if version == 25:
                 raise RuntimeError("Database migration in progress")
