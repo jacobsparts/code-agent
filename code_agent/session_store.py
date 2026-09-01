@@ -592,7 +592,7 @@ class SessionStore:
                     "payload": {
                         "message": {
                             "role": row["role"],
-                            "content": row["content"],
+                            "content": json.loads(row["content"]),
                         }
                     },
                 }

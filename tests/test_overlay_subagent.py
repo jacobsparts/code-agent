@@ -648,7 +648,7 @@ def test_worker_can_fan_out_to_overlay_children_and_apply_results(tmp_path):
                 "choices": [{
                     "message": {
                         "role": "assistant",
-                        "content": response_text,
+                        "content": [{"type": "text", "text": response_text}],
                     },
                     "finish_reason": "stop",
                 }],

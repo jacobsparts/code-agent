@@ -866,8 +866,6 @@ Important:
             out = dict(message)
             blocks = []
             content = out.get("content", [])
-            if isinstance(content, str):
-                content = [{"type": "text", "text": content}]
             media_entries = out.pop(MEDIA_ATTACHMENTS_FIELD, None) or []
             attachment_blocks = [
                 {
@@ -896,8 +894,6 @@ Important:
     def _normalize_malformed_native_tool_calls(message: dict) -> dict:
         """Convert Python calls encoded as empty-args tool names to text."""
         content = message.get("content", [])
-        if isinstance(content, str):
-            return message
         normalized = []
         changed = False
         for block in content:
@@ -931,8 +927,6 @@ Important:
         """Project executable assistant blocks to Python in source order."""
         source = []
         content = message.get("content", [])
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
         for block in sorted(content, key=lambda block: block.get("type") != "attachment"):
             kind = block.get("type")
             if kind == "text":
@@ -961,8 +955,6 @@ Important:
     def _with_corrected_code(message: dict, code: str) -> dict:
         corrected = dict(message)
         content = message.get("content", [])
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
         corrected["content"] = [
             *(
                 block
@@ -1110,14 +1102,9 @@ Call help(function_name) for parameter descriptions.
         except ContextOverflowError:
             if not hasattr(self, "_coalesce_context"):
                 raise
-            boundary_content = (
-                [{"type": "text", "text": "emit(None, release=True)"}]
-                if isinstance(self.conversation, Convo)
-                else "emit(None, release=True)"
-            )
             boundary = self.conversation.append_message({
                 "role": "assistant",
-                "content": boundary_content,
+                "content": [{"type": "text", "text": "emit(None, release=True)"}],
                 "_synthetic": True,
                 "_virtual_interaction_boundary": True,
             })

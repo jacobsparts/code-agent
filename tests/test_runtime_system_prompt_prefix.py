@@ -191,7 +191,7 @@ def test_production_replay_reinstalls_runtime_prefix_provider():
             return [{
                 "seq": 1,
                 "event_type": "message_added",
-                "payload": {"message": {"role": "user", "content": "resumed"}},
+                "payload": {"message": {"role": "user", "content": [{"type": "text", "text": "resumed"}]}},
             }]
 
         def get_session(self, session_id):

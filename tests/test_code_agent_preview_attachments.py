@@ -202,7 +202,7 @@ def test_observe_records_runtime_text_and_commits_metadata():
     assert agent.observe(42) is None
     assert agent.observe("  first\nsecond  ") is None
 
-    message = {"role": "assistant", "content": "observe(value)"}
+    message = {"role": "assistant", "content": [{"type": "text", "text": "observe(value)"}]}
     agent._on_assistant_message_committed(message)
 
     assert message["_observations"] == ["42", "  first\nsecond  "]
@@ -224,7 +224,7 @@ def test_observe_rejects_empty_content():
 
 def test_observe_does_not_pin_or_release():
     agent = make_agent()
-    assistant = {"role": "assistant", "content": "print('previous')"}
+    assistant = {"role": "assistant", "content": [{"type": "text", "text": "print('previous')"}]}
     agent.conversation.append_message(assistant)
     agent.complete = False
     agent._start_assistant_execution_attempt()
@@ -273,7 +273,7 @@ def test_observations_before_runtime_error_remain_on_committed_message():
     finally:
         repl.close()
 
-    message = {"role": "assistant", "content": "observe('kept')\nraise RuntimeError('later failure')"}
+    message = {"role": "assistant", "content": [{"type": "text", "text": "observe('kept')\nraise RuntimeError('later failure')"}]}
     agent._on_assistant_message_committed(message)
 
     assert pure_syntax_error is False
@@ -297,8 +297,8 @@ def test_transition_before_runtime_error_remains_on_committed_message():
     message = {
         "role": "assistant",
         "content": (
-            "observe('kept transition', transition=True)\n"
-            "raise RuntimeError('later failure')"
+            [{"type": "text", "text": "observe('kept transition', transition=True)\n"
+            "raise RuntimeError('later failure')"}]
         ),
     }
     agent._on_assistant_message_committed(message)
@@ -314,7 +314,7 @@ def test_live_ordinary_repl_output_gets_transition_association_without_stdout():
     agent.observe("ordinary output transition", transition=True)
     assistant = {
         "role": "assistant",
-        "content": "observe('ordinary output transition', transition=True)",
+        "content": [{"type": "text", "text": "observe('ordinary output transition', transition=True)"}],
     }
     agent._on_assistant_message_committed(assistant)
     assistant["_event_seq"] = 2
@@ -338,7 +338,7 @@ def test_replay_reconstructs_ordinary_output_association_without_stdout():
             "payload": {
                 "message": {
                     "role": "user",
-                    "content": "task",
+                    "content": [{"type": "text", "text": "task"}],
                     "_user_content": "task",
                     "_render_segments": [{"type": "input", "content": "task"}],
                 }
@@ -350,7 +350,7 @@ def test_replay_reconstructs_ordinary_output_association_without_stdout():
             "payload": {
                 "message": {
                     "role": "assistant",
-                    "content": "observe('stage', transition=True)",
+                    "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
                     "_observation_transition": True,
                 }
             },
@@ -361,7 +361,7 @@ def test_replay_reconstructs_ordinary_output_association_without_stdout():
             "payload": {
                 "message": {
                     "role": "user",
-                    "content": "ordinary output",
+                    "content": [{"type": "text", "text": "ordinary output"}],
                     "_render_segments": [
                         {"type": "stdout", "content": "ordinary output"}
                     ],
@@ -389,7 +389,7 @@ def test_replay_does_not_associate_non_output_user_or_synthetic_messages():
         "payload": {
             "message": {
                 "role": "assistant",
-                "content": "observe('stage', transition=True)",
+                "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
                 "_observation_transition": True,
             }
         },
@@ -397,19 +397,19 @@ def test_replay_does_not_associate_non_output_user_or_synthetic_messages():
     candidates = [
         {
             "role": "user",
-            "content": "ordinary input",
+            "content": [{"type": "text", "text": "ordinary input"}],
             "_user_content": "ordinary input",
             "_render_segments": [{"type": "input", "content": "ordinary input"}],
         },
         {
             "role": "user",
-            "content": "[PreviewRef: session://preview/x]",
+            "content": [{"type": "text", "text": "[PreviewRef: session://preview/x]"}],
             "_synthetic": True,
             "_render_segments": [{"type": "stdout", "content": "preview"}],
         },
         {
             "role": "user",
-            "content": "[Attachment: file.txt]",
+            "content": [{"type": "text", "text": "[Attachment: file.txt]"}],
             "_attachment_refs": {"file.txt": "file.txt"},
         },
     ]
@@ -432,21 +432,18 @@ def test_run_loop_ordinary_output_without_stdout_has_first_checkpoint_marker():
     responses = iter([
         {
             "role": "assistant",
-            "content": "observe('stage', transition=True)",
+            "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
         },
         {
             "role": "assistant",
-            "content": "emit('done', release=True)",
+            "content": [{"type": "text", "text": "emit('done', release=True)"}],
         },
     ])
 
     def call(messages, **kwargs):
         calls.append(messages)
         response = next(responses)
-        return {
-            "role": response["role"],
-            "content": [{"type": "text", "text": response["content"]}],
-        }
+        return response
 
     def execute(repl, content):
         if content.startswith("observe"):
@@ -495,7 +492,7 @@ def test_new_execution_attempt_discards_uncommitted_observations():
     agent.observe("abandoned")
 
     agent._start_assistant_execution_attempt()
-    message = {"role": "assistant", "content": "print('replacement')"}
+    message = {"role": "assistant", "content": [{"type": "text", "text": "print('replacement')"}]}
     agent._on_assistant_message_committed(message)
 
     assert "_observations" not in message
@@ -503,8 +500,8 @@ def test_new_execution_attempt_discards_uncommitted_observations():
 
 def test_pin_marks_previous_assistant_turn():
     agent = make_agent()
-    assistant = {"role": "assistant", "content": "print('important')"}
-    agent.conversation.append_message({"role": "user", "content": "Task", "_user_content": "Task"})
+    assistant = {"role": "assistant", "content": [{"type": "text", "text": "print('important')"}]}
+    agent.conversation.append_message({"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"})
     agent.conversation.append_message(assistant)
 
     result = agent.pin()
@@ -525,14 +522,14 @@ def test_pin_no_previous_turn_is_noop():
 
 def test_pin_can_target_previous_interaction_release_turn():
     agent = make_agent()
-    old_assistant = {"role": "assistant", "content": "print('old')"}
-    release_assistant = {"role": "assistant", "content": "emit('old done', release=True)"}
+    old_assistant = {"role": "assistant", "content": [{"type": "text", "text": "print('old')"}]}
+    release_assistant = {"role": "assistant", "content": [{"type": "text", "text": "emit('old done', release=True)"}]}
     agent.conversation.extend_messages([
-        {"role": "user", "content": "Old task", "_user_content": "Old task"},
+        {"role": "user", "content": [{"type": "text", "text": "Old task"}], "_user_content": "Old task"},
         old_assistant,
-        {"role": "user", "content": ">>> print('old')\nold\n"},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('old')\nold\n"}]},
         release_assistant,
-        {"role": "user", "content": ">>> emit('old done', release=True)\nold done\nNew task", "_user_content": "New task"},
+        {"role": "user", "content": [{"type": "text", "text": ">>> emit('old done', release=True)\nold done\nNew task"}], "_user_content": "New task"},
     ])
 
     result = agent.pin()
@@ -548,8 +545,8 @@ def test_pin_persists_metadata_event_for_existing_persisted_message(tmp_path):
 
     agent = make_persistent_agent(tmp_path)
     agent.conversation.extend_messages([
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('important')"},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('important')"}]},
     ])
     agent._persist_message(agent.conversation.stored_messages()[-2])
     assistant = agent.conversation.stored_messages()[-1]
@@ -574,7 +571,8 @@ def test_pin_persists_metadata_event_for_existing_persisted_message(tmp_path):
     replay_session_into_agent(replayed, agent._session_id, agent._session_store)
     replayed_assistant = next(
         msg for msg in replayed.conversation.stored_messages()
-        if msg.get("role") == "assistant" and msg.get("content") == "print('important')"
+        if msg.get("role") == "assistant"
+        and msg.get("content") == [{"type": "text", "text": "print('important')"}]
     )
     assert replayed_assistant["_pinned_coalesce"] == {"label": "Pinned previous turn"}
 
@@ -585,7 +583,7 @@ def test_observations_survive_message_persistence_and_replay(tmp_path):
     agent = make_persistent_agent(tmp_path)
     message = {
         "role": "assistant",
-        "content": "observe(value)",
+        "content": [{"type": "text", "text": "observe(value)"}],
         "_observations": ["  persisted\nreflection  "],
     }
     agent._persist_message(message)
@@ -612,9 +610,9 @@ def test_replay_reconstructs_observation_counters_across_rewind_exec_and_fork(tm
     store = SessionStore(str(tmp_path / "counter-sessions.db"))
     session_id = store.create_session("/repo", "model")
     messages = [
-        {"role": "assistant", "content": "one"},
-        {"role": "assistant", "content": "observe", "_observations": ["note"]},
-        {"role": "assistant", "content": "three"},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "observe"}], "_observations": ["note"]},
+        {"role": "assistant", "content": [{"type": "text", "text": "three"}]},
     ]
     for seq, message in enumerate(messages, 1):
         store.append_event(session_id, seq, "message_added", {"message": message})
@@ -630,7 +628,7 @@ def test_replay_reconstructs_observation_counters_across_rewind_exec_and_fork(tm
 
     forked = replay(store.fork_session(session_id))
     assert (forked._assistant_turns_since_observation, forked._assistant_turns_since_transition) == (1, 3)
-    forked._update_observation_counters_from_message({"role": "assistant", "content": "fork"})
+    forked._update_observation_counters_from_message({"role": "assistant", "content": [{"type": "text", "text": "fork"}]})
     assert resumed._assistant_turns_since_observation == 1
     assert forked._assistant_turns_since_observation == 2
 
@@ -765,12 +763,12 @@ def test_observation_counters_thresholds_precedence_and_resets():
 
     for _ in range(4):
         agent._update_observation_counters_from_message(
-            {"role": "assistant", "content": "work"}
+            {"role": "assistant", "content": [{"type": "text", "text": "work"}]}
         )
     assert agent._observation_reminder_ephemeral() is None
 
     agent._update_observation_counters_from_message(
-        {"role": "assistant", "content": "work"}
+        {"role": "assistant", "content": [{"type": "text", "text": "work"}]}
     )
     assert "last 5 assistant turns" in agent._observation_reminder_ephemeral()
 
@@ -779,14 +777,14 @@ def test_observation_counters_thresholds_precedence_and_resets():
 
     agent._update_observation_counters_from_message({
         "role": "assistant",
-        "content": "observe",
+        "content": [{"type": "text", "text": "observe"}],
         "_observations": ["kept"],
     })
     assert "No transition observation" in agent._observation_reminder_ephemeral()
 
     agent._update_observation_counters_from_message({
         "role": "assistant",
-        "content": "transition",
+        "content": [{"type": "text", "text": "transition"}],
         "_observations": ["stage"],
         "_observation_transition": True,
     })
@@ -802,7 +800,7 @@ def test_malformed_observation_metadata_and_synthetic_boundaries_do_not_reset_or
 
     agent._update_observation_counters_from_message({
         "role": "assistant",
-        "content": "malformed",
+        "content": [{"type": "text", "text": "malformed"}],
         "_observations": [],
         "_observation_transition": True,
     })
@@ -810,7 +808,7 @@ def test_malformed_observation_metadata_and_synthetic_boundaries_do_not_reset_or
 
     agent._update_observation_counters_from_message({
         "role": "assistant",
-        "content": "emit(None, release=True)",
+        "content": [{"type": "text", "text": "emit(None, release=True)"}],
         "_synthetic": True,
         "_virtual_interaction_boundary": True,
     })
@@ -1000,7 +998,7 @@ def test_replay_attachment_invalidated_removes_attachment_refs(tmp_path):
     store.append_event(session_id, 1, "message_added", {
         "message": {
             "role": "user",
-            "content": "[Attachment: stale.py]",
+            "content": [{"type": "text", "text": "[Attachment: stale.py]"}],
             "_attachment_refs": {"stale.py": "stale.py"},
         }
     })
@@ -1032,7 +1030,7 @@ def test_resume_session_materializes_persisted_attachment_refs(tmp_path):
     store.append_event(session_id, 1, "message_added", {
         "message": {
             "role": "user",
-            "content": "[Attachment: persisted.py]",
+            "content": [{"type": "text", "text": "[Attachment: persisted.py]"}],
             "_attachment_refs": {"persisted.py": "persisted.py"},
         }
     })
@@ -1253,7 +1251,7 @@ class _RejectAudioClient:
         return Convo(self, system)
 
     def call(self, messages, tools=None):
-        return {"role": "assistant", "content": "ok"}
+        return {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
 
     def validate_media_type(self, media_type):
         if media_type.startswith("audio/"):
@@ -1265,7 +1263,7 @@ def test_attach_rejects_audio_before_mutating_existing_attachment(tmp_path):
     existing = TextAttachment("old")
     agent.conversation.append_message({
         "role": "user",
-        "content": "[Attachment: clip.wav]",
+        "content": [{"type": "text", "text": "[Attachment: clip.wav]"}],
         "_attachments": {"clip.wav": existing},
     })
     agent._llm_client = _RejectAudioClient()
@@ -1371,7 +1369,7 @@ def test_typed_image_attachment_persists_and_replays(tmp_path):
     agent = make_persistent_agent(tmp_path)
     message = {
         "role": "user",
-        "content": placeholder,
+        "content": [{"type": "text", "text": placeholder}],
         "_attachments": {"persisted.png": image},
         "_attachment_refs": {"persisted.png": image},
     }
@@ -1389,7 +1387,9 @@ def test_typed_image_attachment_persists_and_replays(tmp_path):
     replay_session_into_agent(replayed, agent._session_id, agent._session_store)
     replayed_message = replayed.conversation.stored_messages()[-1]
 
-    assert replayed_message["content"] == placeholder
+    assert replayed_message["content"] == [
+        {"type": "text", "text": placeholder}
+    ]
     assert replayed_message["_attachments"]["persisted.png"] == image
     assert replayed_message["_attachment_refs"]["persisted.png"] == image
     projected = replayed.conversation.projected_messages()[-1]

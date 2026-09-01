@@ -356,17 +356,6 @@ def test_run_loop_retries_unsupported_native_tool_call_as_syntax_error():
     assert corrected in agent.conversation.stored_messages()
 
 
-@pytest.mark.parametrize("kind", ["attachment", "unknown"])
-def test_assistant_code_fails_closed_for_other_non_executable_blocks(kind):
-    block = {"type": kind}
-    if kind == "attachment":
-        block.update(media_type="image/png", data_type="bytes", data=b"x")
-
-    with pytest.raises(NotImplementedError):
-        REPLMixin._assistant_code({
-            "role": "assistant",
-            "content": [block],
-        })
 
 
 def test_dead_tool_repl_worker_restart_is_normal_repl_output():

@@ -504,7 +504,7 @@ class Pipeline:
         self.reasoning_log.append({"stage": stage, "message": message, "data": data})
 
     def _capture_trace(self, stage, agent):
-        self.traces[stage] = list(agent.conversation.messages)
+        self.traces[stage] = list(agent.conversation.stored_messages())
 
     def run(self):
         try:

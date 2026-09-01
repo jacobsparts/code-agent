@@ -16,9 +16,7 @@ from code_agent.session_message_state import reduce_canonical_message_events
 
 
 def _content_text(message: dict) -> str:
-    content = message.get("content") or ""
-    if isinstance(content, str):
-        return content
+    content = message.get("content") or []
     return "\n".join(
         block.get("text", "")
         for block in content
@@ -27,11 +25,7 @@ def _content_text(message: dict) -> str:
 
 
 def _replace_text_content(message: dict, text: str) -> None:
-    content = message.get("content")
-    if isinstance(content, list):
-        message["content"] = [{"type": "text", "text": text}]
-    else:
-        message["content"] = text
+    message["content"] = [{"type": "text", "text": text}]
 
 
 @dataclass(frozen=True)
@@ -69,8 +63,8 @@ def _input_segments(message: dict) -> list[tuple[str, int]]:
         return [(content, seq)]
     if is_repl_output_message(message):
         return []
-    content = message.get("content")
-    if isinstance(content, str) and content and type(seq) is int:
+    content = _content_text(message)
+    if content and type(seq) is int:
         return [(content, seq)]
     return []
 

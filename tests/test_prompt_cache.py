@@ -50,17 +50,6 @@ def test_convo_preserves_explicit_canonical_block_lists():
     assert user["content"] is blocks
 
 
-def test_convo_projection_repairs_raw_list_payloads():
-    client = CanonicalClient()
-    convo = Convo(client, "system")
-    rows = [{"ticketid": 123}]
-    convo.append_message({"role": "user", "content": rows})
-
-    projected = convo.projected_messages()
-
-    assert projected[-1]["content"] == [
-        {"type": "text", "text": json.dumps(rows)}
-    ]
 
 
 def test_convo_stores_and_calls_canonical_messages_without_projection():
@@ -93,26 +82,6 @@ def test_convo_stores_and_calls_canonical_messages_without_projection():
     assert convo.stored_messages()[-1] is response
 
 
-def test_convo_call_normalizes_explicit_list_payloads():
-    client = CanonicalClient()
-    convo = Convo(client, "system")
-    rows = [{"ticketid": 123}]
-
-    convo.call(
-        [{"role": "user", "content": rows}],
-        additional_messages=[{"role": "user", "content": []}],
-    )
-
-    assert client.calls[0][0] == [
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": json.dumps(rows)}],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": "[]"}],
-        },
-    ]
 
 
 def test_convo_call_accepts_explicit_canonical_messages():
@@ -338,7 +307,7 @@ class _Connection:
     [
         (
             "completions",
-            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+            {"choices": [{"message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}]},
             {
                 "type": "input_audio",
                 "input_audio": {"data": "UklGRgQAAABXQVZFZGF0YQ==", "format": "wav"},
@@ -446,7 +415,7 @@ def test_openai_response_image_decodes_to_canonical_attachment():
 
     blocks = _openai_compatible_message_to_transport_blocks({
         "role": "assistant",
-        "content": "done",
+        "content": [{"type": "text", "text": "done"}],
         "images": [{
             "type": "image_url",
             "image_url": {"url": "https://example.test/result.png"},

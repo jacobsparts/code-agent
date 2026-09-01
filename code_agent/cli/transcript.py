@@ -1,35 +1,10 @@
 """Code-agent transcript viewer."""
 
 from .pager import pager_ui
-from code_agent.convo import materialize_attachments
-
-
-def _llm_visible_message(msg: dict) -> dict:
-    out = {k: v for k, v in msg.items() if not k.startswith("_")}
-    attachments = msg.get("_attachments") or {}
-    if not attachments:
-        return out
-    content = out.get("content")
-    if isinstance(content, list):
-        blocks = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text, _ = materialize_attachments(block.get("text", ""), attachments)
-                blocks.append({**block, "text": text})
-            else:
-                blocks.append(block)
-        out["content"] = blocks
-        return out
-    text, _ = materialize_attachments(str(content or ""), attachments)
-    out["content"] = text
-    return out
 
 
 def _message_text(msg: dict) -> str:
-    visible = _llm_visible_message(msg)
-    content = visible.get("content")
-    if isinstance(content, str):
-        return content
+    content = msg.get("content") or []
     return "\n".join(
         block.get("text", "")
         for block in content

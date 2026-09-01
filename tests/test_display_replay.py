@@ -44,12 +44,12 @@ def test_replay_display_text_respects_rewind():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> first\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("one", release=True)',
+            "content": [{"type": "text", "text": 'emit("one", release=True)'}],
         }}},
         {"seq": 3, "event_type": "display", "payload": {"kind": "input", "text": "> second\n\n"}},
         {"seq": 4, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("two", release=True)',
+            "content": [{"type": "text", "text": 'emit("two", release=True)'}],
         }}},
         {"seq": 5, "event_type": "rewind", "payload": {"target_seq": 2}},
         {"seq": 6, "event_type": "display", "payload": {"kind": "input", "text": "> third\n\n"}},
@@ -83,7 +83,7 @@ def test_replay_display_text_respects_exec():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> first\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("one", release=True)',
+            "content": [{"type": "text", "text": 'emit("one", release=True)'}],
         }}},
         {"seq": 3, "event_type": "exec", "payload": {}},
         {"seq": 4, "event_type": "display", "payload": {"kind": "status", "text": "Session reset.\n"}},
@@ -110,11 +110,11 @@ def test_replay_session_into_agent_exec_resets_messages_and_preview_refs():
             conversation.expanded_preview_refs = self._expanded_preview_refs
 
     store = DummyStore([
-        {"seq": 1, "event_type": "message_added", "payload": {"message": {"role": "user", "content": "first"}}},
+        {"seq": 1, "event_type": "message_added", "payload": {"message": {"role": "user", "content": [{"type": "text", "text": "first"}]}}},
         {"seq": 2, "event_type": "preview_expanded", "payload": {"uri": "session://preview/old", "numbered": False}},
-        {"seq": 3, "event_type": "message_added", "payload": {"message": {"role": "assistant", "content": "old"}}},
+        {"seq": 3, "event_type": "message_added", "payload": {"message": {"role": "assistant", "content": [{"type": "text", "text": "old"}]}}},
         {"seq": 4, "event_type": "exec", "payload": {}},
-        {"seq": 5, "event_type": "message_added", "payload": {"message": {"role": "user", "content": "continuation"}}},
+        {"seq": 5, "event_type": "message_added", "payload": {"message": {"role": "user", "content": [{"type": "text", "text": "continuation"}]}}},
     ])
     store.get_session = lambda session_id: {"cwd": "."}
 
@@ -123,7 +123,7 @@ def test_replay_session_into_agent_exec_resets_messages_and_preview_refs():
 
     assert agent.conversation.stored_messages() == [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
-        {"role": "user", "content": "continuation", "_event_seq": 5},
+        {"role": "user", "content": [{"type": "text", "text": "continuation"}], "_event_seq": 5},
     ]
     assert agent._expanded_preview_refs == {}
 
@@ -165,7 +165,7 @@ def test_replay_only_deepcopies_lists_for_required_snapshots(monkeypatch):
         {
             "seq": seq,
             "event_type": "message_added",
-            "payload": {"message": {"role": "user", "content": str(seq)}},
+            "payload": {"message": {"role": "user", "content": [{"type": "text", "text": str(seq)}]}},
         }
         for seq in range(1, 101)
     ]
@@ -180,10 +180,10 @@ def test_code_agent_coalesce_suppresses_invalid_escape_parse_warnings():
 
     messages = [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
-        {"role": "user", "content": "q1"},
-        {"role": "assistant", "content": 'emit("a1\\[", release=True)'},
-        {"role": "user", "content": "q2"},
-        {"role": "assistant", "content": 'emit("a2\\[", release=True)'},
+        {"role": "user", "content": [{"type": "text", "text": "q1"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": 'emit("a1\\[", release=True)'}]},
+        {"role": "user", "content": [{"type": "text", "text": "q2"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": 'emit("a2\\[", release=True)'}]},
     ]
 
     with warnings.catch_warnings(record=True) as rec:
@@ -206,7 +206,7 @@ def test_replay_display_text_suppresses_invalid_escape_parse_warnings():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("answer\\$", release=True)',
+            "content": [{"type": "text", "text": 'emit("answer\\$", release=True)'}],
         }}},
     ])
 
@@ -281,7 +281,7 @@ def test_replay_display_text_ignores_virtual_interaction_boundary():
             "payload": {
                 "message": {
                     "role": "assistant",
-                    "content": "emit(None, release=True)",
+                    "content": [{"type": "text", "text": "emit(None, release=True)"}],
                     "_synthetic": True,
                     "_virtual_interaction_boundary": True,
                 }
@@ -298,12 +298,12 @@ def test_replay_display_text_keeps_prior_display_after_rewind():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> first\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("one", release=True)',
+            "content": [{"type": "text", "text": 'emit("one", release=True)'}],
         }}},
         {"seq": 3, "event_type": "display", "payload": {"kind": "input", "text": "> second\n\n"}},
         {"seq": 4, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("two", release=True)',
+            "content": [{"type": "text", "text": 'emit("two", release=True)'}],
         }}},
         {"seq": 5, "event_type": "rewind", "payload": {"target_seq": 2}},
         {"seq": 6, "event_type": "display", "payload": {"kind": "status", "text": "Conversation rewound.\n"}},
@@ -318,14 +318,14 @@ def test_replay_display_text_stops_after_release_until_next_input():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("answer", release=True)',
+            "content": [{"type": "text", "text": 'emit("answer", release=True)'}],
         }}},
         {"seq": 3, "event_type": "display", "payload": {"kind": "python", "text": "debug work\n"}},
         {"seq": 4, "event_type": "display", "payload": {"kind": "status", "text": "Loading CLAUDE.md\n"}},
         {"seq": 5, "event_type": "display", "payload": {"kind": "input", "text": "> next\n\n"}},
         {"seq": 6, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("next answer", release=True)',
+            "content": [{"type": "text", "text": 'emit("next answer", release=True)'}],
         }}},
     ])
 
@@ -338,7 +338,7 @@ def test_replay_display_text_prefers_persisted_final_result():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": "emit(result, release=True)",
+            "content": [{"type": "text", "text": "emit(result, release=True)"}],
             "_final_result": "computed answer",
         }}},
     ])
@@ -352,7 +352,7 @@ def test_replay_display_text_extracts_multiline_concatenated_emit_literal():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit(\n    "Done.\\n\\n"\n    "Added entrypoint",\n    release=True,\n)',
+            "content": [{"type": "text", "text": 'emit(\n    "Done.\\n\\n"\n    "Added entrypoint",\n    release=True,\n)'}],
         }}},
     ])
 
@@ -365,7 +365,7 @@ def test_replay_display_text_ignores_emit_inside_string_literal():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'Path("x.py").write_text("""def f():\n    emit(\"55\", release=True)\n""")',
+            "content": [{"type": "text", "text": 'Path("x.py").write_text("""def f():\n    emit(\"55\", release=True)\n""")'}],
         }}},
         {"seq": 3, "event_type": "display", "payload": {"kind": "input", "text": "> next\n\n"}},
     ])
@@ -379,7 +379,7 @@ def test_replay_display_text_does_not_duplicate_emit_display_event():
         {"seq": 1, "event_type": "display", "payload": {"kind": "input", "text": "> question\n\n"}},
         {"seq": 2, "event_type": "message_added", "payload": {"message": {
             "role": "assistant",
-            "content": 'emit("answer", release=True)',
+            "content": [{"type": "text", "text": 'emit("answer", release=True)'}],
         }}},
         {"seq": 3, "event_type": "display", "payload": {"kind": "emit", "text": "answer\n"}},
     ])
@@ -805,7 +805,7 @@ def test_persisted_preview_replay_does_not_load_blob_content(tmp_path, monkeypat
 
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]}})
     store.save_preview_blob(session_id, "abc", "one")
     _append_preview_events(store,
         session_id,
@@ -868,9 +868,9 @@ def test_persisted_preview_replay_rejects_malformed_missing_partial_and_cross_ex
 
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "old"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "old"}]}})
     store.append_event(session_id, 2, "exec", {})
-    store.append_event(session_id, 3, "message_added", {"message": {"role": "user", "content": "new"}})
+    store.append_event(session_id, 3, "message_added", {"message": {"role": "user", "content": [{"type": "text", "text": "new"}]}})
     store.save_preview_blob(session_id, "abc", "new")
     store.append_event(session_id, 4, "preview_created", {"preview_key": "abc", "summary": "ok"})
     store.append_event(session_id, 5, "preview_placed", {
@@ -888,7 +888,7 @@ def test_persisted_preview_replay_rejects_malformed_missing_partial_and_cross_ex
 
     assert agent.conversation.stored_messages() == [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
-        {"role": "user", "content": "new", "_event_seq": 3},
+        {"role": "user", "content": [{"type": "text", "text": "new"}], "_event_seq": 3},
     ]
 
 
@@ -901,7 +901,7 @@ def test_rewind_restores_preview_expansion_and_rendered_conversation(tmp_path):
     store.save_preview_blob(session_id, "abc", "expanded body")
     uri = "session://preview/abc"
     store.append_event(session_id, 1, "message_added", {
-        "message": {"role": "user", "content": f"[PreviewRef: {uri}]\nsummary\n[/PreviewRef]"}
+        "message": {"role": "user", "content": [{"type": "text", "text": f"[PreviewRef: {uri}]\nsummary\n[/PreviewRef]"}]}
     })
     store.append_event(session_id, 2, "preview_expanded", {"uri": uri, "numbered": False})
     store.append_event(session_id, 3, "preview_collapsed", {"uri": uri})
@@ -926,7 +926,7 @@ def test_rewind_restores_collapsed_state_after_later_expand(tmp_path):
     uri = "session://preview/abc"
     store.save_preview_blob(session_id, "abc", "expanded body")
     store.append_event(session_id, 1, "message_added", {
-        "message": {"role": "user", "content": f"[PreviewRef: {uri}]\nsummary\n[/PreviewRef]"}
+        "message": {"role": "user", "content": [{"type": "text", "text": f"[PreviewRef: {uri}]\nsummary\n[/PreviewRef]"}]}
     })
     store.append_event(session_id, 2, "preview_expanded", {"uri": uri, "numbered": False})
     store.append_event(session_id, 3, "preview_collapsed", {"uri": uri})
@@ -946,7 +946,7 @@ def test_replay_duplicate_is_idempotent_and_same_range_replacement_wins(tmp_path
 
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]}})
     for key in ("a", "b"):
         store.save_preview_blob(session_id, key, "one")
     store.append_event(session_id, 2, "preview_created", {"preview_key": "a", "summary": "first"})
@@ -974,10 +974,10 @@ def test_create_resume_expand_fork_resume_end_to_end(tmp_path):
 
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "body"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "body"}]}})
     messages = [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
-        {"role": "assistant", "content": "body", "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "body"}], "_event_seq": 1},
     ]
     projected, key, created_seq, placed_seq = create_persisted_preview(
         messages, Preview("summary"), source_start_seq=1, source_end_seq=1,
@@ -1028,7 +1028,7 @@ def test_adversarial_history_shared_authoritative_state_matches_replay_and_allow
         store.save_preview_blob(session_id, key, content)
 
     events = [
-        (1, "message_added", {"message": {"role": "assistant", "content": "one"}}),
+        (1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]}}),
         (2, "preview_created", {"preview_key": "valid", "summary": "bad", "extra": 1}),
         (3, "preview_created", {"preview_key": "missing", "summary": "missing"}),
         (4, "preview_created", {"preview_key": "valid", "summary": ""}),
@@ -1040,11 +1040,11 @@ def test_adversarial_history_shared_authoritative_state_matches_replay_and_allow
         (10, "preview_placed", {"preview_event_seq": 9, "source_start_seq": 1, "source_end_seq": 1}),
         (11, "preview_created", {"preview_key": "other", "summary": "conflict"}),
         (12, "preview_placed", {"preview_event_seq": 11, "source_start_seq": 1, "source_end_seq": 1}),
-        (13, "message_added", {"message": {"role": "assistant", "content": "two"}}),
+        (13, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]}}),
         (14, "preview_created", {"preview_key": "other", "summary": "partial"}),
         (15, "preview_placed", {"preview_event_seq": 14, "source_start_seq": 1, "source_end_seq": 13}),
         (16, "exec", {}),
-        (17, "message_added", {"message": {"role": "assistant", "content": "post"}}),
+        (17, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "post"}]}}),
         (18, "preview_created", {"preview_key": "post", "summary": "cross exec"}),
         (19, "preview_placed", {"preview_event_seq": 18, "source_start_seq": 13, "source_end_seq": 17}),
         (20, "preview_created", {"preview_key": "valid", "summary": "malformed before rewind", "extra": False}),

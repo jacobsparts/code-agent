@@ -30,16 +30,16 @@ def interaction(i, work_size=2500):
     work = f"print({i})\n" + ("x" * work_size)
     output = f">>> print({i})\n{i}\n" + ("y" * work_size)
     return [
-        {"role": "user", "content": f"Task {i}", "_user_content": f"Task {i}"},
-        {"role": "assistant", "content": work},
-        {"role": "user", "content": output},
-        {"role": "assistant", "content": f"emit('Done {i}', release=True)"},
-        {"role": "user", "content": f">>> emit('Done {i}', release=True)\nDone {i}\n"},
+        {"role": "user", "content": [{"type": "text", "text": f"Task {i}"}], "_user_content": f"Task {i}"},
+        {"role": "assistant", "content": [{"type": "text", "text": work}]},
+        {"role": "user", "content": [{"type": "text", "text": output}]},
+        {"role": "assistant", "content": [{"type": "text", "text": f"emit('Done {i}', release=True)"}]},
+        {"role": "user", "content": [{"type": "text", "text": f">>> emit('Done {i}', release=True)\nDone {i}\n"}]},
     ]
 
 
 def five_interactions():
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     for i in range(5):
         messages.extend(interaction(i))
     return messages
@@ -49,11 +49,11 @@ def _source_tagged_interaction(body):
     messages = [
         {
             "role": "system",
-            "content": "system",
+            "content": [{"type": "text", "text": "system"}],
         },
         {
             "role": "user",
-            "content": "Task",
+            "content": [{"type": "text", "text": "Task"}],
             "_user_content": "Task",
             "_event_seq": 1,
             "_render_segments": [
@@ -73,9 +73,9 @@ def _source_tagged_interaction(body):
 
 def test_shared_deterministic_derivation_matches_production_ordinary():
     messages = _source_tagged_interaction([
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('done', release=True)"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
     ])
 
     derived, keys, materialized = deterministic_interaction_replacement(
@@ -105,23 +105,23 @@ def test_shared_derivation_matches_pinned_attachments_observations_and_nested_re
     messages = _source_tagged_interaction([
         {
             "role": "assistant",
-            "content": "normal work\n" + ("x" * 2500),
+            "content": [{"type": "text", "text": "normal work\n" + ("x" * 2500)}],
             "_observations": ["Normal observation."],
             "_attachments": {"a.py": "body"},
             "_attachment_refs": {"b.py": "session://preview/blob"},
         },
         {
             "role": "user",
-            "content": f">>> normal\n{nested}\n" + ("y" * 2500),
+            "content": [{"type": "text", "text": f">>> normal\n{nested}\n" + ("y" * 2500)}],
         },
         {
             "role": "assistant",
-            "content": "pinned work",
+            "content": [{"type": "text", "text": "pinned work"}],
             "_pinned_coalesce": {"label": "Pinned"},
             "_observations": ["Pinned observation."],
         },
-        {"role": "user", "content": ">>> pinned\npinned\n"},
-        {"role": "assistant", "content": "emit('done', release=True)"},
+        {"role": "user", "content": [{"type": "text", "text": ">>> pinned\npinned\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
     ])
     preserved = {nested_uri: nested}
 
@@ -209,15 +209,15 @@ def test_preview_key_depends_only_on_canonical_content():
 def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
     saved = {}
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {
             "role": "assistant",
-            "content": "observe(value)\n" + ("x" * 2500),
+            "content": [{"type": "text", "text": "observe(value)\n" + ("x" * 2500)}],
             "_observations": ["First.", 123, "", "Second."],
         },
-        {"role": "user", "content": ">>> observe(value)\n'[Continuing...]'\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "user", "content": [{"type": "text", "text": ">>> observe(value)\n'[Continuing...]'\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(
@@ -240,19 +240,19 @@ def test_transition_boundary_observation_is_used_without_changing_preview_blob()
     saved = {}
     transition = "observe('stage summary', transition=True)"
     messages = _source_tagged_interaction([
-        {"role": "assistant", "content": "work\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> work\n" + ("y" * 2500)},
+        {"role": "assistant", "content": [{"type": "text", "text": "work\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> work\n" + ("y" * 2500)}]},
         {
             "role": "assistant",
-            "content": transition,
+            "content": [{"type": "text", "text": transition}],
             "_observations": ["stage summary"],
             "_observation_transition": True,
         },
         {
             "role": "user",
-            "content": f">>> {transition}\n'[Continuing...]'\n",
+            "content": [{"type": "text", "text": f">>> {transition}\n'[Continuing...]'\n"}],
         },
-        {"role": "assistant", "content": "emit('done', release=True)"},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
     ])
 
     projected = coalesce_repl_messages(
@@ -272,18 +272,18 @@ def test_transition_boundary_observation_is_used_without_changing_preview_blob()
 
 def test_pinned_and_normal_sections_keep_their_own_observations():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('normal')\n" + ("x" * 2500), "_observations": ["Normal only."]},
-        {"role": "user", "content": ">>> print('normal')\nnormal\n" + ("y" * 2500)},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('normal')\n" + ("x" * 2500)}], "_observations": ["Normal only."]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('normal')\nnormal\n" + ("y" * 2500)}]},
         {
             "role": "assistant",
-            "content": "print('pinned')",
+            "content": [{"type": "text", "text": "print('pinned')"}],
             "_pinned_coalesce": {"label": "Pinned previous turn"},
             "_observations": ["Pinned only."],
         },
-        {"role": "user", "content": ">>> print('pinned')\npinned\n"},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('pinned')\npinned\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(
@@ -312,7 +312,7 @@ def test_keeps_last_three_interactions_uncoalesced():
 
 def test_preserves_real_user_inputs_and_release_assistant_messages():
     saved = {}
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     messages.extend(interaction(0))
 
     projected = coalesce_repl_messages(
@@ -324,14 +324,18 @@ def test_preserves_real_user_inputs_and_release_assistant_messages():
     )
 
     assert any(m["role"] == "user" and m.get("_user_content") == "Task 0" for m in projected)
-    assert any(m["role"] == "assistant" and m["content"] == "emit('Done 0', release=True)" for m in projected)
-    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
+    assert any(
+        m["role"] == "assistant"
+        and _blocks_text(m["content"]) == "emit('Done 0', release=True)"
+        for m in projected
+    )
+    visible = "\n".join(_blocks_text(m.get("content") or []) for m in projected)
     assert "x" * 600 not in visible
     assert list(saved.values())[0].startswith("print(0)")
 
 
 def test_saves_preview_blob_deterministically():
-    messages = [{"role": "system", "content": "system"}] + interaction(0)
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + interaction(0)
     saved1 = {}
     saved2 = {}
 
@@ -345,7 +349,7 @@ def test_saves_preview_blob_deterministically():
 
 
 def test_skips_small_interactions():
-    messages = [{"role": "system", "content": "system"}] + interaction(0, work_size=1)
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + interaction(0, work_size=1)
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
 
@@ -353,7 +357,7 @@ def test_skips_small_interactions():
 
 
 def test_can_coalesce_last_interactions_for_resume_compaction():
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     messages.extend(five_interactions())
 
     default = coalesce_repl_messages(
@@ -379,16 +383,16 @@ def test_can_coalesce_last_interactions_for_resume_compaction():
 
 def test_attachment_placeholders_and_payloads_survive():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "view('src/foo.py')\n" + ("x" * 2500)},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "view('src/foo.py')\n" + ("x" * 2500)}]},
         {
             "role": "user",
-            "content": ">>> view('src/foo.py')\n[Attachment: src/foo.py]\n" + ("y" * 2500),
+            "content": [{"type": "text", "text": ">>> view('src/foo.py')\n[Attachment: src/foo.py]\n" + ("y" * 2500)}],
             "_attachments": {"src/foo.py": "    1→print('hi')"},
             "_attachment_refs": {"src/foo.py": "src/foo.py"},
         },
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -402,11 +406,11 @@ def test_attachment_placeholders_and_payloads_survive():
 def test_nested_preview_refs_remain_placeholders():
     saved = {}
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "preview(value)\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> preview(value)\n[PreviewRef: session://preview/abc]\n(1 lines, 30000 chars)\n[/PreviewRef]\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "preview(value)\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> preview(value)\n[PreviewRef: session://preview/abc]\n(1 lines, 30000 chars)\n[/PreviewRef]\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
@@ -418,14 +422,14 @@ def test_nested_preview_refs_remain_placeholders():
 
 def test_appended_user_content_is_preserved():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
         {
             "role": "user",
-            "content": ">>> emit('Done', release=True)\nDone\nNext task",
+            "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\nNext task"}],
             "_stdout": ">>> emit('Done', release=True)\nDone\nNext task",
             "_user_content": "Next task",
         },
@@ -440,25 +444,29 @@ def test_appended_user_content_is_preserved():
 def test_release_output_is_preserved_live_not_saved_to_preview():
     saved = {}
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
-        {"role": "user", "content": ">>> emit('Done', release=True)\nDone\nextra line\n"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\nextra line\n"}]},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
-    visible = _blocks_text("\n".join(_blocks_text(m.get("content") or "") for m in projected))
+    visible = "\n".join(_blocks_text(m.get("content") or []) for m in projected)
 
-    assert any(m["role"] == "assistant" and m["content"] == "emit('Done', release=True)" for m in projected)
+    assert any(
+        m["role"] == "assistant"
+        and _blocks_text(m["content"]) == "emit('Done', release=True)"
+        for m in projected
+    )
     assert ">>> emit('Done', release=True)" in visible
     assert "Done\nextra line" in visible
     assert "extra line" not in next(iter(saved.values()))
 
 
 def test_coalesced_messages_are_synthetic():
-    messages = [{"role": "system", "content": "system"}] + interaction(0)
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + interaction(0)
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
     coalesced = next(m for m in projected if m.get("_coalesced"))
@@ -470,7 +478,7 @@ def test_coalesced_messages_are_synthetic():
 
 
 def test_coalesce_is_idempotent_on_projected_messages():
-    messages = [{"role": "system", "content": "system"}] + interaction(0)
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + interaction(0)
     saved = {}
 
     projected = coalesce_repl_messages(
@@ -494,11 +502,11 @@ def test_coalesce_is_idempotent_on_projected_messages():
 
 def test_release_detection_accepts_emit_value_metadata_when_final_result_is_none():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit(result, release=True)", "_final_result": None, "_emit_value": ""},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit(result, release=True)"}], "_final_result": None, "_emit_value": ""},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -509,11 +517,11 @@ def test_release_detection_accepts_emit_value_metadata_when_final_result_is_none
 
 def test_release_detection_finds_top_level_emit_after_non_emit_work():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "result = 'done'\nemit(result, release=True)"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "result = 'done'\nemit(result, release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -523,11 +531,11 @@ def test_release_detection_finds_top_level_emit_after_non_emit_work():
 
 def test_render_segment_input_is_preserved_as_real_user_input():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "displayed", "_render_segments": [{"type": "input", "content": "Segment task"}]},
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('x')\nx\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "displayed"}], "_render_segments": [{"type": "input", "content": "Segment task"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -540,11 +548,11 @@ def test_omitted_echo_is_reconstructed_in_preview_blob():
     saved = {}
     code = "for i in range(2):\n    print(i)"
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": code + "\n" + ("x" * 2500)},
-        {"role": "user", "content": "[content omitted from echo]\n0\n1\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": code + "\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": "[content omitted from echo]\n0\n1\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
@@ -556,16 +564,16 @@ def test_omitted_echo_is_reconstructed_in_preview_blob():
 
 def test_attachment_placeholder_order_is_first_seen_and_deduplicated():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "work\n" + ("x" * 2500)},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "work\n" + ("x" * 2500)}]},
         {
             "role": "user",
-            "content": ">>> work\n[Attachment: b.py]\n[Attachment: a.py]\n[Attachment: b.py]\n" + ("y" * 2500),
+            "content": [{"type": "text", "text": ">>> work\n[Attachment: b.py]\n[Attachment: a.py]\n[Attachment: b.py]\n" + ("y" * 2500)}],
             "_attachments": {"a.py": "a", "c.py": "c"},
             "_attachment_refs": {"d.py": "d"},
         },
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -577,7 +585,7 @@ def test_attachment_placeholder_order_is_first_seen_and_deduplicated():
 
 def test_small_interaction_does_not_save_preview_blob():
     saved = {}
-    messages = [{"role": "system", "content": "system"}] + interaction(0, work_size=1)
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + interaction(0, work_size=1)
 
     projected = coalesce_repl_messages(
         messages,
@@ -595,9 +603,9 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
-    class Conversation:
+    class ConversationStub:
         def __init__(self):
-            self._messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
 
         def message(self, index):
             return copy.deepcopy(self._messages[index])
@@ -610,7 +618,7 @@ def test_replay_then_coalesce_keeps_raw_events_unmodified_and_reapplies_projecti
 
     class Agent:
         def __init__(self):
-            self.conversation = Conversation()
+            self.conversation = ConversationStub()
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -655,9 +663,9 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
-    class Conversation:
+    class ConversationStub:
         def __init__(self):
-            self._messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
 
         def message(self, index):
             return copy.deepcopy(self._messages[index])
@@ -670,7 +678,7 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
 
     class Agent:
         def __init__(self):
-            self.conversation = Conversation()
+            self.conversation = ConversationStub()
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -717,20 +725,20 @@ def test_preview_expansion_event_survives_resume_replay_for_coalesced_preview(tm
 
 def test_coalesce_preserves_expanded_preview_ref_placeholder():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('x')\n" + ("x" * 2500)},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
         {
             "role": "user",
             "content": (
-                ">>> print('x')\n"
+                [{"type": "text", "text": ">>> print('x')\n"
                 "[PreviewRef: session://preview/keep]\n"
                 "(1 lines, 10 chars)\n"
                 "[/PreviewRef]\n"
-                + ("y" * 2500)
+                + ("y" * 2500)}]
             ),
         },
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     projected = coalesce_repl_messages(
@@ -763,7 +771,7 @@ def test_actual_expanded_preview_refs_include_replayed_expanded_state(tmp_path):
     agent._configure_conversation(agent.conversation)
     agent.conversation.append_message({
         "role": "user",
-        "content": "[Assistant work and REPL output coalesced into preview]",
+        "content": [{"type": "text", "text": "[Assistant work and REPL output coalesced into preview]"}],
         "_synthetic": True,
         "_coalesced": True,
     })
@@ -781,9 +789,9 @@ def test_resume_replay_leaves_path_attachment_refs_for_code_agent_worker_materia
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
-    class Conversation:
+    class ConversationStub:
         def __init__(self):
-            self._messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
 
         def message(self, index):
             return copy.deepcopy(self._messages[index])
@@ -796,7 +804,7 @@ def test_resume_replay_leaves_path_attachment_refs_for_code_agent_worker_materia
 
     class Agent:
         def __init__(self):
-            self.conversation = Conversation()
+            self.conversation = ConversationStub()
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
@@ -810,7 +818,7 @@ def test_resume_replay_leaves_path_attachment_refs_for_code_agent_worker_materia
     store.append_event(session_id, 1, "message_added", {
         "message": {
             "role": "user",
-            "content": "[Attachment: rel.py]",
+            "content": [{"type": "text", "text": "[Attachment: rel.py]"}],
             "_attachment_refs": {"rel.py": "rel.py"},
         }
     })
@@ -829,14 +837,14 @@ def test_resume_replay_leaves_path_attachment_refs_for_code_agent_worker_materia
 def test_pinned_turn_creates_auto_expanded_preview_ref():
     saved = {}
     auto_expand = []
-    messages = [{"role": "system", "content": "system"}] + [
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('unpinned')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('unpinned')\nunpinned\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "print('important')", "_pinned_coalesce": {"label": "Pinned previous turn"}},
-        {"role": "user", "content": ">>> print('important')\nimportant\n"},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
-        {"role": "user", "content": ">>> emit('Done', release=True)\nDone\n"},
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + [
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('unpinned')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('unpinned')\nunpinned\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('important')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('important')\nimportant\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\n"}]},
     ]
 
     projected = coalesce_repl_messages(
@@ -859,12 +867,12 @@ def test_pinned_turn_creates_auto_expanded_preview_ref():
 def test_pinned_turn_without_repl_output_is_preserved():
     saved = {}
     auto_expand = []
-    messages = [{"role": "system", "content": "system"}] + [
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "think('important')", "_pinned_coalesce": {"label": "Pinned previous turn"}},
-        {"role": "assistant", "content": "print('work')\n" + ("x" * 2500)},
-        {"role": "user", "content": ">>> print('work')\nwork\n" + ("y" * 2500)},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + [
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "think('important')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('work')\n" + ("x" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('work')\nwork\n" + ("y" * 2500)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
     ]
 
     coalesce_repl_messages(
@@ -883,18 +891,18 @@ def test_pinned_turn_without_repl_output_is_preserved():
 def test_multiple_pinned_turns_keep_ordered_preview_sections():
     saved = {}
     auto_expand = []
-    messages = [{"role": "system", "content": "system"}] + [
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "print('before')\n" + ("b" * 2500)},
-        {"role": "user", "content": ">>> print('before')\nbefore\n"},
-        {"role": "assistant", "content": "print('pin1')", "_pinned_coalesce": {"label": "Pinned previous turn"}},
-        {"role": "user", "content": ">>> print('pin1')\npin1\n"},
-        {"role": "assistant", "content": "print('middle')\n" + ("m" * 2500)},
-        {"role": "user", "content": ">>> print('middle')\nmiddle\n"},
-        {"role": "assistant", "content": "print('pin2')", "_pinned_coalesce": {"label": "Pinned previous turn"}},
-        {"role": "user", "content": ">>> print('pin2')\npin2\n"},
-        {"role": "assistant", "content": "emit('Done', release=True)"},
-        {"role": "user", "content": ">>> emit('Done', release=True)\nDone\n"},
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + [
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('before')\n" + ("b" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('before')\nbefore\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('pin1')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('pin1')\npin1\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('middle')\n" + ("m" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('middle')\nmiddle\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('pin2')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('pin2')\npin2\n"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\n"}]},
     ]
 
     projected = coalesce_repl_messages(
@@ -922,14 +930,14 @@ def test_multiple_pinned_turns_keep_ordered_preview_sections():
 
 def chat_interaction(i):
     return [
-        {"role": "user", "content": f"Question {i}", "_user_content": f"Question {i}"},
-        {"role": "assistant", "content": f"emit('Answer {i}', release=True)"},
-        {"role": "user", "content": f">>> emit('Answer {i}', release=True)\nAnswer {i}\n"},
+        {"role": "user", "content": [{"type": "text", "text": f"Question {i}"}], "_user_content": f"Question {i}"},
+        {"role": "assistant", "content": [{"type": "text", "text": f"emit('Answer {i}', release=True)"}]},
+        {"role": "user", "content": [{"type": "text", "text": f">>> emit('Answer {i}', release=True)\nAnswer {i}\n"}]},
     ]
 
 
 def test_default_keeps_most_recent_execution_interaction_even_past_last_three():
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     for i in range(2):
         messages.extend(interaction(i))
     for i in range(3):
@@ -948,7 +956,7 @@ def test_default_keeps_most_recent_execution_interaction_even_past_last_three():
 
 
 def test_release_output_is_not_treated_as_next_interaction_start_for_execution_policy():
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     messages.extend(interaction(0))
     messages.extend(interaction(1))
     for i in range(3):
@@ -964,15 +972,15 @@ def test_release_output_is_not_treated_as_next_interaction_start_for_execution_p
 
 
 def test_virtual_interaction_boundary_counts_as_completed_interaction_on_both_sides():
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     messages.extend(interaction(0))
     messages.extend([
-        {"role": "user", "content": "Long task", "_user_content": "Long task"},
-        {"role": "assistant", "content": "print('step 1')\n" + ("a" * 2500)},
-        {"role": "user", "content": ">>> print('step 1')\nstep 1\n" + ("b" * 2500)},
+        {"role": "user", "content": [{"type": "text", "text": "Long task"}], "_user_content": "Long task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('step 1')\n" + ("a" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('step 1')\nstep 1\n" + ("b" * 2500)}]},
         {
             "role": "assistant",
-            "content": "emit(None, release=True)",
+            "content": [{"type": "text", "text": "emit(None, release=True)"}],
             "_synthetic": True,
             "_virtual_interaction_boundary": True,
         },
@@ -1006,9 +1014,9 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
     from code_agent.session_replay import replay_session_into_agent
     from code_agent.session_store import SessionStore
 
-    class Conversation:
+    class ConversationStub:
         def __init__(self):
-            self._messages = [{"role": "system", "content": "system"}]
+            self._messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
 
         def message(self, index):
             return copy.deepcopy(self._messages[index])
@@ -1021,21 +1029,21 @@ def test_virtual_interaction_boundary_survives_replay_and_still_coalesces(tmp_pa
 
     class Agent:
         def __init__(self):
-            self.conversation = Conversation()
+            self.conversation = ConversationStub()
             self._expanded_preview_refs = {}
 
         def _configure_conversation(self, conversation):
             conversation.expanded_preview_refs = self._expanded_preview_refs
 
-    raw_messages = [{"role": "system", "content": "system"}]
+    raw_messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     raw_messages.extend(interaction(0))
     raw_messages.extend([
-        {"role": "user", "content": "Long task", "_user_content": "Long task"},
-        {"role": "assistant", "content": "print('step 1')\n" + ("a" * 2500)},
-        {"role": "user", "content": ">>> print('step 1')\nstep 1\n" + ("b" * 2500)},
+        {"role": "user", "content": [{"type": "text", "text": "Long task"}], "_user_content": "Long task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('step 1')\n" + ("a" * 2500)}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('step 1')\nstep 1\n" + ("b" * 2500)}]},
         {
             "role": "assistant",
-            "content": "emit(None, release=True)",
+            "content": [{"type": "text", "text": "emit(None, release=True)"}],
             "_synthetic": True,
             "_virtual_interaction_boundary": True,
         },
@@ -1102,11 +1110,11 @@ def test_message_source_range_prefers_synthetic_coverage():
 
 def test_place_preview_uses_explicit_content_and_does_not_mutate_input():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "raw", "_event_seq": 10},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "raw"}], "_event_seq": 10},
         {
             "role": "user",
-            "content": ">>> raw\noutput",
+            "content": [{"type": "text", "text": ">>> raw\noutput"}],
             "_event_seq": 11,
             "_attachments": {"a.py": "body"},
             "_attachment_refs": {"a.py": "a.py"},
@@ -1140,8 +1148,8 @@ def test_place_preview_uses_explicit_content_and_does_not_mutate_input():
 
 def test_place_preview_derives_content_from_current_projection():
     messages = [
-        {"role": "assistant", "content": "print('x')", "_event_seq": 1},
-        {"role": "user", "content": ">>> print('x')\nx", "_event_seq": 2},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')"}], "_event_seq": 1},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx"}], "_event_seq": 2},
     ]
     saved = {}
 
@@ -1159,7 +1167,7 @@ def test_place_preview_derives_content_from_current_projection():
 
 
 def test_preview_summary_does_not_affect_blob_key():
-    messages = [{"role": "assistant", "content": "body", "_event_seq": 1}]
+    messages = [{"role": "assistant", "content": [{"type": "text", "text": "body"}], "_event_seq": 1}]
     saved = {}
 
     first, first_key = place_preview(
@@ -1187,11 +1195,11 @@ def test_place_preview_rejects_split_and_partial_overlap_boundaries():
     messages = [
         {
             "role": "user",
-            "content": "child",
+            "content": [{"type": "text", "text": "child"}],
             "_source_start_seq": 100,
             "_source_end_seq": 150,
         },
-        {"role": "assistant", "content": "later", "_event_seq": 160},
+        {"role": "assistant", "content": [{"type": "text", "text": "later"}], "_event_seq": 160},
     ]
 
     for start, end in ((110, 140), (80, 120), (120, 160)):
@@ -1211,9 +1219,9 @@ def test_place_preview_rejects_split_and_partial_overlap_boundaries():
 
 def test_recursive_parent_preview_preserves_child_ref_verbatim():
     canonical = [
-        {"role": "assistant", "content": "child work", "_event_seq": 1},
-        {"role": "user", "content": ">>> child work\nresult", "_event_seq": 2},
-        {"role": "assistant", "content": "parent tail", "_event_seq": 3},
+        {"role": "assistant", "content": [{"type": "text", "text": "child work"}], "_event_seq": 1},
+        {"role": "user", "content": [{"type": "text", "text": ">>> child work\nresult"}], "_event_seq": 2},
+        {"role": "assistant", "content": [{"type": "text", "text": "parent tail"}], "_event_seq": 3},
     ]
     saved = {}
 
@@ -1241,9 +1249,9 @@ def test_recursive_parent_preview_preserves_child_ref_verbatim():
 
 def test_disjoint_preview_placements_work():
     messages = [
-        {"role": "assistant", "content": "one", "_event_seq": 1},
-        {"role": "assistant", "content": "two", "_event_seq": 2},
-        {"role": "assistant", "content": "three", "_event_seq": 3},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "two"}], "_event_seq": 2},
+        {"role": "assistant", "content": [{"type": "text", "text": "three"}], "_event_seq": 3},
     ]
 
     projected, _ = place_preview(
@@ -1266,8 +1274,8 @@ def test_disjoint_preview_placements_work():
 
 def test_place_preview_supports_multiple_ordered_previews_in_one_replacement():
     messages = [
-        {"role": "assistant", "content": "one", "_event_seq": 1},
-        {"role": "user", "content": ">>> one\n1", "_event_seq": 2},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}], "_event_seq": 1},
+        {"role": "user", "content": [{"type": "text", "text": ">>> one\n1"}], "_event_seq": 2},
     ]
     saved = {}
 
@@ -1289,9 +1297,9 @@ def test_place_preview_supports_multiple_ordered_previews_in_one_replacement():
 
 def test_source_aware_placement_rejects_source_less_node_inside_span():
     messages = [
-        {"role": "assistant", "content": "one", "_event_seq": 1},
-        {"role": "user", "content": "legacy output"},
-        {"role": "assistant", "content": "three", "_event_seq": 3},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}], "_event_seq": 1},
+        {"role": "user", "content": [{"type": "text", "text": "legacy output"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "three"}], "_event_seq": 3},
     ]
 
     try:
@@ -1311,18 +1319,18 @@ def test_source_aware_placement_rejects_source_less_node_inside_span():
 def test_source_aware_placement_rejects_duplicate_boundaries_and_ranges():
     cases = [
         [
-            {"role": "assistant", "content": "first", "_event_seq": 1},
-            {"role": "assistant", "content": "duplicate start", "_source_start_seq": 1, "_source_end_seq": 2},
-            {"role": "assistant", "content": "last", "_event_seq": 3},
+            {"role": "assistant", "content": [{"type": "text", "text": "first"}], "_event_seq": 1},
+            {"role": "assistant", "content": [{"type": "text", "text": "duplicate start"}], "_source_start_seq": 1, "_source_end_seq": 2},
+            {"role": "assistant", "content": [{"type": "text", "text": "last"}], "_event_seq": 3},
         ],
         [
-            {"role": "assistant", "content": "first", "_event_seq": 1},
-            {"role": "assistant", "content": "duplicate end", "_source_start_seq": 2, "_source_end_seq": 3},
-            {"role": "assistant", "content": "last", "_event_seq": 3},
+            {"role": "assistant", "content": [{"type": "text", "text": "first"}], "_event_seq": 1},
+            {"role": "assistant", "content": [{"type": "text", "text": "duplicate end"}], "_source_start_seq": 2, "_source_end_seq": 3},
+            {"role": "assistant", "content": [{"type": "text", "text": "last"}], "_event_seq": 3},
         ],
         [
-            {"role": "assistant", "content": "same", "_source_start_seq": 1, "_source_end_seq": 3},
-            {"role": "assistant", "content": "same again", "_source_start_seq": 1, "_source_end_seq": 3},
+            {"role": "assistant", "content": [{"type": "text", "text": "same"}], "_source_start_seq": 1, "_source_end_seq": 3},
+            {"role": "assistant", "content": [{"type": "text", "text": "same again"}], "_source_start_seq": 1, "_source_end_seq": 3},
         ],
     ]
 
@@ -1343,13 +1351,13 @@ def test_source_aware_placement_rejects_duplicate_boundaries_and_ranges():
 def test_production_skips_mixed_provenance_candidate_without_saving():
     saved = {}
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "request", "_event_seq": 1},
-        {"role": "assistant", "content": "work " * 300, "_event_seq": 2},
-        {"role": "user", "content": ">>> work\n" + ("output " * 200)},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "request"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "work " * 300}], "_event_seq": 2},
+        {"role": "user", "content": [{"type": "text", "text": ">>> work\n" + ("output " * 200)}]},
         {
             "role": "assistant",
-            "content": "emit('done', release=True)",
+            "content": [{"type": "text", "text": "emit('done', release=True)"}],
             "_final_result": "done",
             "_event_seq": 4,
         },
@@ -1369,18 +1377,18 @@ def test_production_skips_mixed_provenance_candidate_without_saving():
 
 def test_production_skips_invalid_duplicate_source_candidate_safely():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "request", "_event_seq": 1},
-        {"role": "assistant", "content": "work " * 300, "_event_seq": 2},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "request"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "work " * 300}], "_event_seq": 2},
         {
             "role": "user",
-            "content": ">>> work\n" + ("output " * 200),
+            "content": [{"type": "text", "text": ">>> work\n" + ("output " * 200)}],
             "_source_start_seq": 2,
             "_source_end_seq": 3,
         },
         {
             "role": "assistant",
-            "content": "emit('done', release=True)",
+            "content": [{"type": "text", "text": "emit('done', release=True)"}],
             "_final_result": "done",
             "_event_seq": 4,
         },
@@ -1410,22 +1418,22 @@ def test_production_normal_pinned_normal_reuses_one_semantic_partition(monkeypat
         recording_completed,
     )
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "request", "_event_seq": 1},
-        {"role": "assistant", "content": "normal before " * 200, "_event_seq": 2},
-        {"role": "user", "content": ">>> before\n" + ("before output " * 100), "_event_seq": 3},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "request"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "normal before " * 200}], "_event_seq": 2},
+        {"role": "user", "content": [{"type": "text", "text": ">>> before\n" + ("before output " * 100)}], "_event_seq": 3},
         {
             "role": "assistant",
-            "content": "print('pinned')",
+            "content": [{"type": "text", "text": "print('pinned')"}],
             "_pinned_coalesce": {"label": "Pinned previous turn"},
             "_event_seq": 4,
         },
-        {"role": "user", "content": ">>> print('pinned')\npinned", "_event_seq": 5},
-        {"role": "assistant", "content": "normal after " * 200, "_event_seq": 6},
-        {"role": "user", "content": ">>> after\n" + ("after output " * 100), "_event_seq": 7},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('pinned')\npinned"}], "_event_seq": 5},
+        {"role": "assistant", "content": [{"type": "text", "text": "normal after " * 200}], "_event_seq": 6},
+        {"role": "user", "content": [{"type": "text", "text": ">>> after\n" + ("after output " * 100)}], "_event_seq": 7},
         {
             "role": "assistant",
-            "content": "emit('done', release=True)",
+            "content": [{"type": "text", "text": "emit('done', release=True)"}],
             "_final_result": "done",
             "_event_seq": 8,
         },
@@ -1458,47 +1466,47 @@ def test_coalesce_skips_release_normalization_with_nonmonotonic_event_provenance
     saved = {}
     release_text = "done " * 400
     messages = [
-        {"role": "system", "content": "system"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
         {
             "role": "user",
-            "content": "...",
+            "content": [{"type": "text", "text": "..."}],
             "_user_content": "...",
             "_event_seq": 4452,
         },
         {
             "role": "assistant",
-            "content": "work before release " * 200,
+            "content": [{"type": "text", "text": "work before release " * 200}],
             "_event_seq": 4453,
         },
         {
             "role": "user",
-            "content": ">>> work before release\n" + ("output " * 300),
+            "content": [{"type": "text", "text": ">>> work before release\n" + ("output " * 300)}],
             "_event_seq": 4454,
         },
         {
             "role": "assistant",
-            "content": "more work " * 200,
+            "content": [{"type": "text", "text": "more work " * 200}],
             "_event_seq": 4456,
         },
         {
             "role": "user",
-            "content": ">>> more work\n" + ("more output " * 300),
+            "content": [{"type": "text", "text": ">>> more work\n" + ("more output " * 300)}],
             "_event_seq": 4457,
         },
         {
             "role": "assistant",
-            "content": "emit(result, release=True)",
+            "content": [{"type": "text", "text": "emit(result, release=True)"}],
             "_final_result": release_text,
             "_event_seq": 4459,
         },
         {
             "role": "user",
             "content": (
-                ">>> final work\n"
+                [{"type": "text", "text": ">>> final work\n"
                 + ("final output " * 300)
                 + "\n>>> emit(result, release=True)\n"
                 + release_text
-                + "\nNext request"
+                + "\nNext request"}]
             ),
             "_stdout": (
                 ">>> final work\n"
@@ -1541,15 +1549,15 @@ def test_coalesce_skips_release_normalization_with_nonmonotonic_event_provenance
     )
     assert any(
         message.get("_event_seq") == 4462
-        and "final output" in (message.get("content") or "")
+        and "final output" in _blocks_text(message.get("content") or [])
         for message in projected
     )
 def test_structured_appended_input_with_trailing_newline_is_not_duplicated():
     messages = [
-        {"role": "system", "content": "system"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
         {
             "role": "user",
-            "content": "plain output\nNext request\n",
+            "content": [{"type": "text", "text": "plain output\nNext request\n"}],
             "_stdout": "plain output\n",
             "_user_content": "Next request\n",
             "_event_seq": 12,
@@ -1571,8 +1579,8 @@ def test_structured_appended_input_with_trailing_newline_is_not_duplicated():
     normalized = coalesce_module.normalize_repl_messages(messages)
 
     assert [message["content"] for message in normalized[1:]] == [
-        "plain output\n",
-        "Next request\n",
+        [{"type": "text", "text": "plain output\n"}],
+        [{"type": "text", "text": "Next request\n"}],
     ]
     assert all("_preview_event_seq" not in message for message in normalized)
     assert normalized[1]["_render_segments"] == [
@@ -1592,7 +1600,7 @@ def test_structured_appended_input_with_trailing_newline_is_not_duplicated():
     assert message_source_range(normalized[1]) == (11, 11)
     assert message_source_range(normalized[2]) == (12, 12)
     assert sum(
-        message.get("content", "").count("Next request")
+        _blocks_text(message.get("content", [])).count("Next request")
         for message in normalized
     ) == 1
 
@@ -1600,12 +1608,12 @@ def test_structured_appended_input_with_trailing_newline_is_not_duplicated():
 def test_structured_stdout_is_authoritative_without_repl_prompt_text():
     stdout = {
         "role": "user",
-        "content": "# [no output]",
+        "content": [{"type": "text", "text": "# [no output]"}],
         "_render_segments": [{"type": "stdout", "content": "# [no output]"}],
     }
     plain = {
         "role": "user",
-        "content": "plain output",
+        "content": [{"type": "text", "text": "plain output"}],
         "_render_segments": [{"type": "stdout", "content": "plain output"}],
     }
 
@@ -1622,12 +1630,12 @@ def test_create_persisted_preview_and_recursive_parent(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "one", "_event_seq": 1},
-        {"role": "user", "content": "two", "_event_seq": 2},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}], "_event_seq": 1},
+        {"role": "user", "content": [{"type": "text", "text": "two"}], "_event_seq": 2},
     ]
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
-    store.append_event(session_id, 2, "message_added", {"message": {"role": "user", "content": "two"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "user", "content": [{"type": "text", "text": "two"}]}})
     state = PersistedPreviewState.empty()
     child_projection, child_key, child_seq, _ = create_persisted_preview(
         messages, Preview("child summary"),
@@ -1661,12 +1669,12 @@ def test_same_blob_can_have_distinct_persisted_summaries(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "same", "_event_seq": 1},
-        {"role": "assistant", "content": "same", "_event_seq": 2},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "same"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "same"}], "_event_seq": 2},
     ]
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "same"}})
-    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": "same"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "same"}]}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "same"}]}})
     state = PersistedPreviewState.empty()
     projected, first_key, first_seq, _ = create_persisted_preview(
         messages, Preview("first"), source_start_seq=1, source_end_seq=1,
@@ -1694,8 +1702,8 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
 
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
-    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": "two"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]}})
 
     agent = CodeAgentBase.__new__(CodeAgentBase)
     agent._session_store = store
@@ -1706,8 +1714,8 @@ def test_code_agent_base_create_persisted_preview_installs_only_committed_state(
     agent._suspend_persistence = False
     agent._conversation = Convo(Client(), "system")
     agent.conversation.extend_messages([
-        {"role": "assistant", "content": "one", "_event_seq": 1},
-        {"role": "assistant", "content": "two", "_event_seq": 2},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "two"}], "_event_seq": 2},
     ])
     agent._ensure_live_session = lambda: None
     agent._flush_pending_session_events = lambda: None
@@ -1749,14 +1757,14 @@ def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
     raw = [
-        {"role": "user", "content": "Task", "_user_content": "Task"},
-        {"role": "assistant", "content": "work " * 600},
-        {"role": "user", "content": ">>> work\n" + ("output " * 600)},
-        {"role": "assistant", "content": "emit('done', release=True)"},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
+        {"role": "assistant", "content": [{"type": "text", "text": "work " * 600}]},
+        {"role": "user", "content": [{"type": "text", "text": ">>> work\n" + ("output " * 600)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
     ]
     for seq, message in enumerate(raw, 1):
         store.append_event(session_id, seq, "message_added", {"message": message})
-    canonical = [{"role": "system", "content": "system"}] + [
+    canonical = [{"role": "system", "content": [{"type": "text", "text": "system"}]}] + [
         dict(message, _event_seq=seq) for seq, message in enumerate(raw, 1)
     ]
     _, key, _, _ = create_persisted_preview(
@@ -1795,12 +1803,12 @@ def test_module_persistence_requires_complete_authoritative_state(tmp_path):
 
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "one"}})
-    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": "two"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]}})
+    store.append_event(session_id, 2, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]}})
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant", "content": "one", "_event_seq": 1},
-        {"role": "assistant", "content": "two", "_event_seq": 2},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}], "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "two"}], "_event_seq": 2},
     ]
 
     before = store.get_events(session_id)
@@ -1886,11 +1894,11 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
     store.append_event(session_id, 1, "message_added", {
-        "message": {"role": "assistant", "content": "pre-exec"}
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "pre-exec"}]}
     })
     store.append_event(session_id, 2, "exec", {})
     store.append_event(session_id, 3, "message_added", {
-        "message": {"role": "assistant", "content": "post-exec"}
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "post-exec"}]}
     })
     store.append_event(session_id, 4, "rewind", {"target_seq": 1})
 
@@ -1909,7 +1917,7 @@ def test_rewind_across_exec_then_live_create_replays_identically(tmp_path):
     assert agent._persisted_preview_state.exec_start_seq == 0
     assert agent.conversation.stored_messages() == [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
-        {"role": "assistant", "content": "pre-exec", "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "pre-exec"}], "_event_seq": 1},
     ]
 
     key, created_seq = agent.create_persisted_preview(

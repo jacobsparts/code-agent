@@ -56,7 +56,7 @@ def append_raw_event(store, session_id, seq, event_type, payload):
 def input_message(text):
     return {
         "role": "user",
-        "content": text,
+        "content": [{"type": "text", "text": text}],
         "_user_content": text,
         "_render_segments": [{"type": "input", "content": text}],
     }
@@ -65,7 +65,7 @@ def input_message(text):
 def output_message(text=">>> print('x')\nx\n"):
     return {
         "role": "user",
-        "content": text,
+        "content": [{"type": "text", "text": text}],
         "_stdout": text,
         "_render_segments": [{"type": "stdout", "content": text}],
     }
@@ -74,7 +74,7 @@ def output_message(text=">>> print('x')\nx\n"):
 def release_message(text="done"):
     return {
         "role": "assistant",
-        "content": f"emit({text!r}, release=True)",
+        "content": [{"type": "text", "text": f"emit({text!r}, release=True)"}],
     }
 
 
@@ -88,7 +88,7 @@ def completed_events(count, execution_ids=(), release_outputs=()):
         events.append(event(seq, input_message(f"request {index}")))
         seq += 1
         if turn_id in execution_ids:
-            events.append(event(seq, {"role": "assistant", "content": "print('x')"}))
+            events.append(event(seq, {"role": "assistant", "content": [{"type": "text", "text": "print('x')"}]}))
             seq += 1
             events.append(event(seq, output_message()))
             seq += 1
@@ -101,7 +101,7 @@ def completed_events(count, execution_ids=(), release_outputs=()):
 
 
 def projected_messages(events):
-    messages = [{"role": "system", "content": "system"}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
     for item in events:
         if item["event_type"] != "message_added":
             continue
@@ -122,7 +122,7 @@ def test_turn_label_is_provider_only_stable_and_not_duplicated():
     first = render_turn_labels(stored)
     second = render_turn_labels(first)
 
-    assert first["content"] == "# Turn 17\n\nhello"
+    assert first["content"] == [{"type": "text", "text": "# Turn 17\n\nhello"}]
     assert second["content"] == first["content"]
     assert stored == original
 
@@ -130,29 +130,33 @@ def test_turn_label_is_provider_only_stable_and_not_duplicated():
 def test_turn_label_handles_appended_input_segment_and_excludes_non_turns():
     combined = {
         "role": "user",
-        "content": ">>> print('x')\nx\nnext request",
+        "content": [{"type": "text", "text": ">>> print('x')\nx\nnext request"}],
         "_event_seq": 9,
         "_render_segments": [
             {"type": "stdout", "content": ">>> print('x')\nx\n", "_event_seq": 8},
             {"type": "input", "content": "next request", "_event_seq": 9},
         ],
     }
-    assert render_turn_labels(combined)["content"] == (
-        ">>> print('x')\nx\n# Turn 9\n\nnext request"
-    )
+    assert render_turn_labels(combined)["content"] == [
+        {"type": "text", "text": ">>> print('x')\nx\n# Turn 9\n\nnext request"}
+    ]
     repeated_text = {
         "role": "user",
-        "content": "same\nsame",
+        "content": [{"type": "text", "text": "same\nsame"}],
         "_render_segments": [
             {"type": "stdout", "content": "same\n", "_event_seq": 8},
             {"type": "input", "content": "same", "_event_seq": 9},
         ],
     }
-    assert render_turn_labels(repeated_text)["content"] == "same\n# Turn 9\n\nsame"
-    assert render_turn_labels(output_message())["content"].startswith(">>>")
+    assert render_turn_labels(repeated_text)["content"] == [
+        {"type": "text", "text": "same\n# Turn 9\n\nsame"}
+    ]
+    assert render_turn_labels(output_message())["content"][0]["text"].startswith(">>>")
     synthetic = dict(input_message("hidden"), _synthetic=True, _event_seq=10)
     synthetic["_render_segments"][0]["_event_seq"] = 10
-    assert render_turn_labels(synthetic)["content"] == "hidden"
+    assert render_turn_labels(synthetic)["content"] == [
+        {"type": "text", "text": "hidden"}
+    ]
 
 
 def test_conversation_labels_active_turn_on_first_call_without_mutation():
@@ -165,21 +169,23 @@ def test_conversation_labels_active_turn_on_first_call_without_mutation():
 
     projected = [{"type": "text", "text": "# Turn 23\n\nactive"}]
     assert conversation.projected_messages()[-1]["content"] == projected
-    assert conversation.stored_messages()[-1]["content"] == "active"
+    assert conversation.stored_messages()[-1]["content"] == [
+        {"type": "text", "text": "active"}
+    ]
     assert conversation.projected_messages()[-1]["content"] == projected
 
 def test_transition_marker_is_provider_only_exactly_once_on_first_following_call():
     conversation = Convo(None, "system")
     transition = {
         "role": "assistant",
-        "content": "observe('stage done', transition=True)",
+        "content": [{"type": "text", "text": "observe('stage done', transition=True)"}],
         "_event_seq": 7,
         "_observation_transition": True,
     }
     output = output_message(">>> observe('stage done', transition=True)\n'[Continuing...]'\n")
     output["_event_seq"] = 8
     output["_repl_output_for"] = 7
-    task = {"role": "user", "content": "task", "_event_seq": 1}
+    task = {"role": "user", "content": [{"type": "text", "text": "task"}], "_event_seq": 1}
     conversation.extend_messages([task, transition, output])
     conversation.messages_projector = render_semantic_labels
     original = copy.deepcopy(conversation.stored_messages())
@@ -197,7 +203,7 @@ def test_transition_marker_is_provider_only_exactly_once_on_first_following_call
 def test_malformed_transition_metadata_does_not_create_marker_or_segment():
     events = [
         event(1, input_message("task")),
-        event(2, {"role": "assistant", "content": "work", "_observation_transition": "true"}),
+        event(2, {"role": "assistant", "content": [{"type": "text", "text": "work"}], "_observation_transition": "true"}),
         event(3, output_message()),
         event(4, release_message()),
     ]
@@ -214,7 +220,7 @@ def test_completed_segments_use_mixed_turn_checkpoint_identity_and_ranges():
         event(1, input_message("task")),
         event(2, {
             "role": "assistant",
-            "content": "observe('one', transition=True)",
+            "content": [{"type": "text", "text": "observe('one', transition=True)"}],
             "_observation_transition": True,
         }),
         event(3, {
@@ -225,7 +231,7 @@ def test_completed_segments_use_mixed_turn_checkpoint_identity_and_ranges():
         }),
         event(4, {
             "role": "assistant",
-            "content": "observe('two', transition=True)",
+            "content": [{"type": "text", "text": "observe('two', transition=True)"}],
             "_observation_transition": True,
         }),
         event(5, {
@@ -249,7 +255,7 @@ def test_persisted_child_preserves_later_canonical_checkpoint_marker():
         event(1, input_message("task")),
         event(2, {
             "role": "assistant",
-            "content": "observe('one', transition=True)",
+            "content": [{"type": "text", "text": "observe('one', transition=True)"}],
             "_observation_transition": True,
         }),
         event(3, {
@@ -260,7 +266,7 @@ def test_persisted_child_preserves_later_canonical_checkpoint_marker():
         }),
         event(4, {
             "role": "assistant",
-            "content": "observe('two', transition=True)",
+            "content": [{"type": "text", "text": "observe('two', transition=True)"}],
             "_observation_transition": True,
         }),
         event(5, {
@@ -303,11 +309,11 @@ def test_persisted_child_preserves_later_canonical_checkpoint_marker():
 
 def test_transition_output_mismatch_missing_and_ambiguity_are_non_authoritative():
     base = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "task", "_event_seq": 1},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "task"}], "_event_seq": 1},
         {
             "role": "assistant",
-            "content": "observe('stage', transition=True)",
+            "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
             "_event_seq": 2,
             "_observation_transition": True,
         },
@@ -345,18 +351,18 @@ def test_transition_output_mismatch_missing_and_ambiguity_are_non_authoritative(
             ),
             "_event_seq": 3,
         },
-        {"role": "assistant", "content": "duplicate", "_event_seq": 3},
+        {"role": "assistant", "content": [{"type": "text", "text": "duplicate"}], "_event_seq": 3},
     ]
     assert semantic_segments(duplicated)[0].authoritative is False
 
 
 def test_duplicate_and_colliding_transition_identity_is_non_authoritative():
     messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "task", "_event_seq": 2},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "task"}], "_event_seq": 2},
         {
             "role": "assistant",
-            "content": "observe('stage', transition=True)",
+            "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
             "_event_seq": 2,
             "_observation_transition": True,
         },
@@ -379,10 +385,10 @@ def test_duplicate_and_colliding_transition_identity_is_non_authoritative():
 def test_ephemeral_context_targets_canonical_user_and_keeps_checkpoint_exact():
     conversation = Convo(None, "system")
     conversation.extend_messages([
-        {"role": "user", "content": "task", "_event_seq": 1},
+        {"role": "user", "content": [{"type": "text", "text": "task"}], "_event_seq": 1},
         {
             "role": "assistant",
-            "content": "observe('stage', transition=True)",
+            "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
             "_event_seq": 2,
             "_observation_transition": True,
         },
@@ -441,7 +447,7 @@ def test_incomplete_cross_exec_and_ambiguous_turns_are_omitted():
         {"seq": 4, "event_type": "exec", "payload": {}},
         event(5, {
             "role": "user",
-            "content": "a\nb",
+            "content": [{"type": "text", "text": "a\nb"}],
             "_render_segments": [
                 {"type": "input", "content": "a"},
                 {"type": "input", "content": "b"},
@@ -533,16 +539,16 @@ def test_structured_stdout_is_not_a_turn_and_counts_as_execution():
 
     events = [
         event(1, input_message("request")),
-        event(2, {"role": "assistant", "content": "print('x')"}),
+        event(2, {"role": "assistant", "content": [{"type": "text", "text": "print('x')"}]}),
         event(3, {
             "role": "user",
-            "content": "# [no output]",
+            "content": [{"type": "text", "text": "# [no output]"}],
             "_render_segments": [{"type": "stdout", "content": "# [no output]"}],
         }),
         event(4, release_message()),
         event(5, {
             "role": "user",
-            "content": "plain output",
+            "content": [{"type": "text", "text": "plain output"}],
             "_render_segments": [{"type": "stdout", "content": "plain output"}],
         }),
         event(6, release_message("unrelated")),
@@ -550,15 +556,21 @@ def test_structured_stdout_is_not_a_turn_and_counts_as_execution():
 
     assert completed_turns(events) == [CompletedTurn(1, 1, 5, True)]
     projection = projected_messages(events)
-    assert render_turn_labels(projection[3])["content"] == "# [no output]"
-    assert render_turn_labels(projection[5])["content"] == "plain output"
+    assert render_turn_labels(projection[3])["content"] == [
+        {"type": "text", "text": "# [no output]"}
+    ]
+    assert render_turn_labels(projection[5])["content"] == [
+        {"type": "text", "text": "plain output"}
+    ]
 
 
 def test_attachment_invalidation_before_coalescing_remains_eligible():
     from code_agent.session_message_state import reduce_canonical_message_events
 
     events, ids = completed_events(5, execution_ids={1, 11})
-    events[1]["payload"]["message"]["content"] = "assistant work " * 300
+    events[1]["payload"]["message"]["content"] = [
+        {"type": "text", "text": "assistant work " * 300}
+    ]
     events[1]["payload"]["message"]["_attachment_refs"] = {
         "keep.txt": "session://preview/keep",
         "stale.txt": "session://preview/stale",
@@ -567,7 +579,9 @@ def test_attachment_invalidation_before_coalescing_remains_eligible():
         "keep.txt": "keep body",
         "stale.txt": "stale body",
     }
-    events[2]["payload"]["message"]["content"] = "execution output " * 300
+    events[2]["payload"]["message"]["content"] = [
+        {"type": "text", "text": "execution output " * 300}
+    ]
     events[2]["payload"]["message"]["_stdout"] = "execution output " * 300
     events[2]["payload"]["message"]["_render_segments"] = [
         {"type": "stdout", "content": "execution output " * 300}
@@ -591,7 +605,7 @@ def test_attachment_invalidation_before_coalescing_remains_eligible():
     }
 
     projection = coalesce_repl_messages(
-        [{"role": "system", "content": "system"}, *canonical],
+        [{"role": "system", "content": [{"type": "text", "text": "system"}]}, *canonical],
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
         min_savings_chars=0,
@@ -605,8 +619,12 @@ def test_attachment_invalidation_before_coalescing_remains_eligible():
 
 def test_materialized_attachment_identity_is_trusted_but_canonical_structure_is_rederived():
     events, ids = completed_events(5, execution_ids={1, 11})
-    events[1]["payload"]["message"]["content"] = "assistant work " * 300
-    events[2]["payload"]["message"]["content"] = "execution output " * 300
+    events[1]["payload"]["message"]["content"] = [
+        {"type": "text", "text": "assistant work " * 300}
+    ]
+    events[2]["payload"]["message"]["content"] = [
+        {"type": "text", "text": "execution output " * 300}
+    ]
     events[2]["payload"]["message"]["_stdout"] = "execution output " * 300
     events[2]["payload"]["message"]["_render_segments"] = [
         {"type": "stdout", "content": "execution output " * 300}
@@ -662,8 +680,12 @@ def test_replay_materializes_attachments_then_coalesces_with_valid_identity(tmp_
     session_id = store.create_session("/repo", "model")
     store.save_preview_blob(session_id, "attachment", "attachment body")
     events, ids = completed_events(5, execution_ids={1, 11})
-    events[1]["payload"]["message"]["content"] = "assistant work " * 300
-    events[2]["payload"]["message"]["content"] = "execution output " * 300
+    events[1]["payload"]["message"]["content"] = [
+        {"type": "text", "text": "assistant work " * 300}
+    ]
+    events[2]["payload"]["message"]["content"] = [
+        {"type": "text", "text": "execution output " * 300}
+    ]
     events[2]["payload"]["message"]["_stdout"] = "execution output " * 300
     events[2]["payload"]["message"]["_render_segments"] = [
         {"type": "stdout", "content": "execution output " * 300}
@@ -705,16 +727,16 @@ def test_replay_materializes_attachments_then_coalesces_with_valid_identity(tmp_
 def _pinned_completed_events(extra_turns=4):
     events = [
         event(1, input_message("pinned task")),
-        event(2, {"role": "assistant", "content": "normal before " * 200}),
+        event(2, {"role": "assistant", "content": [{"type": "text", "text": "normal before " * 200}]}),
         event(3, output_message(">>> before\n" + ("before " * 200))),
-        event(4, {"role": "assistant", "content": "pinned middle " * 200}),
+        event(4, {"role": "assistant", "content": [{"type": "text", "text": "pinned middle " * 200}]}),
         {
             "seq": 5,
             "event_type": "message_pinned",
             "payload": {"message_event_seq": 4, "label": "Pinned middle"},
         },
         event(6, output_message(">>> pinned\n" + ("pinned " * 200))),
-        event(7, {"role": "assistant", "content": "normal after " * 200}),
+        event(7, {"role": "assistant", "content": [{"type": "text", "text": "normal after " * 200}]}),
         event(8, output_message(">>> after\n" + ("after " * 200))),
         event(9, release_message()),
     ]
@@ -724,7 +746,7 @@ def _pinned_completed_events(extra_turns=4):
         ids.append(seq)
         events.append(event(seq, input_message(f"later {index}")))
         if index == extra_turns - 1:
-            events.append(event(seq + 1, {"role": "assistant", "content": "print('recent')"}))
+            events.append(event(seq + 1, {"role": "assistant", "content": [{"type": "text", "text": "print('recent')"}]}))
             events.append(event(seq + 2, output_message(">>> print('recent')\nrecent\n")))
             events.append(event(seq + 3, release_message()))
             seq += 4
@@ -740,7 +762,7 @@ def test_message_pinned_transition_reconstructs_exact_eligible_sections():
 
     canonical, _ = reduce_canonical_message_events(events)
     projection = coalesce_repl_messages(
-        [{"role": "system", "content": "system"}, *canonical],
+        [{"role": "system", "content": [{"type": "text", "text": "system"}]}, *canonical],
         keep_last_interactions=3,
         keep_last_execution_interactions=0,
         min_savings_chars=0,
@@ -800,7 +822,7 @@ def test_attachment_invalidation_reducer_and_replay_equivalence(tmp_path):
 
     message = {
         "role": "assistant",
-        "content": "work",
+        "content": [{"type": "text", "text": "work"}],
         "_attachment_refs": {
             "keep.txt": "session://preview/keep",
             "stale.txt": "session://preview/stale",
@@ -860,7 +882,7 @@ def test_attachment_invalidation_rewind_snapshots(tmp_path):
 
     message = {
         "role": "assistant",
-        "content": "work",
+        "content": [{"type": "text", "text": "work"}],
         "_attachment_refs": {"a.txt": "session://preview/a"},
         "_attachments": {"a.txt": "materialized"},
     }
@@ -936,7 +958,7 @@ def test_attachment_invalidation_resume_and_fork_reconstruction(tmp_path):
         {
             "message": {
                 "role": "assistant",
-                "content": "work",
+                "content": [{"type": "text", "text": "work"}],
                 "_attachment_refs": {"a.txt": "session://preview/a"},
             }
         },
@@ -961,7 +983,7 @@ def test_malformed_attachment_invalidation_is_conservative_and_equivalent(tmp_pa
 
     message = {
         "role": "assistant",
-        "content": "work",
+        "content": [{"type": "text", "text": "work"}],
         "_attachment_refs": {"a.txt": "session://preview/a"},
         "_attachments": {"a.txt": "materialized"},
     }
@@ -1024,7 +1046,7 @@ def test_malformed_event_snapshots_match_reducer_replay_resume_and_fork(tmp_path
 
     message = {
         "role": "assistant",
-        "content": "work",
+        "content": [{"type": "text", "text": "work"}],
         "_attachment_refs": {"a.txt": "session://preview/a"},
         "_attachments": {"a.txt": "materialized"},
     }
@@ -1164,7 +1186,7 @@ def test_malformed_events_preserve_exec_boundary_and_targetable_snapshots(tmp_pa
 def test_message_pin_rewind_snapshots_match_replay_semantics():
     from code_agent.session_message_state import reduce_canonical_message_events
 
-    base_message = {"role": "assistant", "content": "work"}
+    base_message = {"role": "assistant", "content": [{"type": "text", "text": "work"}]}
     pin_then_rewind_before_pin = [
         event(1, base_message),
         {
@@ -1192,7 +1214,7 @@ def test_message_pin_rewind_snapshots_match_replay_semantics():
 
 def test_ephemeral_provider_adds_exactly_one_line_and_preserves_existing_context():
     conversation = Convo(None, "system")
-    conversation.append_message({"role": "user", "content": "request"})
+    conversation.append_message({"role": "user", "content": [{"type": "text", "text": "request"}]})
     conversation.ephemeral = (
         "Current attached context:\n"
         "- file: file.py\n"
@@ -1343,8 +1365,9 @@ def test_replay_resume_rewind_and_fork_keep_canonical_turn_labels(tmp_path):
     assert forked.conversation.projected_messages()[-1]["content"] == [
         {"type": "text", "text": "# Turn 4\n\nreplacement"}
     ]
-    assert store.get_events(session_id)[-1]["payload"]["message"]["content"] == "replacement"
-    assert store.get_events(fork_id)[-1]["payload"]["message"]["content"] == "replacement"
+    replacement = [{"type": "text", "text": "replacement"}]
+    assert store.get_events(session_id)[-1]["payload"]["message"]["content"] == replacement
+    assert store.get_events(fork_id)[-1]["payload"]["message"]["content"] == replacement
 
 def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_path):
     class ReplayAgent:
@@ -1359,7 +1382,7 @@ def test_replay_rewind_and_fork_reconstruct_transition_segments_and_markers(tmp_
     session_id = store.create_session("/repo", "model")
     transition = {
         "role": "assistant",
-        "content": "observe('stage', transition=True)",
+        "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
         "_observation_transition": True,
     }
     for item in [
@@ -1459,12 +1482,12 @@ def test_observe_transition_schema_is_strict_bool_and_commits_atomically():
     assert agent._pending_observation_transition is False
 
     agent.observe("stage complete", transition=True)
-    message = {"role": "assistant", "content": "work"}
+    message = {"role": "assistant", "content": [{"type": "text", "text": "work"}]}
     agent._on_assistant_message_committed(message)
 
     assert message == {
         "role": "assistant",
-        "content": "work",
+        "content": [{"type": "text", "text": "work"}],
         "_observations": ["stage complete"],
         "_observation_transition": True,
     }
@@ -1483,14 +1506,14 @@ def test_observe_transition_retry_and_abandonment_state_does_not_leak():
 
     agent.observe("discarded attempt", transition=True)
     agent._start_assistant_execution_attempt()
-    retry_message = {"role": "assistant", "content": "retry"}
+    retry_message = {"role": "assistant", "content": [{"type": "text", "text": "retry"}]}
     agent._on_assistant_message_committed(retry_message)
     assert "_observations" not in retry_message
     assert "_observation_transition" not in retry_message
 
     agent.observe("interrupted attempt", transition=True)
     agent._start_assistant_execution_attempt()
-    later_message = {"role": "assistant", "content": "later"}
+    later_message = {"role": "assistant", "content": [{"type": "text", "text": "later"}]}
     agent._on_assistant_message_committed(later_message)
     assert "_observation_transition" not in later_message
 
@@ -1588,7 +1611,7 @@ def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_p
     events, ids = completed_events(6)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
     agent.conversation.insert_message(
-        3, {"role": "assistant", "content": "stale live gap", "_event_seq": 999}
+        3, {"role": "assistant", "content": [{"type": "text", "text": "stale live gap"}], "_event_seq": 999}
     )
     agent._persisted_preview_state = PersistedPreviewState(
         definitions={777: ("stale", "stale")},
@@ -1628,14 +1651,14 @@ def test_production_shape_turn_212_release_output_slices_form_one_authoritative_
         event(212, input_message("ordinary work")),
     ]
     for seq in (213, 215, 217):
-        events.append(event(seq, {"role": "assistant", "content": f"print({seq})"}))
+        events.append(event(seq, {"role": "assistant", "content": [{"type": "text", "text": f"print({seq})"}]}))
         events.append(event(seq + 1, output_message(f">>> print({seq})\n{seq}\n")))
     events.extend([
         event(310, {
             "role": "assistant",
             "content": (
-                "observe('stage complete', transition=True)\n"
-                "emit('done', release=True)"
+                [{"type": "text", "text": "observe('stage complete', transition=True)\n"
+                "emit('done', release=True)"}]
             ),
             "_observation_transition": True,
             "_final_result": "done",
@@ -1643,10 +1666,10 @@ def test_production_shape_turn_212_release_output_slices_form_one_authoritative_
         event(311, {
             "role": "user",
             "content": (
-                ">>> observe('stage complete', transition=True)\n"
+                [{"type": "text", "text": ">>> observe('stage complete', transition=True)\n"
                 "'[Continuing...]'\n"
                 ">>> emit('done', release=True)\n"
-                "done\n"
+                "done\n"}]
             ),
             "_stdout": "combined output",
             "_render_segments": [{
@@ -1724,9 +1747,9 @@ def test_production_shape_turn_212_release_output_slices_form_one_authoritative_
 def test_next_real_input_fallback_closes_unreleased_history_but_eof_keeps_active(ending):
     prefix = [
         event(1, input_message("first")),
-        event(2, {"role": "assistant", "content": "print('one')"}),
+        event(2, {"role": "assistant", "content": [{"type": "text", "text": "print('one')"}]}),
         event(3, output_message(">>> print('one')\none\n")),
-        event(4, {"role": "assistant", "content": f"# {ending}\nprint('two')"}),
+        event(4, {"role": "assistant", "content": [{"type": "text", "text": f"# {ending}\nprint('two')"}]}),
         event(5, output_message(">>> print('two')\ntwo\n")),
     ]
 
@@ -1741,7 +1764,7 @@ def test_transition_release_same_execution_has_one_release_closure_and_no_checkp
         event(1, input_message("task")),
         event(2, {
             "role": "assistant",
-            "content": "observe('done', transition=True)\nemit('released', release=True)",
+            "content": [{"type": "text", "text": "observe('done', transition=True)\nemit('released', release=True)"}],
             "_observation_transition": True,
             "_final_result": "released",
         }),
@@ -1789,12 +1812,12 @@ def test_ordered_same_event_slices_are_valid_but_duplicate_or_mixed_provenance_i
 def test_completed_partition_is_coverage_complete_before_active_segment():
     events = [
         event(1, input_message("fallback")),
-        event(2, {"role": "assistant", "content": "work"}),
+        event(2, {"role": "assistant", "content": [{"type": "text", "text": "work"}]}),
         event(3, output_message()),
         event(4, input_message("transition turn")),
         event(5, {
             "role": "assistant",
-            "content": "observe('stage', transition=True)",
+            "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
             "_observation_transition": True,
         }),
         event(6, {**output_message("transition output"), "_repl_output_for": 5}),
@@ -1833,7 +1856,7 @@ def test_adjacent_release_output_and_multiple_real_inputs_preserve_turn_identiti
         )),
         event(1418, input_message("input A")),
         event(1420, input_message("input B")),
-        event(1422, {"role": "assistant", "content": "print('work')"}),
+        event(1422, {"role": "assistant", "content": [{"type": "text", "text": "print('work')"}]}),
         event(1423, output_message(">>> print('work')\nwork\n")),
     ]
     canonical, _ = reduce_canonical_message_events(events)
@@ -1896,7 +1919,7 @@ def test_adjacent_release_output_and_multiple_real_inputs_preserve_turn_identiti
 def test_structured_multi_input_normalization_rejects_ambiguous_provenance():
     base = {
         "role": "user",
-        "content": "output\nA\nB",
+        "content": [{"type": "text", "text": "output\nA\nB"}],
         "_render_segments": [
             {"type": "stdout", "content": "output\n", "_event_seq": 1},
             {"type": "input", "content": "A", "_event_seq": 2},

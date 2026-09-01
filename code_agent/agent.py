@@ -1183,7 +1183,7 @@ def _code_agent_send_rg_available():
                     render_attachment_placeholder(name), attachment.content
                 )
         prospective_content = prospective_content.replace(marker, content)
-        messages.append({"role": "user", "content": prospective_content})
+        messages.append({"role": "user", "content": [{"type": "text", "text": prospective_content}]})
         try:
             estimated = client._estimate_input_tokens(client._input_bytes(messages))
         except Exception:
@@ -2871,7 +2871,7 @@ Return only the replacement user prompt text.
         try:
             self.ephemeral = ""
             msg = self.conversation.call(
-                additional_messages=[{"role": "user", "content": instruction}]
+                additional_messages=[{"role": "user", "content": [{"type": "text", "text": instruction}]}]
             )
         finally:
             self.ephemeral = old_ephemeral
@@ -2942,7 +2942,11 @@ Return only the replacement user prompt text.
             ('user', user_emit_output),
         ):
             last_message = self.conversation.append_message(
-                {"role": role, "content": content, "_synthetic": True}
+                {
+                    "role": role,
+                    "content": [{"type": "text", "text": content}],
+                    "_synthetic": True,
+                }
             )
         self.conversation.update_message(
             last_message,

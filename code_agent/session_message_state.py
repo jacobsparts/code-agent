@@ -1,14 +1,6 @@
 import copy
 
 
-def _normalize_content_to_blocks(content) -> list[dict]:
-    if isinstance(content, list):
-        return copy.deepcopy(content)
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else []
-    return []
-
-
 def coalesce_adjacent_user_messages(messages: list[dict]) -> list[dict]:
     out = []
     for message in messages:
@@ -21,20 +13,7 @@ def coalesce_adjacent_user_messages(messages: list[dict]) -> list[dict]:
             previous.setdefault("_render_segments", []).extend(
                 copy.deepcopy(message.get("_render_segments") or [])
             )
-            previous_content = previous.get("content")
-            content = message.get("content")
-            if isinstance(previous_content, str) and isinstance(content, str):
-                separator = (
-                    "" if not previous_content or previous_content.endswith("\n") else "\n"
-                )
-                merged = previous_content + separator + content
-                if not merged.endswith("\n"):
-                    merged += "\n"
-                previous["content"] = merged
-            else:
-                prev_blocks = _normalize_content_to_blocks(previous_content)
-                new_blocks = _normalize_content_to_blocks(content)
-                previous["content"] = prev_blocks + new_blocks
+            previous["content"].extend(copy.deepcopy(message["content"]))
             if message.get("_stdout"):
                 previous_stdout = previous.get("_stdout", "")
                 stdout_separator = (
@@ -81,6 +60,14 @@ def add_canonical_message(
     event_seq: int,
 ) -> None:
     canonical = copy.deepcopy(message)
+    content = canonical.get("content")
+    if not isinstance(content, list):
+        raise TypeError("canonical message content must be a list of typed blocks")
+    if any(
+        not isinstance(block, dict) or not isinstance(block.get("type"), str)
+        for block in content
+    ):
+        raise TypeError("canonical message content must contain typed blocks")
     canonical["_event_seq"] = event_seq
     for segment in reversed(canonical.get("_render_segments") or []):
         if "_event_seq" not in segment:

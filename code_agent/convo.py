@@ -79,6 +79,18 @@ def materialize_attachments(content: str, attachments: dict) -> tuple[str, list[
     return "".join(parts), media
 
 
+def _canonical_message(message):
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise TypeError("canonical message content must be a list of typed blocks")
+    if any(
+        not isinstance(block, dict) or not isinstance(block.get("type"), str)
+        for block in content
+    ):
+        raise TypeError("canonical message content must contain typed blocks")
+    return message
+
+
 class Convo:
     def __init__(self, llm_client, system_prompt):
         self.llm_client = llm_client
@@ -126,25 +138,32 @@ class Convo:
         return self._messages
 
     def replace_messages(self, messages):
-        self._messages = list(messages)
+        messages = list(messages)
+        for message in messages:
+            _canonical_message(message)
+        self._messages = messages
 
     def append_message(self, message):
-        self._messages.append(message)
+        self._messages.append(_canonical_message(message))
         return message
 
     def extend_messages(self, messages):
         messages = list(messages)
+        for message in messages:
+            _canonical_message(message)
         self._messages.extend(messages)
         return messages
 
     def insert_message(self, index, message):
-        self._messages.insert(index, message)
+        self._messages.insert(index, _canonical_message(message))
         return message
 
     def pop_message(self, index=-1):
         return self._messages.pop(index)
 
     def update_message(self, message, **changes):
+        updated = {**message, **changes}
+        _canonical_message(updated)
         message.update(changes)
         return message
 
@@ -168,12 +187,10 @@ class Convo:
             for message in messages
         ]
 
-        # Provider boundary: canonical blocks only. Legacy string content from
-        # projectors or resumed sessions is presented as blocks; `_attachments`
-        # are materialized per text block exactly once. Stored messages are
-        # never mutated.
+        # Provider boundary: `_attachments` are materialized per text block
+        # exactly once. Stored messages are never mutated.
         for index, message in enumerate(result):
-            content = content_blocks(message.get("content"))
+            content = message.get("content", [])
             if message.get("role") == "assistant":
                 content = [block for block in content if block["type"] != "attachment"]
             attachments = message.pop("_attachments", None)
@@ -245,14 +262,13 @@ class Convo:
         if messages is None:
             messages = self.projected_messages()
         else:
-            messages = [
-                {**message, "content": content_blocks(message.get("content"))}
-                for message in messages
-            ]
-        messages.extend(
-            {**message, "content": content_blocks(message.get("content"))}
-            for message in additional_messages
-        )
+            messages = list(messages)
+            for message in messages:
+                _canonical_message(message)
+        additional_messages = list(additional_messages)
+        for message in additional_messages:
+            _canonical_message(message)
+        messages.extend(additional_messages)
         return self.llm_client.call(messages, **kwargs)
 
     def add_assistant_response(self):

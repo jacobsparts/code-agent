@@ -20,9 +20,7 @@ _DETERMINISTIC_IDENTITY_FIELD = "_deterministic_preview_identity"
 
 
 def _content_text(message: dict) -> str:
-    content = message.get("content") or ""
-    if isinstance(content, str):
-        return content
+    content = message.get("content") or []
     return "\n".join(
         block.get("text", "")
         for block in content
@@ -499,7 +497,7 @@ def _message_from_segments(template: dict, segments: list[dict], *, user_input: 
     msg = copy.deepcopy(template)
     msg["_render_segments"] = copy.deepcopy(segments)
     content = "".join(str(segment.get("content") or "") for segment in segments)
-    msg["content"] = content
+    msg["content"] = [{"type": "text", "text": content}]
     seqs = {
         segment.get("_event_seq")
         for segment in segments
@@ -615,14 +613,18 @@ def normalize_repl_messages(messages: list[dict]) -> list[dict]:
                 out.append(release_msg)
                 out.append(_stdout_message_from(copied, release_text))
             else:
-                copied["content"] = text
+                copied["content"] = [{"type": "text", "text": text}]
                 if stdout is not None:
                     copied["_stdout"] = stdout
                 copied.pop("_user_content", None)
                 out.append(copied)
 
             if appended is not None:
-                appended_msg = {"role": "user", "content": appended, "_user_content": appended}
+                appended_msg = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": appended}],
+                    "_user_content": appended,
+                }
                 if type(copied.get("_event_seq")) is int:
                     appended_msg["_event_seq"] = copied["_event_seq"]
                 out.append(appended_msg)

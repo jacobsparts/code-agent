@@ -59,7 +59,7 @@ def test_get_transcript_events_only_loads_visible_message_fields(tmp_path):
         {
             "message": {
                 "role": "user",
-                "content": "visible",
+                "content": [{"type": "text", "text": "visible"}],
                 "_stdout": "large private output",
                 "_render_segments": [{"content": "large private output"}],
             }
@@ -70,14 +70,14 @@ def test_get_transcript_events_only_loads_visible_message_fields(tmp_path):
         session_id,
         3,
         "message_added",
-        {"message": {"role": "assistant", "content": "emit('done')", "_final_result": "done"}},
+        {"message": {"role": "assistant", "content": [{"type": "text", "text": "emit('done')"}], "_final_result": "done"}},
     )
 
     events = store.get_transcript_events(session_id)
 
     assert [event["seq"] for event in events] == [1, 3]
-    assert events[0]["payload"]["message"] == {"role": "user", "content": "visible"}
-    assert events[1]["payload"]["message"] == {"role": "assistant", "content": "emit('done')"}
+    assert events[0]["payload"]["message"] == {"role": "user", "content": [{"type": "text", "text": "visible"}]}
+    assert events[1]["payload"]["message"] == {"role": "assistant", "content": [{"type": "text", "text": "emit('done')"}]}
 
 
 def test_session_lock_blocks_other_owner_until_released(tmp_path):
@@ -137,15 +137,15 @@ def test_create_session_from_messages_appends_events_and_copies_preview_blobs(tm
     store.append_event(source, 1, "message_added", {"message": {"role": "user", "_user_content": "source"}})
     store.save_preview_blob(source, "abc", "blob content")
     messages = [
-        {"role": "system", "content": "system"},
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
         {
             "role": "user",
-            "content": "condensed",
+            "content": [{"type": "text", "text": "condensed"}],
             "_attachments": {"file.txt": "content"},
             "_attachment_refs": {"blob": "session://preview/abc"},
             "_render_segments": [{"type": "stdout", "content": "condensed"}],
         },
-        {"role": "assistant", "content": "emit('ok')"},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('ok')"}]},
     ]
 
     created = store.create_session_from_messages(
@@ -299,7 +299,7 @@ def test_forks_and_copy_only_add_preview_associations(tmp_path):
 def test_append_preview_events_uses_minimal_payloads_and_is_atomic(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "source"}]}})
     store.save_preview_blob(session_id, "abc", "content")
 
     assert _append_preview_events(store,
@@ -335,7 +335,7 @@ def test_append_preview_events_uses_minimal_payloads_and_is_atomic(tmp_path):
 def test_fork_session_copies_persisted_preview_events_and_blob(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     source = store.create_session("/repo", "model")
-    store.append_event(source, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    store.append_event(source, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "source"}]}})
     store.save_preview_blob(source, "abc", "content")
     _append_preview_events(store,
         source,
@@ -356,7 +356,7 @@ def test_append_preview_events_rejects_stale_missing_unassociated_exec_and_bool(
     store = SessionStore(str(tmp_path / "sessions.db"))
     other = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("/repo", "model")
-    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    store.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "source"}]}})
     store.save_preview_blob(session_id, "ok", "content")
     other.save_preview_blob(other.create_session("/repo", "model"), "unassociated", "content")
 
@@ -396,7 +396,7 @@ def test_two_store_instances_cannot_commit_same_expected_preview_sequence(tmp_pa
     first = SessionStore(path)
     second = SessionStore(path)
     session_id = first.create_session("/repo", "model")
-    first.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": "source"}})
+    first.append_event(session_id, 1, "message_added", {"message": {"role": "assistant", "content": [{"type": "text", "text": "source"}]}})
     first.save_preview_blob(session_id, "a", "a")
     first.save_preview_blob(session_id, "b", "b")
 

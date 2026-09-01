@@ -30,6 +30,7 @@ code_agent = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
 addopts = '-m "not integration"'
 markers = [
   "integration: live process, namespace, mount, or network integration tests",
