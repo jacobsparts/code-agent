@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now_iso() -> str:
@@ -41,6 +41,13 @@ class SessionStore:
     def _init_db(self):
         with self._connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 2:
+                raise RuntimeError(
+                    "Database migration required; run "
+                    "./code_agent/utility/db_migrate_to_v3.py"
+                )
+            if version == 25:
+                raise RuntimeError("Database migration in progress")
             if version not in (0, SCHEMA_VERSION):
                 raise RuntimeError("Unsupported schema")
             preview_columns = {
