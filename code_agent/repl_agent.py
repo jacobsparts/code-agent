@@ -153,6 +153,10 @@ def _print(*args, **kwargs):
     print(*args, **{**kwargs, 'file': buf})
     _send_output("print", buf.getvalue())
 
+def attach(media_type, content):
+    if content != b"[content omitted]":
+        raise ValueError("attach() is reserved for assistant-generated attachments")
+
 def emit(value, release=False):
     """Emit a value to the output.
 
@@ -929,7 +933,7 @@ Important:
         content = message.get("content", [])
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
-        for block in content:
+        for block in sorted(content, key=lambda block: block.get("type") != "attachment"):
             kind = block.get("type")
             if kind == "text":
                 source.append(block.get("text", ""))
@@ -946,9 +950,7 @@ Important:
                     f"args={block.get('args')!r}"
                 )
             elif kind == "attachment":
-                raise NotImplementedError(
-                    "REPLAgent cannot execute assistant 'attachment' blocks"
-                )
+                source.append(f'attach({block["media_type"]!r}, b"[content omitted]")')
             else:
                 raise NotImplementedError(
                     f"Unknown assistant content block type: {kind!r}"

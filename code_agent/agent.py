@@ -1272,6 +1272,12 @@ def _code_agent_send_rg_available():
         """Build LLM output, converting complete reads to attachments and large statement output to previews."""
         self._read_attachments = {}
         result = []
+        message = self.conversation.stored_messages()[-1]
+        attachment_indexes = iter(
+            index
+            for index, block in enumerate(message["content"])
+            if block["type"] == "attachment"
+        )
         statement = []
         attach_path = None
         partial_read_path = None
@@ -1306,6 +1312,8 @@ def _code_agent_send_rg_available():
             if msg_type == "echo":
                 flush_statement()
                 result.append(chunk)
+                if event.data.get("direct_call") == "attach":
+                    result.append(f'session://attachment/{message["_event_seq"]}/{next(attachment_indexes)}\n')
                 continue
             if msg_type == "preview_expand":
                 flush_statement()
@@ -2018,6 +2026,8 @@ Don't reconnect every turn - the connection object persists.
 
 read() returns file contents as text. Use it when you need to assign, search,
 split, parse, or otherwise process file contents in Python.
+
+Assistant-generated media will appear with a `session://attachment/...` URI in the next turn; pass the URI to `read()` to get the raw bytes.
 
 view("file.py") is for inspecting code with line numbers:
 - Prefer one full view(file_path) when inspecting a normal-sized source
@@ -3674,6 +3684,17 @@ class CodeAgent(MCPMixin, CodeAgentBase):
             return output.split('\n')
         return output
 
+    @REPLAgent.tool
+    def get_attachment_b64(self, uri):
+        """Return the base64 data referenced by a session attachment URI."""
+        seq, index = map(int, uri.removeprefix("session://attachment/").split("/"))
+        for message in self.conversation.stored_messages():
+            if message.get("_event_seq") == seq and 0 <= index < len(message["content"]):
+                block = message["content"][index]
+                if block["type"] == "attachment" and block["data"]["type"] == "base64":
+                    return block["data"]["data"]
+        raise ValueError(f"URI does not reference a supported attachment: {uri}")
+
     @REPLAgent.tool(inject=True)
     def read(self,
             file_path: str = "Path to the file",
@@ -3701,6 +3722,10 @@ class CodeAgent(MCPMixin, CodeAgentBase):
         import os
         if not isinstance(file_path, str):
             file_path = os.fspath(file_path)
+        if file_path.startswith("session://attachment/"):
+            import base64
+            return base64.b64decode(get_attachment_b64(file_path))
+
         prefix = "session://preview/"
 
         if isinstance(file_path, str) and file_path.startswith(prefix):
