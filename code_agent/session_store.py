@@ -435,7 +435,6 @@ class SessionStore:
 
         now = utc_now_iso()
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
                     "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM session_events WHERE session_id = ?",
@@ -488,6 +487,7 @@ class SessionStore:
                         if not contains and not equal:
                             raise ValueError("preview range partially overlaps an active placement")
 
+                conn.execute("BEGIN IMMEDIATE")
                 blob = conn.execute(
                     "SELECT content FROM preview_blobs WHERE key = ?",
                     (preview_key,),
