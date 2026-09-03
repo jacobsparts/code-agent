@@ -41,30 +41,21 @@ Select the appropriate model automatically from this set when building agents:
 | Model | Use |
 |---|---|
 | `omniroute/deepseek-v4-flash` | Fast, cheap, good general-purpose agentic model for bulk execution. No vision support. |
-| `gemini-3.7-flash` | Fast high intelligence model for agentic workflows, good agentic and REPL performance. General purpose default. |
-| `gpt-5.6-sol-medium` | Highest-intelligence model for advanced planning and reasoning. Best REPL performance and a good orchestrator. Vision support. |
+| `omniroute/gemini-3.7-flash` | Fast high intelligence model for agentic workflows, good agentic and REPL performance. General purpose default. |
+| `omniroute/gpt-5.6-sol-medium` | Highest-intelligence model for advanced planning and reasoning. Best REPL performance and a good orchestrator. Vision support. |
 
-Default choices:
-- Simple retrieval, extraction, formatting, routing: `opencode/mimo-v2.5-pro`.
-- Normal business reasoning or mixed judgment: `opencode/minimax-m3`.
-- Complex data analysis or open-ended goal pursuit: `fireworks/glm-5.2`.
-- REPL-heavy agents or orchestration-heavy workflows: `gpt-5.5-medium`.
-
-Approval rule:
-- For interactive, user-driven agents, choose the best fit from the table.
-- For unattended automation, scheduled jobs, or side-effecting production workflows, use only `opencode/mimo-v2.5-pro` or `opencode/minimax-m3` unless the user explicitly approves `fireworks/glm-5.2` or `gpt-5.5-medium`.
-- If requirements do not clearly justify one of the four models, ask the user.
+- If requirements do not clearly justify one of the models, ask the user.
 
 ```python
 class Agent(BaseAgent):
-    model = "opencode/mimo-v2.5-pro"
+    model = "omniroute/deepseek-v4-flash"
 ```
 
 For deployable projects:
 - Put model selection in a config helper if several agents share tiers.
 - Allow command-line or environment overrides for evaluation.
 - Keep model choice at class level unless runtime switching is a requirement.
-- Require explicit approval before configuring unattended automation to use `fireworks/glm-5.2` or `gpt-5.5-medium`.
+- Require explicit approval before configuring unattended automation to use highest intelligence model.
 
 ```python
 class Agent(BaseAgent):
@@ -78,7 +69,7 @@ class Agent(BaseAgent):
 from agentlib import BaseAgent
 
 class HashAgent(BaseAgent):
-    model = "opencode/mimo-v2.5-pro"
+    model = "opencode/deepseek-v4-flash"
     system = "You are a hashing assistant. Use sha256 to answer."
 
     @BaseAgent.tool
@@ -190,7 +181,7 @@ from pydantic import Field, create_model
 from agentlib import BaseAgent
 
 class Picker(BaseAgent):
-    model = "opencode/mimo-v2.5-pro"
+    model = "opencode/deepseek-v4-flash"
     system = "Pick one option and call choose."
 
     def __init__(self, options):
@@ -241,7 +232,7 @@ A `REPLAgent` makes the LLM write Python directly. The assistant response is exe
 from agentlib import REPLAgent
 
 class AnalysisAgent(REPLAgent):
-    model = "opencode/mimo-v2.5-pro"
+    model = "opencode/deepseek-v4-flash"
     system = """You are a data analyst.
 Write Python only. Use emit(answer, release=True) for the final answer."""
 
@@ -392,7 +383,7 @@ from agentlib import PythonToolResponseMixin
 from agentlib.cli import CLIAgent
 
 class FinanceAgent(PythonToolResponseMixin, CLIAgent):
-    model = "opencode/mimo-v2.5-pro"
+    model = "opencode/deepseek-v4-flash"
     system = """You answer questions about simplefin.sqlite3.
 
 Call sql_query(query) in Python to query the database.
