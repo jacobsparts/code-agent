@@ -109,7 +109,10 @@ def _message_text(message):
         kind = block["type"]
         if kind == "text":
             text.append(block["text"])
-        elif kind == "attachment":
+        elif kind == "commentary":
+            value = block["text"]
+            text.append("# " + value.replace("\n", "\n# "))
+        elif kind in ("reasoning", "attachment"):
             continue
         else:
             raise NotImplementedError(
