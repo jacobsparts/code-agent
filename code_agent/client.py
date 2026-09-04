@@ -98,7 +98,6 @@ from .provider_admission import ProviderAdmission
 from .utils import UsageTracker
 from .llm_registry import get_model_config
 from .convo import Convo
-from .transports import codex
 from .streaming import wrap_chat_completions_streaming_response
 from .repl_tool_adapter import REPL_EXECUTE_TOOL, ReplExecuteResponseError, repl_response_to_text, project_repl_tool_history
 
@@ -130,7 +129,6 @@ TRANSPORT_MEDIA_TYPES = {
     "responses": IMAGE_MEDIA_TYPES,
     "messages": IMAGE_MEDIA_TYPES,
     "gemini": IMAGE_MEDIA_TYPES | AUDIO_MEDIA_TYPES,
-    "codex": IMAGE_MEDIA_TYPES,
 }
 
 
@@ -917,12 +915,6 @@ class LLMClient:
         finally:
             conn.close()
 
-    def _call_codex(self, messages, tools):
-        req = self._responses_request(messages, tools)
-        # Stage idle budgets live in code_agent.transports.codex (60s/30s/30s).
-        # Do not impose a total wall-clock timeout here.
-        return self._parse_responses_result(codex.responses(req))
-
     def _call_messages(self, messages, tools):
         """
         Call Anthropic Messages API.
@@ -1271,7 +1263,6 @@ class LLMClient:
             "completions": self._call_completions,
             "responses": self._call_responses,
             "messages": self._call_messages,
-            "codex": self._call_codex,
             "gemini": self._call_gemini,
         }
         try:

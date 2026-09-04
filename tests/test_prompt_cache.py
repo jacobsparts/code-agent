@@ -383,7 +383,6 @@ def test_audio_attachment_transport_payload(
         ("responses", "_responses_attachment"),
         ("messages", "_anthropic_attachment"),
         ("cursor", "_openai_attachment"),
-        ("codex", "_responses_attachment"),
     ],
 )
 def test_transport_rejects_unsupported_audio_generically(

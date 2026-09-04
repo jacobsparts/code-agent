@@ -20,15 +20,14 @@ class ProviderConfig:
     tools: bool = False
     api_type: str = "completions"
     token_transform: object = None    # callable(usage_dict) -> usage_dict
-    requires_api_key: bool = True
     cost_transform: object = None     # callable(prompt, cached, completion, reasoning, in_cost, cached_cost, out_cost, rsn_cost) -> (in_cost, cached_cost, out_cost, rsn_cost)
     response_parser: object = None    # callable(response_json) -> (message, stop_reason, usage)
     headers: dict = field(default_factory=dict)
+    api_key: str = None
 
-    @property
-    def api_key(self):
-        return os.getenv(f"{self.provider.upper()}_API_KEY")
-
+    def __post_init__(self):
+        if self.api_key is None:
+            self.api_key = os.getenv(f"{self.provider.upper()}_API_KEY")
 
 @dataclass
 class ModelConfig:
@@ -72,7 +71,7 @@ class EndpointRegistry:
                 "aliases": sorted(aliases_by_model.get(full_name, [])),
             }
             for full_name, model in sorted(self._models.items())
-            if not model.provider.requires_api_key or model.provider.api_key
+            if model.provider.api_key
         ]
 
     def register_provider(self, name, **kwargs):
@@ -107,7 +106,7 @@ class EndpointRegistry:
                 f"Unknown model '{name}'\nAvailable models:\n"
                 + "\n".join(f"  - {model['full_name']}" for model in self.list_models())
             )
-        if model_obj.provider.requires_api_key and not model_obj.provider.api_key:
+        if not model_obj.provider.api_key:
             raise Exception(f"{model_obj.provider.provider.upper()}_API_KEY not set")
         return {
             **{k:v for k,v in model_obj.__dict__.items() if not k == 'provider'},
@@ -150,42 +149,6 @@ for conf, efforts in (
             kwargs = {**kwargs, 'explicit_prompt_cache': True}
             kwargs.setdefault('config', {})['prompt_cache_key'] = 'jp-code-agent-001'
         register_model("openai", f"{conf['model']}{suffix}", **kwargs)
-
-
-# --- Codex OAuth transport ---
-register_provider(
-    "codex",
-    host=None,
-    path=None,
-    rpm=60,
-    concurrency=5,
-    timeout=300,
-    tools=True,
-    api_type="codex",
-    requires_api_key=False,
-)
-register_model(
-    "codex",
-    "gpt-5.6-luna-xhigh",
-    model="gpt-5.6-luna",
-    tool_mode="repl_execute",
-    context_window=272_000,
-    input_cost=0.2,
-    cached_cost=0.02,
-    output_cost=1.2,
-    config={"reasoning_effort": "xhigh"},
-)
-for effort in ('low','medium'):
-    register_model(
-        "codex",
-        "gpt-5.6-sol-"+effort,
-        model="gpt-5.6-sol",
-        context_window=272_000,
-        input_cost=5.0,
-        cached_cost=0.5,
-        output_cost=30.0,
-        config={"reasoning_effort": effort},
-    )
 
 
 ### Anthropic ###
