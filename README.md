@@ -17,7 +17,7 @@ $ coda
 ──────────────────────────────────
 Code Agent
 Python REPL-based coding assistant
-gpt-5.5-medium
+gpt-5.6-sol-medium
 ──────────────────────────────────
 Enter = submit | Alt+Enter = newline | Ctrl+O = transcript | Esc Esc = rewind | Ctrl+C = interrupt | Ctrl+D = quit
 Commands: /repl, /rewind, /exec [instructions], /resume [session_id], /fork [session_id], /skills [name], /subagents [model], /attach <file>, /detach <file>, /attachments, /model [name], /tokens
@@ -44,7 +44,7 @@ You're already at the latest revision. Nothing pending.
 
 Session ended. Goodbye!
 Resume session: coda --resume f5867c0c-6963-405e-9c6a-c775cea6cb6a
-gpt-5.5-medium: In=12847, Cached=41203, Rsn=1024, Out=843, Cost=$0.018
+gpt-5.6-sol-medium: In=12847, Cached=41203, Rsn=1024, Out=843, Cost=$0.018
 ```
 
 ---
