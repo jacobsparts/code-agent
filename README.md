@@ -162,9 +162,7 @@ API keys can also be supplied with the `api_key` parameter on a provider definit
 
 ## Remote Workers
 
-The REPL worker is a separate spawned process from the agentic loop. Code Agent explicitly uses the `spawn` multiprocessing context for workers it owns rather than inheriting the application's ambient start method. Application-owned workers that initialize Code Agent must also use `multiprocessing.get_context("spawn")`; externally forked children fail fast before creating provider-admission, shell, or REPL resources.
-
-By default the worker runs locally, but it can run on any host you can SSH into:
+By default the REPL worker runs locally, but it can run on any host you can SSH into:
 
 ```bash
 coda example.com
