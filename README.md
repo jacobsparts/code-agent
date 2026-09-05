@@ -69,7 +69,7 @@ gpt-5.5-medium: In=12847, Cached=41203, Rsn=1024, Out=843, Cost=$0.018
 
 **Lossless coalescing.** Old turns are automatically coalesced past a three-interaction horizon (each interaction may span many turns), and the system actively coalesces as needed to stay under the context window — including mid-session on long-running interactions. Coalesced exchanges become expandable preview blobs rather than discarded text, so nothing is permanently lost. The agent can also `pin()` important turns so they survive coalescing and auto-expand when referenced.
 
-This is fundamentally different from compaction: compaction summarizes and discards. Coalescing archives. The full REPL state is preserved either way.
+This is fundamentally different from compaction: compaction summarizes and discards, whereas coalescing archives. And because Code Agent executes in a persistent subprocess, the full REPL state remains completely intact as context is archived.
 
 **Agent-managed rollups.** Beyond automatic coalescing, the agent curates its own context. `observe()` records durable lessons that survive coalescing; `rollup(start, end, summary)` replaces a completed span of turns with a structured summary — recursively, so rolled-up spans can themselves be rolled up — while the original content remains archived behind expandable preview references. `pin()` protects exact turns from summarization.
 
