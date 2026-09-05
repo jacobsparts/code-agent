@@ -1,27 +1,19 @@
 # Configuration
 
-## API Keys
-
-Set your API key in a `.env` file in your working directory, or as an environment variable.
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-GOOGLE_API_KEY=...
-XAI_API_KEY=...
-```
-
-Copy `.env.example` to get started:
-
-```bash
-cp .env.example .env
-```
-
 ## `~/.code-agent/config.py`
 
-Code Agent loads `~/.code-agent/config.py` on startup, if it exists. Use it to register
-custom providers and models—any OpenAI-compatible endpoint, a local Ollama instance,
-a corporate proxy, a custom API wrapper, etc.
+Code Agent loads `~/.code-agent/config.py` on startup, if it exists. This is the main
+configuration file: use it to set API keys and default models, or to register custom
+providers and models—any OpenAI-compatible endpoint, a local Ollama instance, a corporate
+proxy, a custom API wrapper, etc.
+
+API keys can be set through `<PROVIDER>_API_KEY` environment variables here. Code Agent
+also loads environment variables from a project `.env` file, and `.env.example` lists the
+standard names.
+
+Provider definitions accept `api_key` directly. This is useful for endpoints such as Codex
+or Cursor gateways, local servers, and corporate proxies. If `api_key` is omitted, a
+provider falls back to its `<PROVIDER>_API_KEY` environment variable.
 
 The following functions are injected into the config's namespace before it runs:
 
@@ -37,6 +29,7 @@ The following functions are injected into the config's namespace before it runs:
 |-----------|-------------|
 | `host` | API hostname (e.g. `"api.openai.com"`) |
 | `path` | Default request path (e.g. `"/v1/chat/completions"`) |
+| `api_key` | API key for the provider; defaults to `<PROVIDER>_API_KEY` from the environment |
 | `port` | Port, default `443` |
 | `api_type` | `"completions"` (OpenAI-compatible) or `"messages"` (Anthropic) |
 | `timeout` | Request timeout in seconds |
@@ -64,6 +57,23 @@ The following functions are injected into the config's namespace before it runs:
 | `headers` | Extra HTTP headers; merged over the provider headers |
 
 ### Examples
+
+**API keys and default model cycle:**
+
+```python
+import os
+
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
+os.environ["OPENAI_API_KEY"] = "sk-..."
+
+code_agent_model = [
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-5.4",
+]
+```
+
+The first entry is used at startup. At an empty prompt, use `Tab` and `Shift+Tab` to cycle
+through the list.
 
 **Local Ollama:**
 
