@@ -2821,7 +2821,13 @@ If you don't know how to proceed:
         return True
 
     @staticmethod
-    def _exec_prompt_text(content: str) -> str:
+    def _exec_prompt_text(content) -> str:
+        if isinstance(content, list):
+            content = "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
         text = (content or "").strip()
         try:
             import ast
