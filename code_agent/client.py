@@ -503,6 +503,7 @@ class LLMClient:
                 continue
             content = []
             calls = []
+            reasoning_content = []
             for block in blocks:
                 kind = block['type']
                 if kind in ('text', 'commentary'):
@@ -519,7 +520,8 @@ class LLMClient:
                         },
                     })
                 elif kind == 'reasoning':
-                    continue
+                    if self.model_config.get('preserve_reasoning'):
+                        reasoning_content.append(block.get('text', ''))
                 else:
                     raise NotImplementedError(
                         f"Unknown transport content type: {kind!r}"
@@ -534,6 +536,8 @@ class LLMClient:
             }
             if calls:
                 out['tool_calls'] = calls
+            if reasoning_content:
+                out['reasoning_content'] = '\n'.join(reasoning_content)
             breakpoint = message.get('_prompt_cache_breakpoint')
             if (
                 breakpoint
@@ -951,14 +955,15 @@ class LLMClient:
                     if kind in ('text', 'commentary'):
                         content.append({'type': 'text', 'text': block['text']})
                     elif kind == 'reasoning':
-                        item = {
-                            'type': 'thinking',
-                            'thinking': block['text'],
-                        }
-                        metadata = block.get('provider_metadata') or {}
-                        if 'signature' in metadata:
-                            item['signature'] = metadata['signature']
-                        content.append(item)
+                        if self.model_config.get('preserve_reasoning'):
+                            item = {
+                                'type': 'thinking',
+                                'thinking': block['text'],
+                            }
+                            metadata = block.get('provider_metadata') or {}
+                            if 'signature' in metadata:
+                                item['signature'] = metadata['signature']
+                            content.append(item)
                     elif kind == 'tool_call':
                         content.append({
                             'type': 'tool_use',
@@ -1109,13 +1114,14 @@ class LLMClient:
                     if kind in ('text', 'commentary'):
                         parts.append({'text': block['text']})
                     elif kind == 'reasoning':
-                        part = {'text': block['text'], 'thought': True}
-                        metadata = block.get('provider_metadata') or {}
-                        if 'thought_signature' in metadata:
-                            part['thoughtSignature'] = metadata[
-                                'thought_signature'
-                            ]
-                        parts.append(part)
+                        if self.model_config.get('preserve_reasoning'):
+                            part = {'text': block['text'], 'thought': True}
+                            metadata = block.get('provider_metadata') or {}
+                            if 'thought_signature' in metadata:
+                                part['thoughtSignature'] = metadata[
+                                    'thought_signature'
+                                ]
+                            parts.append(part)
                     elif kind == 'tool_call':
                         parts.append({
                             'functionCall': {

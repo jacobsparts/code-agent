@@ -18,6 +18,7 @@ class ProviderConfig:
     concurrency: int = None
     timeout: int = 900
     tools: bool = False
+    preserve_reasoning: bool = False
     api_type: str = "completions"
     token_transform: object = None    # callable(usage_dict) -> usage_dict
     cost_transform: object = None     # callable(prompt, cached, completion, reasoning, in_cost, cached_cost, out_cost, rsn_cost) -> (in_cost, cached_cost, out_cost, rsn_cost)
@@ -35,6 +36,7 @@ class ModelConfig:
     provider: ProviderConfig
     path: str = None
     config: dict = field(default_factory=dict)
+    preserve_reasoning: object = None
     context_window: int = None
     context_constraint: int = None
     max_input_tokens: int = None
