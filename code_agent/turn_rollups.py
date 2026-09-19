@@ -288,6 +288,7 @@ def derive_rollup_candidate_turns(
     events: list[dict],
     projected_messages: list[dict],
     persisted_state: PersistedPreviewState,
+    usage_percent: int | None = None,
 ) -> tuple[int, ...]:
     """Return every turn number that may be passed to rollup().
 
@@ -299,7 +300,8 @@ def derive_rollup_candidate_turns(
     if not turns:
         return ()
 
-    frontier = len(turns) - 3
+    keep_last = 1 if usage_percent is not None and usage_percent >= 80 else 3
+    frontier = len(turns) - keep_last
     execution_indexes = [
         index for index, turn in enumerate(turns) if turn.has_execution
     ]
@@ -379,10 +381,12 @@ def derive_agent_rollup_context(agent):
         ),
         min_savings_chars=agent.code_agent_coalesce_min_savings_chars,
     )
+    accounting = agent._context_accounting()
     candidate_turns = derive_rollup_candidate_turns(
         events,
         projected_messages,
         state,
+        usage_percent=None if accounting is None else accounting.get("usage_percent"),
     )
     rolled_up_upper_turns = rolled_up_upper_boundary_turns(
         events,

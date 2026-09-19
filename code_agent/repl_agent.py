@@ -1246,7 +1246,7 @@ Call help(function_name) for parameter descriptions.
                 raise
             except _CompleteException:
                 # Record the terminal assistant message before returning
-                if getattr(self, "complete", False) and getattr(self, "_final_result", None) is not None:
+                if getattr(self, "complete", False):
                     resp["_final_result"] = self._final_result
                 self.conversation.append_message(resp)
                 if hasattr(self, '_on_assistant_message_committed'):
@@ -1262,7 +1262,7 @@ Call help(function_name) for parameter descriptions.
                 self.on_repl_events_complete(events)
 
             # Commit successful response to conversation
-            if getattr(self, "complete", False) and getattr(self, "_final_result", None) is not None:
+            if getattr(self, "complete", False):
                 resp["_final_result"] = self._final_result
             self.conversation.append_message(resp)
             if hasattr(self, '_on_assistant_message_committed'):

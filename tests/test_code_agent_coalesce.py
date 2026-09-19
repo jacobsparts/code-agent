@@ -23,7 +23,9 @@ from code_agent.code_agent_coalesce import message_source_range
 from code_agent.code_agent_coalesce import place_preview
 from code_agent.code_agent_coalesce import preview_key
 from code_agent.code_agent_coalesce import render_default_preview_summary
+from code_agent.code_agent_coalesce import is_release_assistant_message
 from code_agent.code_agent_coalesce import render_preview_ref
+from code_agent.code_agent_coalesce import semantic_segments
 
 
 def interaction(i, work_size=2500):
@@ -33,7 +35,11 @@ def interaction(i, work_size=2500):
         {"role": "user", "content": [{"type": "text", "text": f"Task {i}"}], "_user_content": f"Task {i}"},
         {"role": "assistant", "content": [{"type": "text", "text": work}]},
         {"role": "user", "content": [{"type": "text", "text": output}]},
-        {"role": "assistant", "content": [{"type": "text", "text": f"emit('Done {i}', release=True)"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"emit('Done {i}', release=True)"}],
+            "_final_result": f"Done {i}",
+        },
         {"role": "user", "content": [{"type": "text", "text": f">>> emit('Done {i}', release=True)\nDone {i}\n"}]},
     ]
 
@@ -75,7 +81,7 @@ def test_shared_deterministic_derivation_matches_production_ordinary():
     messages = _source_tagged_interaction([
         {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}], "_final_result": "done"},
     ])
 
     derived, keys, materialized = deterministic_interaction_replacement(
@@ -121,7 +127,7 @@ def test_shared_derivation_matches_pinned_attachments_observations_and_nested_re
             "_observations": ["Pinned observation."],
         },
         {"role": "user", "content": [{"type": "text", "text": ">>> pinned\npinned\n"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}], "_final_result": "done"},
     ])
     preserved = {nested_uri: nested}
 
@@ -217,7 +223,7 @@ def test_coalescing_collects_valid_observations_and_preserves_canonical_blob():
             "_observations": ["First.", 123, "", "Second."],
         },
         {"role": "user", "content": [{"type": "text", "text": ">>> observe(value)\n'[Continuing...]'\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     projected = coalesce_repl_messages(
@@ -252,7 +258,7 @@ def test_transition_boundary_observation_is_used_without_changing_preview_blob()
             "role": "user",
             "content": [{"type": "text", "text": f">>> {transition}\n'[Continuing...]'\n"}],
         },
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}], "_final_result": "done"},
     ])
 
     projected = coalesce_repl_messages(
@@ -283,7 +289,7 @@ def test_pinned_and_normal_sections_keep_their_own_observations():
             "_observations": ["Pinned only."],
         },
         {"role": "user", "content": [{"type": "text", "text": ">>> print('pinned')\npinned\n"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     projected = coalesce_repl_messages(
@@ -392,7 +398,7 @@ def test_attachment_placeholders_and_payloads_survive():
             "_attachments": {"src/foo.py": "    1→print('hi')"},
             "_attachment_refs": {"src/foo.py": "src/foo.py"},
         },
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -410,7 +416,7 @@ def test_nested_preview_refs_remain_placeholders():
         {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {"role": "assistant", "content": [{"type": "text", "text": "preview(value)\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> preview(value)\n[PreviewRef: session://preview/abc]\n(1 lines, 30000 chars)\n[/PreviewRef]\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
@@ -426,7 +432,7 @@ def test_appended_user_content_is_preserved():
         {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
         {
             "role": "user",
             "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\nNext task"}],
@@ -448,7 +454,7 @@ def test_release_output_is_preserved_live_not_saved_to_preview():
         {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
         {"role": "user", "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\nextra line\n"}]},
     ]
 
@@ -515,18 +521,59 @@ def test_release_detection_accepts_emit_value_metadata_when_final_result_is_none
     assert projected[-1]["role"] == "assistant"
 
 
-def test_release_detection_finds_top_level_emit_after_non_emit_work():
+def test_release_detection_uses_recorded_outcome_after_non_emit_work():
     messages = [
         {"role": "system", "content": [{"type": "text", "text": "system"}]},
         {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "result = 'done'\nemit(result, release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "result = 'done'\nemit(result, release=True)"}], "_final_result": "done"},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
 
     assert any(m.get("_coalesced") for m in projected)
+
+
+def test_release_detection_requires_recorded_outcome_not_source_text():
+    unexecuted = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "emit('x', release=True)"}],
+    }
+    assert not is_release_assistant_message(unexecuted)
+    assert is_release_assistant_message({**unexecuted, "_final_result": "x"})
+    assert is_release_assistant_message({**unexecuted, "_final_result": None})
+    assert is_release_assistant_message({**unexecuted, "_emit_value": ""})
+    assert is_release_assistant_message({
+        "role": "assistant",
+        "_synthetic": True,
+        "_virtual_interaction_boundary": True,
+    })
+
+
+def test_transition_after_release_restarts_segmentation_with_unique_ids():
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "system"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task", "_event_seq": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}], "_final_result": "done", "_event_seq": 2},
+        {"role": "assistant", "content": [{"type": "text", "text": "observe('stage', transition=True)"}], "_observation_transition": True, "_event_seq": 3},
+        {"role": "user", "content": [{"type": "text", "text": ">>> observe('stage', transition=True)\n'[Continuing...]'\n"}], "_repl_output_for": 3, "_event_seq": 4},
+        {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}], "_event_seq": 5},
+        {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}], "_event_seq": 6},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('later', release=True)"}], "_final_result": "later", "_event_seq": 7},
+    ]
+
+    segments = semantic_segments(messages)
+    ids = [segment.segment_id for segment in segments]
+
+    assert ids == [1, 3]
+    assert [segment.identity_kind for segment in segments] == ["turn", "checkpoint"]
+    coalesce_repl_messages(
+        messages,
+        keep_last_interactions=0,
+        keep_last_execution_interactions=0,
+        min_savings_chars=1,
+    )
 
 
 def test_render_segment_input_is_preserved_as_real_user_input():
@@ -535,7 +582,7 @@ def test_render_segment_input_is_preserved_as_real_user_input():
         {"role": "user", "content": [{"type": "text", "text": "displayed"}], "_render_segments": [{"type": "input", "content": "Segment task"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "print('x')\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('x')\nx\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -552,7 +599,7 @@ def test_omitted_echo_is_reconstructed_in_preview_blob():
         {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {"role": "assistant", "content": [{"type": "text", "text": code + "\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": "[content omitted from echo]\n0\n1\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1, save_preview_blob=saved.setdefault)
@@ -573,7 +620,7 @@ def test_attachment_placeholder_order_is_first_seen_and_deduplicated():
             "_attachments": {"a.py": "a", "c.py": "c"},
             "_attachment_refs": {"d.py": "d"},
         },
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     projected = coalesce_repl_messages(messages, keep_last_interactions=0, keep_last_execution_interactions=0, min_savings_chars=1)
@@ -738,7 +785,7 @@ def test_coalesce_preserves_expanded_preview_ref_placeholder():
                 + ("y" * 2500)}]
             ),
         },
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     projected = coalesce_repl_messages(
@@ -843,7 +890,7 @@ def test_pinned_turn_creates_auto_expanded_preview_ref():
         {"role": "user", "content": [{"type": "text", "text": ">>> print('unpinned')\nunpinned\n" + ("y" * 2500)}]},
         {"role": "assistant", "content": [{"type": "text", "text": "print('important')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('important')\nimportant\n"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
         {"role": "user", "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\n"}]},
     ]
 
@@ -872,7 +919,7 @@ def test_pinned_turn_without_repl_output_is_preserved():
         {"role": "assistant", "content": [{"type": "text", "text": "think('important')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
         {"role": "assistant", "content": [{"type": "text", "text": "print('work')\n" + ("x" * 2500)}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('work')\nwork\n" + ("y" * 2500)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
     ]
 
     coalesce_repl_messages(
@@ -901,7 +948,7 @@ def test_multiple_pinned_turns_keep_ordered_preview_sections():
         {"role": "user", "content": [{"type": "text", "text": ">>> print('middle')\nmiddle\n"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "print('pin2')"}], "_pinned_coalesce": {"label": "Pinned previous turn"}},
         {"role": "user", "content": [{"type": "text", "text": ">>> print('pin2')\npin2\n"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('Done', release=True)"}], "_final_result": "Done"},
         {"role": "user", "content": [{"type": "text", "text": ">>> emit('Done', release=True)\nDone\n"}]},
     ]
 
@@ -931,7 +978,11 @@ def test_multiple_pinned_turns_keep_ordered_preview_sections():
 def chat_interaction(i):
     return [
         {"role": "user", "content": [{"type": "text", "text": f"Question {i}"}], "_user_content": f"Question {i}"},
-        {"role": "assistant", "content": [{"type": "text", "text": f"emit('Answer {i}', release=True)"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"emit('Answer {i}', release=True)"}],
+            "_final_result": f"Answer {i}",
+        },
         {"role": "user", "content": [{"type": "text", "text": f">>> emit('Answer {i}', release=True)\nAnswer {i}\n"}]},
     ]
 
@@ -1760,7 +1811,7 @@ def test_actual_agent_replay_then_deterministic_coalescing_keeps_persisted_node_
         {"role": "user", "content": [{"type": "text", "text": "Task"}], "_user_content": "Task"},
         {"role": "assistant", "content": [{"type": "text", "text": "work " * 600}]},
         {"role": "user", "content": [{"type": "text", "text": ">>> work\n" + ("output " * 600)}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "emit('done', release=True)"}], "_final_result": "done"},
     ]
     for seq, message in enumerate(raw, 1):
         store.append_event(session_id, seq, "message_added", {"message": message})

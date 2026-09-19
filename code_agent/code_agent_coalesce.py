@@ -323,31 +323,11 @@ def select_projected_span(
 
 
 def is_release_assistant_message(msg: dict) -> bool:
-    if msg.get("_final_result") is not None or msg.get("_emit_value") is not None:
-        return True
-
-    content = _content_text(msg)
-    try:
-        tree = _parse_silently(content)
-    except SyntaxError:
-        tree = None
-    if tree is not None:
-        for node in tree.body:
-            expr = node.value if isinstance(node, ast.Expr) else None
-            if not isinstance(expr, ast.Call):
-                continue
-            if not isinstance(expr.func, ast.Name) or expr.func.id != "emit":
-                continue
-            for kw in expr.keywords:
-                if kw.arg == "release":
-                    try:
-                        return bool(ast.literal_eval(kw.value))
-                    except Exception:
-                        return False
-            return False
-
-    stripped = content.lstrip()
-    return stripped.startswith("emit(") and "release=True" in stripped.replace(" ", "")
+    return (
+        "_final_result" in msg
+        or "_emit_value" in msg
+        or msg.get("_virtual_interaction_boundary") is True
+    )
 
 
 def released_assistant_text(msg: dict) -> str:
@@ -900,7 +880,6 @@ def semantic_segments(messages: list[dict]) -> list[SemanticSegment]:
             ),
             authoritative=source_valid,
         ))
-        return end_index
 
     for index, message in enumerate(messages[first_index:], start=first_index):
         if index == skip_output:
@@ -930,17 +909,23 @@ def semantic_segments(messages: list[dict]) -> list[SemanticSegment]:
             skip_output = None
             continue
 
-        if identity is None or index not in boundaries:
+        if index not in boundaries:
             continue
-
         boundary = boundaries[index]
-        end_index = append_segment(
-            index,
-            boundary.boundary_output_index,
-            transition=boundary.is_transition,
-            boundary_authoritative=boundary.authoritative,
+        if not boundary.is_transition and identity is None:
+            continue
+        end_index = (
+            boundary.boundary_output_index
+            if boundary.boundary_output_index is not None
+            else index
         )
-        skip_output = boundary.boundary_output_index
+        if identity is not None:
+            append_segment(
+                index,
+                boundary.boundary_output_index,
+                transition=boundary.is_transition,
+                boundary_authoritative=boundary.authoritative,
+            )
         if boundary.is_transition:
             identity = boundary.transition_seq
             identity_kind = "checkpoint"
@@ -950,6 +935,7 @@ def semantic_segments(messages: list[dict]) -> list[SemanticSegment]:
         else:
             identity = identity_kind = anchor = segment_start = None
             authoritative = False
+        skip_output = boundary.boundary_output_index
 
     return segments
 

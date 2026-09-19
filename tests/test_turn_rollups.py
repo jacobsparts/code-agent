@@ -75,6 +75,7 @@ def release_message(text="done"):
     return {
         "role": "assistant",
         "content": [{"type": "text", "text": f"emit({text!r}, release=True)"}],
+        "_final_result": text,
     }
 
 
@@ -472,6 +473,61 @@ def test_candidate_frontier_is_earlier_of_three_turns_ago_and_last_execution():
         "Eligible normal turn boundaries: "
         + ", ".join(str(turn_id) for turn_id in ids[:4])
     )
+
+
+def test_candidate_frontier_keeps_three_turns_normally_but_one_under_pressure():
+    events, ids = completed_events(8)
+    projection = projected_messages(events)
+    state = PersistedPreviewState.empty()
+
+    expected_normal = tuple(ids[:-2])
+    assert derive_rollup_candidate_turns(events, projection, state) == expected_normal
+    assert derive_rollup_candidate_turns(
+        events, projection, state, usage_percent=79
+    ) == expected_normal
+    assert derive_rollup_candidate_turns(
+        events, projection, state, usage_percent=80
+    ) == tuple(ids)
+
+
+def test_candidate_frontier_pressure_cannot_move_past_last_execution_turn():
+    events, ids = completed_events(8, execution_ids={7})
+    projection = projected_messages(events)
+    state = PersistedPreviewState.empty()
+
+    for usage_percent in (None, 79, 80, 95):
+        candidates = derive_rollup_candidate_turns(
+            events,
+            projection,
+            state,
+            usage_percent=usage_percent,
+        )
+        assert candidates == tuple(ids[:4])
+
+
+def test_transition_after_release_completes_turns_without_new_user_message():
+    events = [
+        event(1, input_message("task")),
+        event(2, release_message("done")),
+        event(3, {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "observe('stage', transition=True)"}],
+            "_observation_transition": True,
+        }),
+        event(4, {
+            **output_message(">>> observe('stage', transition=True)\n'[Continuing...]'\n"),
+            "_repl_output_for": 3,
+        }),
+        event(5, {"role": "assistant", "content": [{"type": "text", "text": "print('x')"}]}),
+        event(6, output_message()),
+        event(7, release_message("later")),
+    ]
+
+    turns = completed_turns(events)
+
+    assert [turn.turn_id for turn in turns] == [1, 3]
+    assert [turn.identity_kind for turn in turns] == ["turn", "checkpoint"]
+    assert turns[1].has_execution is True
 
 
 def test_ambiguous_projected_boundaries_are_not_listed_as_candidates():
