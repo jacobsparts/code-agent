@@ -431,7 +431,9 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
         """Replace an eligible interval of completed turns with a persisted preview summary."""
         from code_agent.code_agent_coalesce import (
             Preview,
-            render_projected_span,
+            _content_text,
+            make_preview_replacement,
+            render_preview_ref,
             select_projected_span,
         )
         from code_agent.turn_rollups import (
@@ -505,14 +507,13 @@ class CodeAgentBase(REPLAttachmentMixin, CLIMixin, REPLAgent):
             source_start_seq=source_start_seq,
             source_end_seq=source_end_seq,
         )
-        replaced_content = render_projected_span(
-            authoritative_messages[span.start_index:span.end_index]
+        selected = authoritative_messages[span.start_index:span.end_index]
+        replacement = make_preview_replacement(
+            [render_preview_ref("0" * 16, summary)], selected
         )
-        if len(summary) >= len(replaced_content):
-            print(
-                "Rollup rejected: rollup summary must be shorter than the "
-                "content it replaces."
-            )
+        original_chars = sum(len(_content_text(message)) for message in selected)
+        if original_chars <= len(replacement["content"][0]["text"]):
+            print("Rollup rejected: estimated savings must be greater than zero.")
             return
 
         create_from_projection = getattr(

@@ -1605,6 +1605,7 @@ def test_rollup_summary_validation_is_objective_and_nonmutating(
 
 def test_rollup_live_success_and_validation_failure_are_atomic(tmp_path, capsys):
     events, ids = completed_events(6)
+    events[0]["payload"]["message"] = input_message("original details " * 100)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
     before = _rollup_snapshot(agent, store, session_id)
 
@@ -1628,6 +1629,7 @@ def test_rollup_live_success_and_validation_failure_are_atomic(tmp_path, capsys)
 
 def test_rollup_injected_persistence_failure_is_atomic(tmp_path, monkeypatch):
     events, ids = completed_events(6)
+    events[0]["payload"]["message"] = input_message("original details " * 100)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
     before = _rollup_snapshot(agent, store, session_id)
     monkeypatch.setattr(
@@ -1645,6 +1647,8 @@ def test_rollup_injected_persistence_failure_is_atomic(tmp_path, monkeypatch):
 
 def test_recursive_and_adjacent_rollups_preserve_outer_boundaries(tmp_path, capsys):
     events, ids = completed_events(7)
+    for item in events[:4:2]:
+        item["payload"]["message"] = input_message("original details " * 100)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
 
     assert agent.rollup(ids[0], ids[1], "child summary") is None
@@ -1665,6 +1669,7 @@ def test_recursive_and_adjacent_rollups_preserve_outer_boundaries(tmp_path, caps
 
 def test_rollup_ignores_stale_live_projection_and_rebuilds_authoritatively(tmp_path):
     events, ids = completed_events(6)
+    events[0]["payload"]["message"] = input_message("original details " * 100)
     agent, store, session_id = _rollup_test_agent(events, tmp_path)
     agent.conversation.insert_message(
         3, {"role": "assistant", "content": [{"type": "text", "text": "stale live gap"}], "_event_seq": 999}
