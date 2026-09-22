@@ -4832,7 +4832,7 @@ Examples:
                 initial_prompt=args.prompt,
                 non_interactive=args.non_interactive,
             )
-    except ModelNotFoundError as e:
+    except (ModelNotFoundError, RuntimeError) as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 

@@ -41,7 +41,7 @@ Select the appropriate model automatically from this set when building agents:
 | Model | Use |
 |---|---|
 | `omniroute/deepseek-v4-flash` | Fast, cheap, good general-purpose agentic model for bulk execution. No vision support. |
-| `omniroute/gemini-3.7-flash` | Fast high intelligence model for agentic workflows, good agentic and REPL performance. General purpose default. |
+| `omniroute/gemini-3.8-flash` | Fast high intelligence model for agentic workflows, good agentic and REPL performance. General purpose default. |
 | `omniroute/gpt-5.6-sol-medium` | Highest-intelligence model for advanced planning and reasoning. Best REPL performance and a good orchestrator. Vision support. |
 
 - If requirements do not clearly justify one of the models, ask the user.
