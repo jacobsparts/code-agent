@@ -1299,7 +1299,7 @@ class LLMClient:
             raise
         except Exception as e:
             err = (str(e) if len(str(e)) < 1000 else str(e)[:1000]+'...').replace("\n"," ")
-            logger.error(f"call {type(e).__name__}: {err}", exc_info=not isinstance(e, APIError))
+            logger.error(f"call {type(e).__name__}: {err}", exc_info=not isinstance(e, (APIError, EmptyResponseError)))
             if retry:
                 self._sleep_backoff(attempt)
                 return self.call(messages, retry-1, attempt+1)
