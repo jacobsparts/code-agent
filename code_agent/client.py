@@ -195,7 +195,7 @@ def _apply_native_policy(messages, native):
 
 
 def _openai_compatible_message_to_transport_blocks(message):
-    content = message['content']
+    content = message.get('content')
     if isinstance(content, str):
         blocks = [{'type': 'text', 'text': content}] if content else []
     elif content is None:

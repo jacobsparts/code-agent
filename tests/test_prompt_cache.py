@@ -428,6 +428,30 @@ def test_openai_response_image_decodes_to_canonical_attachment():
         "data": "https://example.test/result.png",
     }
 
+def test_openai_response_missing_content_key_decodes_tool_calls():
+    from code_agent.client import (
+        _openai_compatible_message_to_transport_blocks,
+    )
+
+    blocks = _openai_compatible_message_to_transport_blocks({
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "repl_execute",
+                "arguments": "{\"code\": \"print(1)\"}",
+            },
+        }],
+    })
+
+    assert blocks == [{
+        "type": "tool_call",
+        "id": "call_123",
+        "name": "repl_execute",
+        "args": {"code": "print(1)"},
+    }]
+
 
 def test_responses_request_skips_explicit_cache_when_not_opted_in(monkeypatch):
     config = {
